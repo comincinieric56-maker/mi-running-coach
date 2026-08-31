@@ -99,7 +99,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.1"
+APP_VERSION = "6.2"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -124,6 +124,40 @@ RUN_DAYS = {
     5: [0, 1, 3, 5, 6],    # Lun/Mar/Jue/Sáb/Dom
     6: [0, 1, 2, 3, 5, 6], # Lun/Mar/Mié/Jue/Sáb/Dom
 }
+
+ASSESSMENT_VERSION = "RCP-1.0"
+RCP_LEVELS = ["INICIACIÓN", "PRINCIPIANTE", "INTERMEDIO", "AVANZADO"]
+RCP_GOALS = [
+    "Empezar a correr",
+    "Correr 30 min continuos",
+    "Condición física",
+    "5K",
+    "10K",
+    "21K",
+    "42K",
+    "Mantener rendimiento",
+    "Volver a correr tras una pausa",
+]
+EXPERIENCE_OPTIONS = [
+    "Nunca",
+    "<1 mes",
+    "1–3 meses",
+    "3–6 meses",
+    "6–12 meses",
+    "1–2 años",
+    ">2 años",
+]
+CONTINUOUS_OPTIONS = {
+    "<5 min": 3,
+    "5–10 min": 8,
+    "10–20 min": 15,
+    "20–30 min": 25,
+    "30–45 min": 38,
+    "45–60 min": 52,
+    "60–90 min": 75,
+    ">90 min": 100,
+}
+TIME_AVAILABLE_OPTIONS = ["30 min", "45 min", "60 min", "75 min", "90+ min"]
 
 # ============================================================
 # Autenticación Supabase
@@ -325,6 +359,43 @@ def delete_log(session_date):
     ).eq("session_date", str(session_date)).execute()
 
 
+def get_assessments(limit=20):
+    """Historial de evaluaciones RCP. Si la migración V6.2 aún no existe, no rompe la app."""
+    try:
+        return (
+            client.table("rc_assessments")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+
+def get_latest_assessment():
+    rows = get_assessments(limit=1)
+    return rows[0] if rows else None
+
+
+def save_assessment(payload):
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    row["assessment_version"] = ASSESSMENT_VERSION
+    return client.table("rc_assessments").insert(row).execute()
+
+
+def assessment_storage_ready():
+    try:
+        client.table("rc_assessments").select("id").eq("user_id", USER_ID).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -429,6 +500,242 @@ def volume_for_week(base_km, week_idx, total_weeks, has_race):
         growth *= 0.88
 
     return base_km * growth
+
+
+def _score_by_threshold(value, thresholds):
+    score = 0
+    for threshold, points in thresholds:
+        if value >= threshold:
+            score = points
+    return score
+
+
+def evaluate_safety(answers):
+    """Cribado conservador. No diagnostica ni equivale a autorización médica."""
+    concerning_symptoms = any([
+        answers.get("chest_discomfort_exertion"),
+        answers.get("unexplained_syncope"),
+        answers.get("unreasonable_breathlessness"),
+        answers.get("symptomatic_palpitations"),
+    ])
+    known_condition = bool(answers.get("known_condition"))
+    professionally_cleared = bool(answers.get("professionally_cleared"))
+    acute_issue = bool(answers.get("acute_illness")) or bool(answers.get("pain_changes_gait"))
+
+    if concerning_symptoms:
+        return (
+            "REQUIERE VALORACIÓN",
+            "Declaraste uno o más síntomas que justifican valoración profesional antes de iniciar o reanudar ejercicio intenso.",
+        )
+    if known_condition and not professionally_cleared:
+        return (
+            "VALORACIÓN ANTES DE INTENSIDAD",
+            "Declaraste una condición cardiovascular, metabólica o renal conocida sin una indicación profesional vigente para ejercicio sin restricciones relevantes.",
+        )
+    if acute_issue:
+        return (
+            "PAUSA TEMPORAL",
+            "Hay enfermedad aguda/fiebre o dolor que modifica la forma de correr. No conviene progresar la carga hasta resolverlo o reevaluarlo.",
+        )
+    return (
+        "SIN ALERTAS DECLARADAS",
+        "No se identificaron alertas en este cribado. Esto no equivale a una autorización médica ni descarta enfermedad.",
+    )
+
+
+def calculate_runner_score(answers):
+    active_weeks = int(answers.get("active_weeks_8") or 0)
+    running_days = int(answers.get("current_days") or 0)
+    weekly_km = float(answers.get("weekly_km") or 0)
+    long_km = float(answers.get("long_run_km") or 0)
+    continuous_min = int(answers.get("continuous_min") or 0)
+    experience = str(answers.get("experience") or "Nunca")
+    quality_types = answers.get("quality_types") or []
+    intense_sessions = int(answers.get("intense_sessions_per_week") or 0)
+    race_experience = bool(answers.get("race_or_test_recent"))
+
+    experience_score = {
+        "Nunca": 0,
+        "<1 mes": 2,
+        "1–3 meses": 5,
+        "3–6 meses": 8,
+        "6–12 meses": 11,
+        "1–2 años": 13,
+        ">2 años": 15,
+    }.get(experience, 0)
+
+    consistency_score = round(min(active_weeks, 8) / 8 * 20)
+    frequency_score = _score_by_threshold(running_days, [(0, 0), (1, 2), (2, 4), (3, 6), (4, 8), (5, 10)])
+    volume_score = _score_by_threshold(weekly_km, [(0, 0), (5, 2), (10, 5), (20, 8), (30, 11), (40, 13), (55, 15)])
+    continuous_score = _score_by_threshold(continuous_min, [(0, 0), (10, 3), (20, 6), (30, 9), (45, 11), (60, 13), (90, 15)])
+    long_score = _score_by_threshold(long_km, [(0, 0), (3, 2), (5, 4), (8, 6), (12, 8), (16, 9), (20, 10)])
+
+    structured_quality = len(set(quality_types))
+    quality_score = 0
+    if structured_quality >= 1 or intense_sessions >= 1:
+        quality_score = 4
+    if structured_quality >= 2 and intense_sessions >= 1:
+        quality_score = 7
+    if structured_quality >= 3 and intense_sessions >= 2:
+        quality_score = 10
+
+    race_score = 5 if race_experience else 0
+
+    components = {
+        "Consistencia": consistency_score,
+        "Antigüedad": experience_score,
+        "Frecuencia": frequency_score,
+        "Volumen": volume_score,
+        "Carrera continua": continuous_score,
+        "Tirada larga": long_score,
+        "Calidad estructurada": quality_score,
+        "Experiencia en carrera/test": race_score,
+    }
+    score = int(max(0, min(100, sum(components.values()))))
+    return score, components
+
+
+def classify_runner(answers, score):
+    experience = str(answers.get("experience") or "Nunca")
+    active_weeks = int(answers.get("active_weeks_8") or 0)
+    current_days = int(answers.get("current_days") or 0)
+    weekly_km = float(answers.get("weekly_km") or 0)
+    long_km = float(answers.get("long_run_km") or 0)
+    continuous_min = int(answers.get("continuous_min") or 0)
+    quality_types = len(set(answers.get("quality_types") or []))
+
+    if score < 30:
+        level = "INICIACIÓN"
+    elif score < 50:
+        level = "PRINCIPIANTE"
+    elif score < 75:
+        level = "INTERMEDIO"
+    else:
+        level = "AVANZADO"
+
+    # Reglas de techo: la experiencia mínima importa más que un único valor alto.
+    if active_weeks < 4 or continuous_min < 20 or experience in ("Nunca", "<1 mes"):
+        level = "INICIACIÓN"
+    elif experience == "1–3 meses" or active_weeks < 6 or current_days <= 2:
+        level = "PRINCIPIANTE"
+
+    # AVANZADO exige trayectoria y tolerancia estructurada, no solo velocidad.
+    if level == "AVANZADO":
+        advanced_experience = experience in ("1–2 años", ">2 años")
+        if not (
+            advanced_experience
+            and current_days >= 5
+            and weekly_km >= 40
+            and long_km >= 14
+            and quality_types >= 2
+        ):
+            level = "INTERMEDIO"
+
+    return level
+
+
+def goal_readiness(answers, safety_status):
+    goal = str(answers.get("goal") or "Condición física")
+    active_weeks = int(answers.get("active_weeks_8") or 0)
+    weekly_km = float(answers.get("weekly_km") or 0)
+    long_km = float(answers.get("long_run_km") or 0)
+    continuous_min = int(answers.get("continuous_min") or 0)
+    race_date_text = answers.get("goal_race_date")
+
+    if safety_status != "SIN ALERTAS DECLARADAS":
+        return "EVALUAR SEGURIDAD PRIMERO", ["El cribado de seguridad debe resolverse antes de progresar el entrenamiento."]
+
+    if goal in ("Empezar a correr", "Correr 30 min continuos", "Condición física", "Volver a correr tras una pausa"):
+        return "APTO PARA FASE ADAPTADA", ["El objetivo puede abordarse con una fase inicial ajustada a la capacidad actual."]
+
+    if goal == "Mantener rendimiento":
+        if active_weeks >= 4 and weekly_km > 0:
+            return "BASE ACTUAL UTILIZABLE", ["Existe actividad reciente suficiente para plantear mantenimiento individualizado."]
+        return "BASE PREVIA", ["Conviene reconstruir consistencia antes de un bloque de mantenimiento estructurado."]
+
+    requirements = {
+        "5K": (4, 8, 3, 20, 6),
+        "10K": (4, 12, 5, 30, 8),
+        "21K": (6, 18, 8, 45, 10),
+        "42K": (8, 28, 14, 60, 16),
+    }
+    req = requirements.get(goal)
+    if not req:
+        return "REVISIÓN MANUAL", ["No hay reglas RCP definidas para este objetivo."]
+
+    req_weeks, req_km, req_long, req_cont, min_calendar_weeks = req
+    missing = []
+    if active_weeks < req_weeks:
+        missing.append(f"consistencia reciente ({active_weeks}/8 semanas)")
+    if weekly_km < req_km:
+        missing.append(f"volumen actual ({weekly_km:g} km/sem)")
+    if long_km < req_long:
+        missing.append(f"tirada larga actual ({long_km:g} km)")
+    if continuous_min < req_cont:
+        missing.append(f"carrera continua ({continuous_min} min)")
+
+    calendar_short = False
+    if race_date_text:
+        try:
+            race_day = date.fromisoformat(str(race_date_text))
+            weeks_left = max(0, (race_day - date.today()).days / 7)
+            if weeks_left < min_calendar_weeks:
+                calendar_short = True
+                missing.append(f"tiempo hasta la carrera ({weeks_left:.1f} semanas; referencia RCP ≥{min_calendar_weeks})")
+        except Exception:
+            pass
+
+    if not missing:
+        return "PREPARACIÓN ADECUADA", ["La base declarada cumple los umbrales internos RCP para iniciar este tipo de plan."]
+    if len(missing) <= 2 and not calendar_short:
+        return "NECESITA FASE DE BASE", missing
+    return "OBJETIVO AGRESIVO PARA LA BASE ACTUAL", missing
+
+
+def assessment_explanation(answers, components, level):
+    positives = []
+    developments = []
+
+    if int(answers.get("active_weeks_8") or 0) >= 6:
+        positives.append("buena consistencia en las últimas 8 semanas")
+    else:
+        developments.append("construir más semanas consecutivas de entrenamiento")
+
+    if float(answers.get("weekly_km") or 0) >= 25:
+        positives.append("base semanal consolidada")
+    else:
+        developments.append("aumentar la base aeróbica de forma progresiva")
+
+    if int(answers.get("continuous_min") or 0) >= 60:
+        positives.append("buena capacidad de carrera continua")
+    elif int(answers.get("continuous_min") or 0) < 30:
+        developments.append("mejorar tolerancia a carrera continua")
+
+    if float(answers.get("long_run_km") or 0) >= 10:
+        positives.append("experiencia con tiradas largas")
+    else:
+        developments.append("desarrollar progresivamente la tirada larga")
+
+    if len(set(answers.get("quality_types") or [])) >= 2:
+        positives.append("experiencia con entrenamiento estructurado")
+    else:
+        developments.append("introducir calidad estructurada solo cuando la base lo permita")
+
+    reasons = []
+    exp = str(answers.get("experience") or "Nunca")
+    reasons.append(f"experiencia declarada: {exp}")
+    reasons.append(f"frecuencia actual: {int(answers.get('current_days') or 0)} días/sem")
+    reasons.append(f"volumen actual: {float(answers.get('weekly_km') or 0):g} km/sem")
+    reasons.append(f"carrera continua: {int(answers.get('continuous_min') or 0)} min")
+    reasons.append(f"tirada larga: {float(answers.get('long_run_km') or 0):g} km")
+
+    return {
+        "level": level,
+        "reasons": reasons,
+        "strengths": positives[:4],
+        "development": developments[:4],
+        "components": components,
+    }
 
 
 def quality_workout(level, week_no, target_pace):
@@ -667,7 +974,390 @@ def generate_plan(profile):
     return rows
 
 
-def profile_form(existing=None):
+def _option_index(options, value, fallback=0):
+    try:
+        return options.index(value)
+    except Exception:
+        return fallback
+
+
+def show_assessment_result(assessment):
+    if not assessment:
+        return
+
+    score = int(assessment.get("runner_score") or 0)
+    level = str(assessment.get("runner_level") or "—")
+    safety = str(assessment.get("safety_status") or "—")
+    readiness = str(assessment.get("goal_readiness") or "—")
+    goal = str(assessment.get("goal") or "—")
+    explanation = assessment.get("explanation") or {}
+
+    st.markdown("### Tu perfil RCP")
+    a, b, c, d = st.columns(4)
+    a.metric("Nivel RCP", level.title())
+    b.metric("Runner Score", f"{score}/100")
+    c.metric("Objetivo evaluado", goal)
+    d.metric("Preparación", readiness.title())
+
+    if safety == "SIN ALERTAS DECLARADAS":
+        st.success(f"**Cribado de seguridad:** {safety}. {assessment.get('safety_message') or ''}")
+    elif safety == "PAUSA TEMPORAL":
+        st.warning(f"**Cribado de seguridad:** {safety}. {assessment.get('safety_message') or ''}")
+    else:
+        st.error(f"**Cribado de seguridad:** {safety}. {assessment.get('safety_message') or ''}")
+
+    reasons = explanation.get("reasons") or []
+    strengths = explanation.get("strengths") or []
+    development = explanation.get("development") or []
+    components = explanation.get("components") or {}
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### ¿Por qué este nivel?")
+        for item in reasons:
+            st.write(f"• {item}")
+        if strengths:
+            st.markdown("#### Fortalezas actuales")
+            for item in strengths:
+                st.write(f"• {item}")
+    with right:
+        if development:
+            st.markdown("#### Áreas a desarrollar")
+            for item in development:
+                st.write(f"• {item}")
+        readiness_reasons = assessment.get("readiness_reasons") or []
+        if readiness_reasons:
+            st.markdown("#### Preparación para el objetivo")
+            for item in readiness_reasons:
+                st.write(f"• {item}")
+
+    if components:
+        with st.expander("Ver composición del Runner Score"):
+            score_rows = [{"Dimensión": k, "Puntos": v} for k, v in components.items()]
+            st.dataframe(score_rows, use_container_width=True, hide_index=True)
+            st.caption(
+                "El Runner Score es un índice interno RCP de experiencia y tolerancia de entrenamiento; "
+                "no es una escala médica ni una medida de talento o velocidad."
+            )
+
+
+def assessment_form(existing_assessment=None, onboarding=False):
+    existing_answers = (existing_assessment or {}).get("answers") or {}
+
+    st.subheader("🧭 Evaluación inicial RCP" if onboarding else "🧭 Reevaluación del corredor")
+    st.caption(
+        "Esta evaluación clasifica experiencia, base actual, disponibilidad y preparación para un objetivo. "
+        "El apartado de seguridad es un cribado conservador y no sustituye valoración médica."
+    )
+
+    with st.form("rcp_assessment_form"):
+        st.markdown("### 1 · Seguridad antes de aumentar la carga")
+        st.caption("Marca solo lo que aplique actualmente o durante el ejercicio.")
+        s1, s2 = st.columns(2)
+        chest = s1.checkbox(
+            "Molestia, presión u opresión en pecho/cuello/mandíbula/brazos asociada al esfuerzo",
+            value=bool(existing_answers.get("chest_discomfort_exertion")),
+        )
+        breath = s1.checkbox(
+            "Falta de aire claramente desproporcionada al esfuerzo habitual",
+            value=bool(existing_answers.get("unreasonable_breathlessness")),
+        )
+        syncope = s1.checkbox(
+            "Desmayo, pérdida de conocimiento o mareo intenso inexplicado",
+            value=bool(existing_answers.get("unexplained_syncope")),
+        )
+        palpitations = s2.checkbox(
+            "Palpitaciones rápidas/irregulares acompañadas de malestar, mareo o dolor",
+            value=bool(existing_answers.get("symptomatic_palpitations")),
+        )
+        known_condition = s2.checkbox(
+            "Condición cardiovascular, metabólica o renal conocida relevante para el ejercicio",
+            value=bool(existing_answers.get("known_condition")),
+        )
+        professionally_cleared = s2.checkbox(
+            "Tengo indicación profesional vigente para realizar ejercicio sin restricciones relevantes",
+            value=bool(existing_answers.get("professionally_cleared")),
+        )
+        acute_illness = st.checkbox(
+            "Actualmente tengo fiebre, enfermedad aguda o un cuadro que hace que entrenar no sea razonable",
+            value=bool(existing_answers.get("acute_illness")),
+        )
+
+        st.markdown("### 2 · Experiencia corriendo")
+        e1, e2, e3 = st.columns(3)
+        running_status_options = [
+            "No corro actualmente",
+            "Estoy empezando",
+            "Volviendo después de una pausa",
+            "Corro regularmente",
+        ]
+        running_status = e1.selectbox(
+            "Situación actual",
+            running_status_options,
+            index=_option_index(running_status_options, existing_answers.get("running_status"), 1),
+        )
+        experience = e2.selectbox(
+            "Tiempo corriendo regularmente",
+            EXPERIENCE_OPTIONS,
+            index=_option_index(EXPERIENCE_OPTIONS, existing_answers.get("experience"), 0),
+        )
+        active_weeks = e3.slider(
+            "Semanas corridas en las últimas 8",
+            0, 8,
+            int(existing_answers.get("active_weeks_8") or 0),
+        )
+
+        c1, c2, c3 = st.columns(3)
+        current_days = c1.number_input(
+            "Días que corres actualmente / semana",
+            min_value=0, max_value=7,
+            value=int(existing_answers.get("current_days") or 0),
+            step=1,
+        )
+        weekly_km = c2.number_input(
+            "KM promedio / semana (últimas 4 semanas)",
+            min_value=0.0, max_value=250.0,
+            value=float(existing_answers.get("weekly_km") or 0.0),
+            step=1.0,
+        )
+        long_run_km = c3.number_input(
+            "Tirada más larga de las últimas 4 semanas",
+            min_value=0.0, max_value=100.0,
+            value=float(existing_answers.get("long_run_km") or 0.0),
+            step=0.5,
+        )
+
+        with st.expander("Opcional · Detallar las últimas 4 semanas"):
+            wk = existing_answers.get("weekly_km_detail") or [0, 0, 0, 0]
+            wk = list(wk) + [0, 0, 0, 0]
+            w1, w2, w3, w4 = st.columns(4)
+            week1 = w1.number_input("Semana -4", 0.0, 250.0, float(wk[0]), 1.0)
+            week2 = w2.number_input("Semana -3", 0.0, 250.0, float(wk[1]), 1.0)
+            week3 = w3.number_input("Semana -2", 0.0, 250.0, float(wk[2]), 1.0)
+            week4 = w4.number_input("Semana -1", 0.0, 250.0, float(wk[3]), 1.0)
+
+        continuous_label = st.selectbox(
+            "Máximo tiempo que puedes correr de forma continua",
+            list(CONTINUOUS_OPTIONS.keys()),
+            index=_option_index(
+                list(CONTINUOUS_OPTIONS.keys()),
+                existing_answers.get("continuous_label"),
+                0,
+            ),
+        )
+
+        st.markdown("### 3 · Historial de entrenamiento")
+        quality_options = [
+            "Rodajes suaves",
+            "Tirada larga",
+            "Fartlek",
+            "Series/intervalos",
+            "Tempo/umbral",
+            "Cuestas",
+            "Strides/progresivos",
+        ]
+        quality_types = st.multiselect(
+            "Sesiones que has realizado con cierta regularidad",
+            quality_options,
+            default=[x for x in (existing_answers.get("quality_types") or []) if x in quality_options],
+        )
+        h1, h2, h3 = st.columns(3)
+        intense_sessions = h1.selectbox(
+            "Sesiones intensas habituales / semana",
+            [0, 1, 2, 3],
+            index=min(3, int(existing_answers.get("intense_sessions_per_week") or 0)),
+            format_func=lambda x: "3+" if x == 3 else str(x),
+        )
+        strength_options = ["No", "Ocasional", "1/sem", "2/sem", "3+/sem"]
+        strength_frequency = h2.selectbox(
+            "Trabajo de fuerza",
+            strength_options,
+            index=_option_index(strength_options, existing_answers.get("strength_frequency"), 0),
+        )
+        race_or_test = h3.checkbox(
+            "Carrera o test reciente",
+            value=bool(existing_answers.get("race_or_test_recent")),
+            help="Una carrera o test reciente aporta evidencia de experiencia competitiva, pero no define por sí sola tu nivel.",
+        )
+
+        st.markdown("### 4 · Lesiones y tolerancia actual")
+        i1, i2, i3 = st.columns(3)
+        injury_last12m = i1.checkbox(
+            "Lesión que impidió correr ≥7 días en los últimos 12 meses",
+            value=bool(existing_answers.get("injury_last12m")),
+        )
+        current_pain = i2.slider(
+            "Dolor actual al correr (0–10)",
+            0, 10,
+            int(existing_answers.get("current_pain") or 0),
+        )
+        pain_changes_gait = i3.checkbox(
+            "El dolor cambia mi forma de caminar/correr",
+            value=bool(existing_answers.get("pain_changes_gait")),
+        )
+        injury_areas = st.multiselect(
+            "Zonas con lesión relevante reciente (opcional)",
+            ["Pie/tobillo", "Aquiles", "Pantorrilla", "Tibia", "Rodilla", "Isquiotibiales", "Cadera", "Espalda", "Otra"],
+            default=existing_answers.get("injury_areas") or [],
+        )
+
+        st.markdown("### 5 · Disponibilidad real")
+        available_days = st.multiselect(
+            "Días en los que realmente puedes entrenar",
+            DAY_NAMES,
+            default=existing_answers.get("available_days") or ["Martes", "Jueves", "Domingo"],
+        )
+        d1, d2 = st.columns(2)
+        preferred_long_day = d1.selectbox(
+            "Día preferido para tirada larga",
+            DAY_NAMES,
+            index=_option_index(DAY_NAMES, existing_answers.get("preferred_long_day"), 6),
+        )
+        no_intensity_days = d2.multiselect(
+            "Días que prefieres evitar para calidad",
+            DAY_NAMES,
+            default=existing_answers.get("no_intensity_days") or [],
+        )
+        t1, t2 = st.columns(2)
+        weekday_time = t1.selectbox(
+            "Tiempo máximo entre semana",
+            TIME_AVAILABLE_OPTIONS,
+            index=_option_index(TIME_AVAILABLE_OPTIONS, existing_answers.get("weekday_time"), 2),
+        )
+        weekend_time = t2.selectbox(
+            "Tiempo máximo fin de semana",
+            TIME_AVAILABLE_OPTIONS,
+            index=_option_index(TIME_AVAILABLE_OPTIONS, existing_answers.get("weekend_time"), 4),
+        )
+
+        st.markdown("### 6 · Objetivo")
+        g1, g2 = st.columns(2)
+        goal = g1.selectbox(
+            "¿Qué quieres conseguir?",
+            RCP_GOALS,
+            index=_option_index(RCP_GOALS, existing_answers.get("goal"), 4),
+        )
+        goal_style_options = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
+        goal_style = g2.selectbox(
+            "Tipo de objetivo",
+            goal_style_options,
+            index=_option_index(goal_style_options, existing_answers.get("goal_style"), 0),
+        )
+        has_goal_race = st.checkbox(
+            "Tengo una fecha de carrera/objetivo",
+            value=bool(existing_answers.get("has_goal_race")),
+        )
+        default_goal_date = date.today() + timedelta(weeks=12)
+        if existing_answers.get("goal_race_date"):
+            try:
+                default_goal_date = date.fromisoformat(str(existing_answers["goal_race_date"]))
+            except Exception:
+                pass
+        goal_race_date = st.date_input(
+            "Fecha objetivo (se ignora si no marcaste la casilla anterior)",
+            value=default_goal_date,
+            min_value=date.today() + timedelta(days=1),
+            max_value=date.today() + timedelta(days=730),
+        )
+
+        accepted = st.checkbox(
+            "Confirmo que respondí según mi situación actual y entiendo que esta evaluación no diagnostica ni reemplaza una valoración profesional.",
+            value=False,
+        )
+        submit = st.form_submit_button(
+            "Analizar mi perfil RCP",
+            use_container_width=True,
+        )
+
+    if not submit:
+        return False
+    if not accepted:
+        st.error("Confirma la casilla para guardar la evaluación.")
+        return False
+    if not available_days:
+        st.error("Selecciona al menos un día disponible para entrenar.")
+        return False
+
+    weekly_detail = [float(week1), float(week2), float(week3), float(week4)]
+    positive_weeks = [x for x in weekly_detail if x > 0]
+    effective_weekly_km = float(weekly_km)
+    if positive_weeks:
+        effective_weekly_km = round(sum(positive_weeks) / len(positive_weeks), 2)
+
+    answers = {
+        "chest_discomfort_exertion": bool(chest),
+        "unreasonable_breathlessness": bool(breath),
+        "unexplained_syncope": bool(syncope),
+        "symptomatic_palpitations": bool(palpitations),
+        "known_condition": bool(known_condition),
+        "professionally_cleared": bool(professionally_cleared),
+        "acute_illness": bool(acute_illness),
+        "running_status": running_status,
+        "experience": experience,
+        "active_weeks_8": int(active_weeks),
+        "current_days": int(current_days),
+        "weekly_km": effective_weekly_km,
+        "weekly_km_declared": float(weekly_km),
+        "weekly_km_detail": weekly_detail,
+        "long_run_km": float(long_run_km),
+        "continuous_label": continuous_label,
+        "continuous_min": int(CONTINUOUS_OPTIONS[continuous_label]),
+        "quality_types": quality_types,
+        "intense_sessions_per_week": int(intense_sessions),
+        "strength_frequency": strength_frequency,
+        "race_or_test_recent": bool(race_or_test),
+        "injury_last12m": bool(injury_last12m),
+        "current_pain": int(current_pain),
+        "pain_changes_gait": bool(pain_changes_gait),
+        "injury_areas": injury_areas,
+        "available_days": available_days,
+        "preferred_long_day": preferred_long_day,
+        "no_intensity_days": no_intensity_days,
+        "weekday_time": weekday_time,
+        "weekend_time": weekend_time,
+        "goal": goal,
+        "goal_style": goal_style,
+        "has_goal_race": bool(has_goal_race),
+        "goal_race_date": goal_race_date.isoformat() if has_goal_race else None,
+    }
+
+    safety_status, safety_message = evaluate_safety(answers)
+    runner_score, components = calculate_runner_score(answers)
+    runner_level = classify_runner(answers, runner_score)
+    readiness, readiness_reasons = goal_readiness(answers, safety_status)
+    explanation = assessment_explanation(answers, components, runner_level)
+
+    payload = {
+        "safety_status": safety_status,
+        "safety_message": safety_message,
+        "runner_score": int(runner_score),
+        "runner_level": runner_level,
+        "goal": goal,
+        "goal_readiness": readiness,
+        "weekly_km": effective_weekly_km,
+        "days_running": int(current_days),
+        "longest_run_km": float(long_run_km),
+        "continuous_run_min": int(CONTINUOUS_OPTIONS[continuous_label]),
+        "answers": answers,
+        "explanation": explanation,
+        "readiness_reasons": readiness_reasons,
+    }
+
+    try:
+        save_assessment(payload)
+    except Exception as exc:
+        st.error(
+            "No pude guardar la evaluación. Ejecuta primero supabase_v6_2_assessment.sql "
+            f"en Supabase. Detalle: {exc}"
+        )
+        return False
+
+    st.success(f"Evaluación guardada · Nivel RCP: {runner_level.title()} · {runner_score}/100")
+    st.rerun()
+    return True
+
+
+def profile_form(existing=None, assessed_level=None):
     existing = existing or {}
 
     st.subheader("Configura tu RunningCoachPro")
@@ -690,12 +1380,27 @@ def profile_form(existing=None):
             goal_options,
             index=goal_options.index(current_goal) if current_goal in goal_options else 1,
         )
-        level = c2.selectbox(
-            "Nivel",
-            LEVELS,
-            index=LEVELS.index(existing.get("level", "Principiante"))
-            if existing.get("level") in LEVELS else 0,
-        )
+        if assessed_level:
+            legacy_level_map = {
+                "INICIACIÓN": "Principiante",
+                "PRINCIPIANTE": "Principiante",
+                "INTERMEDIO": "Intermedio",
+                "AVANZADO": "Avanzado",
+            }
+            level = legacy_level_map.get(str(assessed_level).upper(), "Principiante")
+            c2.markdown("**Nivel RCP evaluado**")
+            c2.info(str(assessed_level).title())
+            c2.caption(
+                f"El generador V6 usa temporalmente la plantilla {level}. "
+                "El motor adaptativo V7 se conectará en la siguiente fase."
+            )
+        else:
+            level = c2.selectbox(
+                "Nivel (legacy · completa la Evaluación RCP para automatizarlo)",
+                LEVELS,
+                index=LEVELS.index(existing.get("level", "Principiante"))
+                if existing.get("level") in LEVELS else 0,
+            )
 
         c3, c4 = st.columns(2)
         days = c3.slider(
@@ -807,10 +1512,34 @@ def profile_form(existing=None):
 
 
 profile = get_profile()
+ASSESSMENT_READY = assessment_storage_ready()
+LATEST_ASSESSMENT = get_latest_assessment() if ASSESSMENT_READY else None
+
 if not profile:
     st.title("🏃 Bienvenido a RunningCoachPro")
     st.write(f"Cuenta: **{USER_EMAIL}**")
-    profile_form()
+
+    if ASSESSMENT_READY and not LATEST_ASSESSMENT:
+        st.info(
+            "Antes de crear tu primer plan, RunningCoachPro evaluará tu experiencia, "
+            "base actual, disponibilidad y objetivo."
+        )
+        assessment_form(onboarding=True)
+    elif ASSESSMENT_READY and LATEST_ASSESSMENT:
+        show_assessment_result(LATEST_ASSESSMENT)
+        st.divider()
+        st.markdown("### Crear el plan actual")
+        st.caption(
+            "En V6.2 la evaluación ya determina tu nivel. El generador adaptativo completo "
+            "se conectará en la siguiente fase; por ahora se conserva el generador V6 para no romper la app."
+        )
+        profile_form(assessed_level=LATEST_ASSESSMENT.get("runner_level"))
+    else:
+        st.warning(
+            "El módulo de evaluación aún no está instalado en Supabase. "
+            "Puedes usar temporalmente la configuración V6 o ejecutar supabase_v6_2_assessment.sql."
+        )
+        profile_form()
     st.stop()
 
 PLAN = get_plan()
@@ -840,6 +1569,11 @@ st.sidebar.caption(USER_EMAIL)
 st.sidebar.markdown(f"🎯 **Objetivo:** {profile['goal']}")
 st.sidebar.markdown(f"📅 **Días/sem:** {profile['days_per_week']}")
 st.sidebar.markdown(f"📏 **Base:** {float(profile['weekly_km']):g} km/sem")
+if LATEST_ASSESSMENT:
+    st.sidebar.markdown(
+        f"🧭 **Nivel RCP:** {str(LATEST_ASSESSMENT.get('runner_level') or '—').title()} "
+        f"· {int(LATEST_ASSESSMENT.get('runner_score') or 0)}/100"
+    )
 
 selected_day = st.sidebar.date_input(
     "Fecha",
@@ -897,7 +1631,15 @@ m2.metric("KM reales", f"{actual_km_total:.1f}")
 m3.metric("RPE promedio", "—" if avg_rpe is None else f"{avg_rpe:.1f}/10")
 m4.metric("Sesiones del plan", len(PLAN))
 
-tabs = st.tabs(["📍 Hoy", "📅 Semana", "📊 Progreso", "🗓️ Plan", "✅ Registro", "⚙️ Perfil"])
+tabs = st.tabs([
+    "📍 Hoy",
+    "📅 Semana",
+    "📊 Progreso",
+    "🗓️ Plan",
+    "✅ Registro",
+    "🧭 Evaluación",
+    "⚙️ Perfil",
+])
 
 # ============================================================
 # HOY
@@ -1171,15 +1913,60 @@ with tabs[4]:
                 st.rerun()
 
 # ============================================================
-# PERFIL
+# EVALUACIÓN RCP
 # ============================================================
 with tabs[5]:
+    st.subheader("Evaluación del corredor")
+    if not ASSESSMENT_READY:
+        st.error(
+            "Falta instalar el módulo V6.2 en Supabase. Ejecuta el archivo "
+            "supabase_v6_2_assessment.sql y recarga la app."
+        )
+    elif LATEST_ASSESSMENT:
+        show_assessment_result(LATEST_ASSESSMENT)
+        st.caption(
+            "Tu plan actual NO se modifica al reevaluarte. El resultado queda guardado como historial "
+            "y se utilizará por el motor adaptativo en una versión posterior."
+        )
+        with st.expander("🔄 Hacer una nueva evaluación"):
+            assessment_form(existing_assessment=LATEST_ASSESSMENT)
+
+        history = get_assessments(limit=10)
+        if len(history) > 1:
+            st.divider()
+            st.markdown("### Historial")
+            rows = []
+            for a in history:
+                created = str(a.get("created_at") or "")
+                try:
+                    created_label = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%d/%m/%Y %H:%M")
+                except Exception:
+                    created_label = created[:16]
+                rows.append({
+                    "Fecha": created_label,
+                    "Nivel": str(a.get("runner_level") or "").title(),
+                    "Score": int(a.get("runner_score") or 0),
+                    "Objetivo": a.get("goal"),
+                    "Preparación": a.get("goal_readiness"),
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aún no has realizado tu evaluación RCP.")
+        assessment_form(onboarding=True)
+
+# ============================================================
+# PERFIL
+# ============================================================
+with tabs[6]:
     st.subheader("Mi perfil")
     st.warning(
         "Si actualizas y regeneras el plan, los registros actuales se eliminarán "
         "para evitar mezclar dos planificaciones distintas."
     )
-    profile_form(profile)
+    profile_form(
+        profile,
+        assessed_level=LATEST_ASSESSMENT.get("runner_level") if LATEST_ASSESSMENT else None,
+    )
 
     st.divider()
     st.markdown("### Mantenimiento de registros")
