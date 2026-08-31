@@ -8,7 +8,7 @@ import re
 import requests
 
 st.set_page_config(
-    page_title="RunningCoachPro V3",
+    page_title="RunningCoachPro V4",
     page_icon="🏃",
     layout="wide",
 )
@@ -1315,6 +1315,197 @@ def readiness(as_of):
     )
 
 
+
+def hms_to_seconds(text):
+    parts = [int(x) for x in str(text).split(":")]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return 0
+
+
+def pace_text_to_seconds(text):
+    m = re.match(r"^\s*(\d+):(\d{2})", str(text))
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def pace_decimal(seconds_per_km):
+    if seconds_per_km is None:
+        return None
+    return round(float(seconds_per_km) / 60.0, 3)
+
+
+def logged_running_sessions(as_of):
+    rows = []
+    for s in PLAN:
+        d = date.fromisoformat(s["fecha"])
+        if d > as_of or not is_running(s):
+            continue
+
+        log = LOG_BY_DATE.get(s["fecha"])
+        if not log or status_label(log) not in ("COMPLETADO", "MODIFICADO"):
+            continue
+
+        km = float(log.get("actual_km") or 0)
+        sec = int(log.get("actual_duration_sec") or 0)
+        if km <= 0:
+            continue
+
+        pace_sec = (sec / km) if sec > 0 else None
+        rows.append({
+            "date": d,
+            "session": s,
+            "log": log,
+            "km": km,
+            "seconds": sec,
+            "pace_sec": pace_sec,
+        })
+    return rows
+
+
+def weekly_dashboard_data(as_of):
+    data = []
+    for w in range(1, 14):
+        sessions = [s for s in PLAN if s["semana"] == w]
+        plan_base_km = sum(
+            s["km"] for s in sessions
+            if not is_optional(s) and is_running(s)
+        )
+
+        real_km = 0.0
+        load_proxy = 0.0
+        rpes = []
+        completed = 0
+        due_base = 0
+
+        for s in sessions:
+            d = date.fromisoformat(s["fecha"])
+            if d <= as_of and not is_optional(s):
+                due_base += 1
+
+            log = LOG_BY_DATE.get(s["fecha"])
+            if not log or d > as_of:
+                continue
+
+            if status_label(log) in ("COMPLETADO", "MODIFICADO"):
+                if not is_optional(s) and d <= as_of:
+                    completed += 1
+
+                km = float(log.get("actual_km") or 0)
+                real_km += km
+
+                try:
+                    rpe = float(log.get("rpe")) if log.get("rpe") is not None else None
+                except Exception:
+                    rpe = None
+
+                if rpe is not None:
+                    rpes.append(rpe)
+                    if is_running(s):
+                        load_proxy += km * rpe
+
+        data.append({
+            "week": w,
+            "plan_km": round(plan_base_km, 2),
+            "real_km": round(real_km, 2),
+            "load": round(load_proxy, 2),
+            "avg_rpe": round(sum(rpes) / len(rpes), 2) if rpes else None,
+            "completed": completed,
+            "due_base": due_base,
+        })
+    return data
+
+
+def milestone_metrics(as_of):
+    runs = logged_running_sessions(as_of)
+    if not runs:
+        return {
+            "longest": None,
+            "fastest_easy": None,
+            "best_week_km": None,
+            "long_runs_completed": 0,
+        }
+
+    longest = max(runs, key=lambda x: x["km"])
+
+    comparable = [
+        x for x in runs
+        if x["session"]["tipo"] in ("RODAJE", "LARGA") and x["pace_sec"] is not None
+    ]
+    fastest_easy = min(comparable, key=lambda x: x["pace_sec"]) if comparable else None
+
+    weekly = weekly_dashboard_data(as_of)
+    best_week = max(weekly, key=lambda x: x["real_km"]) if weekly else None
+
+    long_runs_completed = sum(
+        1 for x in runs if x["session"]["tipo"] == "LARGA"
+    )
+
+    return {
+        "longest": longest,
+        "fastest_easy": fastest_easy,
+        "best_week_km": best_week,
+        "long_runs_completed": long_runs_completed,
+    }
+
+
+def recent_training_alerts(as_of):
+    messages = []
+    recent = []
+    cutoff = as_of - timedelta(days=14)
+
+    for s in PLAN:
+        d = date.fromisoformat(s["fecha"])
+        if not (cutoff <= d <= as_of):
+            continue
+
+        log = LOG_BY_DATE.get(s["fecha"])
+        if not log:
+            continue
+
+        recent.append((s, log))
+
+        if (
+            status_label(log) in ("COMPLETADO", "MODIFICADO")
+            and is_running(s)
+            and float(s["km"] or 0) > 0
+        ):
+            real_km = float(log.get("actual_km") or 0)
+            if real_km > float(s["km"]) * 1.15:
+                messages.append(
+                    f"{d.strftime('%d/%m')}: corriste {real_km:.1f} km frente a "
+                    f"{float(s['km']):.1f} km planificados (+15% o más)."
+                )
+
+    high_rpe = []
+    for s, log in recent:
+        if status_label(log) in ("COMPLETADO", "MODIFICADO"):
+            try:
+                rpe = float(log.get("rpe"))
+            except Exception:
+                continue
+            if rpe >= 8:
+                high_rpe.append((s, rpe))
+
+    if len(high_rpe) >= 2:
+        messages.append(
+            f"Hay {len(high_rpe)} sesiones con RPE ≥8 en los últimos 14 días."
+        )
+
+    missed_base = [
+        s for s, log in recent
+        if not is_optional(s) and status_label(log) == "OMITIDO"
+    ]
+    if missed_base:
+        messages.append(
+            f"Hay {len(missed_base)} sesión(es) base omitida(s) en los últimos 14 días."
+        )
+
+    return messages[:5]
+
 def csv_export():
     out = StringIO()
     cols = [
@@ -1349,7 +1540,7 @@ def csv_export():
 # ------------------------------
 # SIDEBAR
 # ------------------------------
-st.sidebar.title("🏃 RunningCoachPro V3")
+st.sidebar.title("🏃 RunningCoachPro V4")
 st.sidebar.caption("Plan importado de RunningCoachPro Sep–Nov 2026")
 
 selected_day = st.sidebar.date_input(
@@ -1394,7 +1585,7 @@ if APP_PIN and st.sidebar.button("Cerrar sesión", use_container_width=True):
 # HEADER
 # ------------------------------
 st.title("🏃 RunningCoachPro")
-st.caption("Plan real de media maratón · Septiembre a Noviembre 2026 · V3")
+st.caption("Plan real de media maratón · Septiembre a Noviembre 2026 · V4")
 
 h1, h2, h3, h4 = st.columns(4)
 h1.metric("Marca actual", CURRENT_TIME)
@@ -1408,9 +1599,253 @@ progress = elapsed / total_days
 st.progress(progress, text=f"Progreso hacia la media maratón objetivo · {progress*100:.0f}%")
 
 
-tab_today, tab_week, tab_progress, tab_plan, tab_zones, tab_log = st.tabs(
-    ["📍 Hoy / fecha", "📅 Semana", "📊 Progreso", "🗓️ Plan completo", "🎯 Zonas", "✅ Registro"]
+tab_dashboard, tab_today, tab_week, tab_progress, tab_plan, tab_zones, tab_log = st.tabs(
+    ["🏠 Dashboard", "📍 Hoy / fecha", "📅 Semana", "📊 Progreso", "🗓️ Plan completo", "🎯 Zonas", "✅ Registro"]
 )
+
+
+# ------------------------------
+# DASHBOARD V4
+# ------------------------------
+with tab_dashboard:
+    st.subheader("Panel de rendimiento")
+
+    dm = dashboard_metrics(selected_day)
+    level, avg3, recommendation = readiness(selected_day)
+    weekly = weekly_dashboard_data(selected_day)
+    milestones = milestone_metrics(selected_day)
+    alerts = recent_training_alerts(selected_day)
+
+    current_sec = hms_to_seconds(CURRENT_TIME)
+    target_sec = hms_to_seconds(TARGET_TIME)
+    time_gap = max(0, current_sec - target_sec)
+    current_pace_sec = pace_text_to_seconds(CURRENT_PACE)
+    target_pace_sec = pace_text_to_seconds(TARGET_PACE)
+    pace_gap = (
+        current_pace_sec - target_pace_sec
+        if current_pace_sec is not None and target_pace_sec is not None
+        else None
+    )
+
+    days_left = (RACE_DATE - selected_day).days
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Cumplimiento base",
+        f"{dm['compliance']:.0f}%",
+        f"{dm['completed_base']} de {dm['due_base']} sesiones",
+    )
+    k2.metric(
+        "KM reales acumulados",
+        f"{dm['actual_km']:.1f}",
+        f"Plan vencido: {dm['plan_km_due']:.1f} km",
+    )
+    k3.metric(
+        "RPE promedio",
+        "—" if dm["avg_rpe"] is None else f"{dm['avg_rpe']:.1f}/10",
+    )
+    k4.metric(
+        "Días para carrera" if days_left >= 0 else "Días desde carrera",
+        abs(days_left),
+    )
+
+    st.markdown("### 🎯 Objetivo 1:47:12")
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Marca de referencia", CURRENT_TIME)
+    g2.metric("Meta", TARGET_TIME, f"-{time_gap // 60}:{time_gap % 60:02d}")
+    g3.metric(
+        "Cambio de ritmo objetivo",
+        f"{TARGET_PACE} min/km",
+        None if pace_gap is None else f"-{pace_gap} s/km",
+    )
+
+    if dm["due_base"] > 0:
+        st.progress(
+            min(1.0, dm["compliance"] / 100.0),
+            text=f"Cumplimiento de sesiones base vencidas · {dm['compliance']:.0f}%",
+        )
+    else:
+        st.info("Aún no hay sesiones base vencidas en la fecha seleccionada.")
+
+    st.markdown("### 📊 PLAN vs REAL por semana")
+    km_chart = []
+    for row in weekly:
+        km_chart.append({"Semana": str(row["week"]), "Serie": "Plan base", "KM": row["plan_km"]})
+        km_chart.append({"Semana": str(row["week"]), "Serie": "Real", "KM": row["real_km"]})
+
+    st.vega_lite_chart(
+        {
+            "data": {"values": km_chart},
+            "mark": {"type": "bar", "tooltip": True},
+            "encoding": {
+                "x": {"field": "Semana", "type": "ordinal", "title": "Semana"},
+                "xOffset": {"field": "Serie"},
+                "y": {"field": "KM", "type": "quantitative", "title": "Kilómetros"},
+                "color": {"field": "Serie", "type": "nominal"},
+                "tooltip": [
+                    {"field": "Semana", "type": "ordinal"},
+                    {"field": "Serie", "type": "nominal"},
+                    {"field": "KM", "type": "quantitative", "format": ".1f"},
+                ],
+            },
+        },
+        use_container_width=True,
+    )
+
+    chart_left, chart_right = st.columns(2)
+
+    with chart_left:
+        st.markdown("### 🏃 Evolución de ritmo real")
+        run_rows = logged_running_sessions(selected_day)
+        pace_types = ["RODAJE", "LARGA", "TEMPO", "SERIES"]
+        selected_pace_types = st.multiselect(
+            "Tipos incluidos",
+            pace_types,
+            default=["RODAJE", "LARGA", "TEMPO"],
+            key="dashboard_pace_types",
+        )
+
+        pace_data = []
+        for x in run_rows:
+            if x["session"]["tipo"] not in selected_pace_types or x["pace_sec"] is None:
+                continue
+            pace_data.append({
+                "Fecha": x["date"].isoformat(),
+                "Ritmo": pace_decimal(x["pace_sec"]),
+                "RitmoTexto": fmt_pace(x["seconds"], x["km"]),
+                "Tipo": x["session"]["tipo"],
+                "Entrenamiento": x["session"]["entrenamiento"],
+            })
+
+        if pace_data:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": pace_data},
+                    "mark": {"type": "line", "point": True, "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Fecha", "type": "temporal", "title": "Fecha"},
+                        "y": {
+                            "field": "Ritmo",
+                            "type": "quantitative",
+                            "title": "Ritmo promedio total (min/km)",
+                            "scale": {"reverse": True, "zero": False},
+                        },
+                        "color": {"field": "Tipo", "type": "nominal"},
+                        "tooltip": [
+                            {"field": "Fecha", "type": "temporal"},
+                            {"field": "Entrenamiento", "type": "nominal"},
+                            {"field": "RitmoTexto", "type": "nominal", "title": "Ritmo"},
+                        ],
+                    },
+                },
+                use_container_width=True,
+            )
+            st.caption(
+                "Es el ritmo promedio de toda la sesión registrada; en series/tempo incluye calentamiento y recuperaciones."
+            )
+        else:
+            st.info("Todavía no hay suficientes sesiones con distancia y duración para graficar ritmo.")
+
+    with chart_right:
+        st.markdown("### 🔋 Carga semanal")
+        load_data = [
+            {"Semana": str(x["week"]), "Carga": x["load"]}
+            for x in weekly if x["load"] > 0
+        ]
+        if load_data:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": load_data},
+                    "mark": {"type": "bar", "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Semana", "type": "ordinal"},
+                        "y": {"field": "Carga", "type": "quantitative", "title": "Índice km × RPE"},
+                        "tooltip": [
+                            {"field": "Semana", "type": "ordinal"},
+                            {"field": "Carga", "type": "quantitative", "format": ".1f"},
+                        ],
+                    },
+                },
+                use_container_width=True,
+            )
+            st.caption(
+                "Indicador simple de seguimiento: kilómetros reales × RPE. No es una medición fisiológica ni sustituye evaluación profesional."
+            )
+        else:
+            st.info("Registra sesiones con km y RPE para construir la carga semanal.")
+
+    st.markdown("### 🚦 Estado de carga reciente")
+    if level == "VERDE":
+        st.success(f"VERDE · RPE reciente {avg3:.1f}" if avg3 is not None else "VERDE")
+    elif level == "AMARILLO":
+        st.warning(f"AMARILLO · RPE reciente {avg3:.1f}" if avg3 is not None else "AMARILLO")
+    elif level == "ROJO":
+        st.error(f"ROJO · RPE reciente {avg3:.1f}" if avg3 is not None else "ROJO")
+    else:
+        st.info("SIN DATOS")
+    st.write(recommendation)
+
+    if alerts:
+        st.markdown("#### Alertas de seguimiento")
+        for msg in alerts:
+            st.warning(msg)
+
+    st.markdown("### 🏆 Hitos registrados")
+    m1, m2, m3, m4 = st.columns(4)
+
+    longest = milestones["longest"]
+    m1.metric(
+        "Tirada/sesión más larga",
+        "—" if longest is None else f"{longest['km']:.1f} km",
+        None if longest is None else longest["date"].strftime("%d/%m"),
+    )
+
+    fastest = milestones["fastest_easy"]
+    m2.metric(
+        "Mejor ritmo rodaje/larga",
+        "—" if fastest is None else fmt_pace(fastest["seconds"], fastest["km"]),
+        None if fastest is None else fastest["date"].strftime("%d/%m"),
+    )
+
+    best_week = milestones["best_week_km"]
+    m3.metric(
+        "Semana con más KM reales",
+        "—" if not best_week or best_week["real_km"] <= 0 else f"{best_week['real_km']:.1f} km",
+        None if not best_week or best_week["real_km"] <= 0 else f"Semana {best_week['week']}",
+    )
+
+    m4.metric(
+        "Tiradas largas completadas",
+        milestones["long_runs_completed"],
+    )
+
+    st.markdown("### 🧾 Últimos registros")
+    recent_records = []
+    for s in reversed(PLAN):
+        d = date.fromisoformat(s["fecha"])
+        if d > selected_day:
+            continue
+        log = LOG_BY_DATE.get(s["fecha"])
+        if not log:
+            continue
+
+        recent_records.append({
+            "Fecha": d.strftime("%d/%m/%Y"),
+            "Tipo": s["tipo"],
+            "Sesión": s["entrenamiento"],
+            "Plan km": round(float(s["km"]), 1),
+            "Real km": round(float(log.get("actual_km") or 0), 1),
+            "Ritmo real": fmt_pace(log.get("actual_duration_sec"), log.get("actual_km")),
+            "RPE": log.get("rpe"),
+            "Estado": status_label(log),
+        })
+        if len(recent_records) >= 6:
+            break
+
+    if recent_records:
+        st.dataframe(recent_records, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Aún no hay registros para mostrar.")
 
 
 # ------------------------------
@@ -1823,7 +2258,7 @@ with tab_log:
 
 if not DB_READY:
     st.warning(
-        "La V3 está funcionando en modo temporal. Para que los registros sobrevivan a reinicios de Streamlit, "
+        "La V4 está funcionando en modo temporal. Para que los registros sobrevivan a reinicios de Streamlit, "
         "configura Supabase con los archivos incluidos en el paquete V3."
     )
 
