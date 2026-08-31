@@ -99,6 +99,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
+APP_VERSION = "6.1"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -318,9 +319,25 @@ def save_log(payload):
     ).execute()
 
 
+def delete_log(session_date):
+    client.table("rc_workout_logs").delete().eq(
+        "user_id", USER_ID
+    ).eq("session_date", str(session_date)).execute()
+
+
 # ============================================================
 # Helpers
 # ============================================================
+def session_is_optional(session):
+    """Reconoce opcionales incluso en planes migrados con el flag antiguo incorrecto."""
+    if bool(session.get("is_optional")):
+        return True
+
+    name = str(session.get("workout_name") or "").upper()
+    intensity = str(session.get("intensity") or "").upper()
+    return "OPCIONAL" in name or intensity == "OPCIONAL"
+
+
 def parse_hms(text):
     text = str(text or "").strip()
     if not text:
@@ -799,13 +816,25 @@ if not profile:
 PLAN = get_plan()
 LOGS = get_logs()
 PLAN_BY_DATE = {str(x["session_date"]): x for x in PLAN}
-LOG_BY_DATE = {str(x["session_date"]): x for x in LOGS}
+
+# Solo los registros asociados por fecha al plan vigente alimentan métricas y gráficos.
+# Esto evita que registros de prueba o restos de una planificación anterior contaminen
+# KM reales, RPE y PLAN vs REAL.
+CURRENT_LOGS = [
+    x for x in LOGS
+    if str(x.get("session_date")) in PLAN_BY_DATE
+]
+ORPHAN_LOGS = [
+    x for x in LOGS
+    if str(x.get("session_date")) not in PLAN_BY_DATE
+]
+LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
 # ============================================================
 # Navegación / Sidebar
 # ============================================================
 st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption("Multiusuario · Web + móvil")
+st.sidebar.caption(f"V{APP_VERSION} Multiusuario · Web + móvil")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
 st.sidebar.markdown(f"🎯 **Objetivo:** {profile['goal']}")
@@ -838,15 +867,16 @@ st.title("🏃 RunningCoachPro")
 st.caption(f"Hola, {profile['display_name']} · Tu plan, tus datos, tu progreso")
 
 completed = [
-    l for l in LOGS
+    l for l in CURRENT_LOGS
     if str(l.get("status", "")).upper() in ("COMPLETADO", "MODIFICADO")
 ]
 actual_km_total = sum(float(x.get("actual_km") or 0) for x in completed)
 
+dashboard_day = date.today()
 due_sessions = [
     p for p in PLAN
-    if date.fromisoformat(str(p["session_date"])) <= selected_day
-    and not bool(p.get("is_optional"))
+    if date.fromisoformat(str(p["session_date"])) <= dashboard_day
+    and not session_is_optional(p)
 ]
 done_due = [
     p for p in due_sessions
@@ -862,7 +892,7 @@ rpes = [
 avg_rpe = sum(rpes) / len(rpes) if rpes else None
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Cumplimiento", f"{compliance:.0f}%")
+m1.metric("Cumplimiento", "—" if not due_sessions else f"{compliance:.0f}%")
 m2.metric("KM reales", f"{actual_km_total:.1f}")
 m3.metric("RPE promedio", "—" if avg_rpe is None else f"{avg_rpe:.1f}/10")
 m4.metric("Sesiones del plan", len(PLAN))
@@ -958,9 +988,11 @@ with tabs[2]:
     for p in PLAN:
         week = int(p["week_no"])
         weekly.setdefault(week, {"plan": 0.0, "real": 0.0, "rpes": []})
-        weekly[week]["plan"] += float(p["planned_km"] or 0)
+        # PLAN vs REAL usa la carga base; los rodajes opcionales no inflan el plan.
+        if not session_is_optional(p):
+            weekly[week]["plan"] += float(p["planned_km"] or 0)
 
-    for l in LOGS:
+    for l in CURRENT_LOGS:
         if str(l.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
             continue
         p = PLAN_BY_DATE.get(str(l["session_date"]))
@@ -974,7 +1006,7 @@ with tabs[2]:
 
     values = []
     for week in sorted(weekly):
-        values.append({"Semana": str(week), "Serie": "Plan", "KM": round(weekly[week]["plan"], 1)})
+        values.append({"Semana": str(week), "Serie": "Plan base", "KM": round(weekly[week]["plan"], 1)})
         values.append({"Semana": str(week), "Serie": "Real", "KM": round(weekly[week]["real"], 1)})
 
     st.vega_lite_chart(
@@ -1040,6 +1072,7 @@ with tabs[3]:
             "Entrenamiento": p["workout_name"],
             "KM": float(p["planned_km"]),
             "Objetivo": p["target"],
+            "Opcional": "SÍ" if session_is_optional(p) else "NO",
             "Estado": str(log.get("status") or "PENDIENTE") if log else "PENDIENTE",
         })
     st.dataframe(table, use_container_width=True, hide_index=True)
@@ -1122,6 +1155,21 @@ with tabs[4]:
                 st.success("Guardado permanentemente ✅")
                 st.rerun()
 
+        if existing:
+            st.divider()
+            st.caption(
+                "Si este registro fue una prueba o quedó mal guardado, puedes eliminarlo "
+                "sin modificar la sesión planificada."
+            )
+            if st.button(
+                "🗑️ Eliminar registro de esta fecha",
+                key=f"delete_log_{selected_day.isoformat()}",
+                use_container_width=True,
+            ):
+                delete_log(selected_day.isoformat())
+                st.success("Registro eliminado.")
+                st.rerun()
+
 # ============================================================
 # PERFIL
 # ============================================================
@@ -1132,6 +1180,35 @@ with tabs[5]:
         "para evitar mezclar dos planificaciones distintas."
     )
     profile_form(profile)
+
+    st.divider()
+    st.markdown("### Mantenimiento de registros")
+    if ORPHAN_LOGS:
+        st.warning(
+            f"Hay {len(ORPHAN_LOGS)} registro(s) que no pertenecen al plan vigente. "
+            "Ya no se incluyen en los KPI ni en los gráficos."
+        )
+        orphan_rows = [
+            {
+                "Fecha": date.fromisoformat(str(x["session_date"])).strftime("%d/%m/%Y"),
+                "Estado": str(x.get("status") or ""),
+                "KM": float(x.get("actual_km") or 0),
+                "RPE": x.get("rpe"),
+            }
+            for x in ORPHAN_LOGS
+        ]
+        st.dataframe(orphan_rows, use_container_width=True, hide_index=True)
+        if st.button(
+            "🧹 Eliminar registros fuera del plan",
+            key="delete_orphan_logs",
+            use_container_width=True,
+        ):
+            for old_log in ORPHAN_LOGS:
+                delete_log(old_log["session_date"])
+            st.success("Registros fuera del plan eliminados.")
+            st.rerun()
+    else:
+        st.success("No hay registros huérfanos o de planes anteriores.")
 
     st.divider()
     st.markdown("### Cuenta")
