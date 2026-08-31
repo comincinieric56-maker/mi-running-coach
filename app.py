@@ -8,9 +8,143 @@ import re
 import requests
 
 st.set_page_config(
-    page_title="RunningCoachPro V4",
+    page_title="RunningCoachPro V5",
     page_icon="🏃",
     layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# ------------------------------
+# V5 · Optimización para celular
+# ------------------------------
+st.markdown(
+    """
+    <style>
+    /* Contenido general */
+    .block-container {
+        max-width: 1180px;
+        padding-top: 1.15rem;
+        padding-bottom: 4rem;
+    }
+
+    /* Botones táctiles */
+    .stButton > button,
+    .stDownloadButton > button,
+    [data-testid="stFormSubmitButton"] > button {
+        min-height: 48px;
+        border-radius: 12px;
+        font-weight: 600;
+    }
+
+    /* Inputs más cómodos */
+    div[data-baseweb="input"] input,
+    div[data-baseweb="select"] > div,
+    textarea {
+        min-height: 44px;
+        font-size: 16px !important;
+    }
+
+    /* Tarjetas y avisos */
+    [data-testid="stMetric"] {
+        padding: 0.6rem 0;
+    }
+
+    /* Tabs desplazables con dedo */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.25rem;
+        overflow-x: auto;
+        scrollbar-width: thin;
+        white-space: nowrap;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        min-height: 44px;
+        flex: 0 0 auto;
+    }
+
+    /* Tablas: permitir scroll horizontal local */
+    [data-testid="stDataFrame"] {
+        overflow-x: auto;
+    }
+
+    @media (max-width: 768px) {
+        /* Márgenes compactos en móvil */
+        .block-container {
+            padding-left: 0.85rem;
+            padding-right: 0.85rem;
+            padding-top: 0.75rem;
+            padding-bottom: 5rem;
+        }
+
+        h1 {
+            font-size: 1.9rem !important;
+            line-height: 1.15 !important;
+        }
+
+        h2 {
+            font-size: 1.45rem !important;
+        }
+
+        h3 {
+            font-size: 1.15rem !important;
+        }
+
+        /* En móvil, las columnas se apilan */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.55rem !important;
+        }
+
+        [data-testid="column"] {
+            flex: 1 1 100% !important;
+            width: 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Métricas como tarjetas legibles */
+        [data-testid="stMetric"] {
+            border: 1px solid rgba(128, 128, 128, 0.20);
+            border-radius: 14px;
+            padding: 0.75rem 0.85rem;
+        }
+
+        [data-testid="stMetricValue"] {
+            font-size: 1.65rem !important;
+        }
+
+        [data-testid="stMetricLabel"] {
+            font-size: 0.82rem !important;
+        }
+
+        /* Botones full-width cómodos */
+        .stButton > button,
+        .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] > button {
+            width: 100% !important;
+            min-height: 50px;
+        }
+
+        /* Tabs más compactas */
+        .stTabs [data-baseweb="tab"] {
+            padding-left: 0.65rem;
+            padding-right: 0.65rem;
+        }
+
+        /* Gráficos aprovechan todo el ancho */
+        [data-testid="stVegaLiteChart"] {
+            width: 100% !important;
+        }
+
+        /* Menos aire en separadores */
+        hr {
+            margin-top: 0.8rem !important;
+            margin-bottom: 0.8rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 PLAN = [{'fecha': '2026-09-01',
@@ -1540,8 +1674,15 @@ def csv_export():
 # ------------------------------
 # SIDEBAR
 # ------------------------------
-st.sidebar.title("🏃 RunningCoachPro V4")
+st.sidebar.title("🏃 RunningCoachPro V5")
 st.sidebar.caption("Plan importado de RunningCoachPro Sep–Nov 2026")
+
+st.sidebar.caption("📱 V5 optimizada para celular")
+with st.sidebar.expander("📲 Añadir a pantalla de inicio"):
+    st.markdown(
+        "**iPhone (Safari):** Compartir → Añadir a pantalla de inicio.\n\n"
+        "**Android (Chrome):** menú ⋮ → Añadir a pantalla principal / Instalar app."
+    )
 
 selected_day = st.sidebar.date_input(
     "Fecha a consultar",
@@ -1585,7 +1726,7 @@ if APP_PIN and st.sidebar.button("Cerrar sesión", use_container_width=True):
 # HEADER
 # ------------------------------
 st.title("🏃 RunningCoachPro")
-st.caption("Plan real de media maratón · Septiembre a Noviembre 2026 · V4")
+st.caption("Plan real de media maratón · Septiembre a Noviembre 2026 · V5 · Mobile")
 
 h1, h2, h3, h4 = st.columns(4)
 h1.metric("Marca actual", CURRENT_TIME)
@@ -2258,7 +2399,7 @@ with tab_log:
 
 if not DB_READY:
     st.warning(
-        "La V4 está funcionando en modo temporal. Para que los registros sobrevivan a reinicios de Streamlit, "
+        "La V5 está funcionando en modo temporal. Para que los registros sobrevivan a reinicios de Streamlit, "
         "configura Supabase con los archivos incluidos en el paquete V3."
     )
 
