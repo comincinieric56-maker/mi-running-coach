@@ -1,22 +1,34 @@
-# RunningCoachPro V2
+# RunningCoachPro V3
 
-Esta versión está construida directamente a partir del archivo
-`RunningCoachPro_Sep_Nov_2026.xlsx`.
+V3 construida directamente desde `RunningCoachPro_Sep_Nov_2026.xlsx`.
 
-## Incluye
+## Novedades
 
-- Plan real de 13 semanas (septiembre–noviembre 2026).
-- Entrenamiento exacto de cada fecha.
-- Vista semanal.
-- Plan completo filtrable.
-- Zonas de ritmo exactas del documento.
-- Series, tempo, rodaje posturno opcional, fuerza y tiradas largas.
-- Media maratón objetivo del 29/11/2026.
-- Registro temporal de distancia real, duración, RPE, FC y observaciones.
+- Guardado permanente con Supabase.
+- PIN de acceso para proteger una app pública de Streamlit.
+- Comparación PLAN vs REAL.
+- KM semanales planificados vs reales.
+- RPE promedio semanal.
+- Semáforo de carga (verde / amarillo / rojo).
+- Estados: COMPLETADO, MODIFICADO y OMITIDO.
+- El rodaje opcional omitido no penaliza el plan y no se recupera otro día.
+- Exportación de respaldo CSV.
+- Conserva las 58 sesiones y las zonas del Excel.
 
-## Actualizar tu app actual en Streamlit
+## Archivos
 
-Solo necesitas reemplazar `app.py` en tu repositorio de GitHub.
-`requirements.txt` puede mantenerse igual.
+- `app.py`: reemplaza el app.py actual.
+- `requirements.txt`: reemplaza el actual.
+- `supabase_setup.sql`: ejecutar una vez en el SQL Editor de Supabase.
+- `secrets_example.toml`: ejemplo de los Secrets de Streamlit.
+- `.gitignore`: evita subir secretos locales por accidente.
 
-Streamlit detectará el cambio y volverá a desplegar la app automáticamente.
+## Seguridad
+
+NO pongas la clave `sb_secret_...` dentro de app.py ni la subas a GitHub.
+Guárdala únicamente en los Secrets de Streamlit.
+
+## Si todavía no configuras Supabase
+
+La app arranca igualmente en "modo temporal", para que puedas comprobar que
+la interfaz funciona. Cuando añadas Supabase, el guardado será permanente.

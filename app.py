@@ -1,8 +1,14 @@
+
 import streamlit as st
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from io import StringIO
+import csv
+import hmac
+import re
+import requests
 
 st.set_page_config(
-    page_title="RunningCoachPro",
+    page_title="RunningCoachPro V3",
     page_icon="🏃",
     layout="wide",
 )
@@ -21,8 +27,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 x 600 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '90 s trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-09-03',
   'semana': 1,
   'tipo': 'TEMPO',
@@ -37,8 +43,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 km tempo controlado',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-09-04',
   'semana': 1,
   'tipo': 'RODAJE',
@@ -53,8 +59,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-09-06',
   'semana': 1,
   'tipo': 'LARGA',
@@ -69,8 +75,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '14 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-09-08',
   'semana': 2,
   'tipo': 'SERIES',
@@ -85,8 +91,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 x 800 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-09-10',
   'semana': 2,
   'tipo': 'TEMPO',
@@ -116,8 +122,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-09-12',
   'semana': 2,
   'tipo': 'FUERZA',
@@ -129,12 +135,10 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-09-13',
   'semana': 2,
   'tipo': 'LARGA',
@@ -149,8 +153,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '16 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-09-15',
   'semana': 3,
   'tipo': 'SERIES',
@@ -165,8 +169,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 x 800 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-09-17',
   'semana': 3,
   'tipo': 'TEMPO',
@@ -181,8 +185,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '2 x 4 km',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-09-18',
   'semana': 3,
   'tipo': 'RODAJE',
@@ -197,8 +201,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-09-20',
   'semana': 3,
   'tipo': 'LARGA',
@@ -213,8 +217,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '18 km | RUTA APROX. 157 M D+ | ÚLTIMOS 3 KM PROGRESIVOS SIN SUPERAR RPE 7',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-09-22',
   'semana': 4,
   'tipo': 'SERIES',
@@ -229,8 +233,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '10 x 400 m a 4:29-4:37 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '200 m trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-09-24',
   'semana': 4,
   'tipo': 'TEMPO',
@@ -260,8 +264,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-09-26',
   'semana': 4,
   'tipo': 'FUERZA',
@@ -273,12 +277,10 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-09-27',
   'semana': 4,
   'tipo': 'LARGA',
@@ -293,8 +295,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '15 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-09-29',
   'semana': 5,
   'tipo': 'SERIES',
@@ -309,8 +311,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 x 1000 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-10-01',
   'semana': 5,
   'tipo': 'TEMPO',
@@ -325,8 +327,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km tempo continuo',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-10-02',
   'semana': 5,
   'tipo': 'RODAJE',
@@ -341,8 +343,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-10-04',
   'semana': 5,
   'tipo': 'LARGA',
@@ -357,8 +359,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '18 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-10-06',
   'semana': 6,
   'tipo': 'SERIES',
@@ -373,8 +375,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 x 1000 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-10-08',
   'semana': 6,
   'tipo': 'TEMPO',
@@ -404,8 +406,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-10-10',
   'semana': 6,
   'tipo': 'FUERZA',
@@ -417,12 +419,10 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-10-11',
   'semana': 6,
   'tipo': 'LARGA',
@@ -437,8 +437,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '20 km | RUTA APROX. 157 M D+ | ÚLTIMOS 4 KM PROGRESIVOS HASTA RITMO MODERADO',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-10-13',
   'semana': 7,
   'tipo': 'SERIES',
@@ -453,8 +453,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '4 x 1200 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:30 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-10-15',
   'semana': 7,
   'tipo': 'TEMPO',
@@ -469,8 +469,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '8 km tempo continuo',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-10-16',
   'semana': 7,
   'tipo': 'RODAJE',
@@ -485,8 +485,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-10-18',
   'semana': 7,
   'tipo': 'LARGA',
@@ -501,8 +501,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '16 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-10-20',
   'semana': 8,
   'tipo': 'SERIES',
@@ -517,8 +517,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 x 1200 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:30 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-10-22',
   'semana': 8,
   'tipo': 'TEMPO',
@@ -548,8 +548,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-10-24',
   'semana': 8,
   'tipo': 'FUERZA',
@@ -561,12 +561,10 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-10-25',
   'semana': 8,
   'tipo': 'LARGA',
@@ -581,8 +579,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '21 km | RUTA APROX. 157 M D+ | ÚLTIMOS 5 KM PROGRESIVOS SIN ENTRAR EN UMBRAL',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-10-27',
   'semana': 9,
   'tipo': 'SERIES',
@@ -597,8 +595,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '8 x 600 m a 4:29-4:37 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '90 s trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-10-29',
   'semana': 9,
   'tipo': 'TEMPO',
@@ -613,8 +611,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '9 km tempo continuo',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-10-30',
   'semana': 9,
   'tipo': 'RODAJE',
@@ -629,8 +627,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-11-01',
   'semana': 9,
   'tipo': 'LARGA',
@@ -645,8 +643,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '18 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-11-03',
   'semana': 10,
   'tipo': 'SERIES',
@@ -661,8 +659,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 x 1000 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-11-05',
   'semana': 10,
   'tipo': 'TEMPO',
@@ -677,8 +675,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '2 x 5 km',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-11-06',
   'semana': 10,
   'tipo': 'RODAJE',
@@ -693,8 +691,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-11-08',
   'semana': 10,
   'tipo': 'LARGA',
@@ -709,8 +707,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '22 km | RUTA APROX. 157 M D+ | ÚLTIMOS 4 KM A ESFUERZO STEADY CONTROLADO',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-11-10',
   'semana': 11,
   'tipo': 'SERIES',
@@ -725,8 +723,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '3 x 1600 m a ritmo controlado de 10K a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '3:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-11-12',
   'semana': 11,
   'tipo': 'TEMPO',
@@ -756,8 +754,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '7 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-11-14',
   'semana': 11,
   'tipo': 'FUERZA',
@@ -769,30 +767,27 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-11-15',
   'semana': 11,
   'tipo': 'LARGA',
   'entrenamiento': 'TIRADA LARGA 18 KM',
-  'descripcion': '18 KM EN RUTA HABITUAL CON APROXIMADAMENTE 157 M D+. ÚLTIMOS 5 KM CERCA DE RITMO MM OBJETIVO (5:05 '
-                 'MIN/KM) SOLO SI LAS SENSACIONES SON BUENAS.',
+  'descripcion': '18 KM EN RUTA HABITUAL CON APROXIMADAMENTE 157 M D+. ÚLTIMOS 5 KM CERCA DE RITMO MM OBJETIVO (5:05 MIN/KM) SOLO SI LAS '
+                 'SENSACIONES SON BUENAS.',
   'km': 18.0,
   'ritmo': '5:52-6:08 min/km',
   'duracion': '1:45:36',
   'intensidad': 'MEDIA',
   'objetivo': 'RESISTENCIA AERÓBICA, DURABILIDAD Y ESPECIFICIDAD PARA MEDIA MARATÓN',
   'calentamiento': 'PRIMEROS 2 KM ESPECIALMENTE CONTROLADOS',
-  'bloque': '18 km | RUTA APROX. 157 M D+ | ÚLTIMOS 5 KM CERCA DE RITMO MM OBJETIVO (5:05 MIN/KM) SOLO SI LAS '
-            'SENSACIONES SON BUENAS',
+  'bloque': '18 km | RUTA APROX. 157 M D+ | ÚLTIMOS 5 KM CERCA DE RITMO MM OBJETIVO (5:05 MIN/KM) SOLO SI LAS SENSACIONES SON BUENAS',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-11-17',
   'semana': 12,
   'tipo': 'SERIES',
@@ -807,8 +802,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 x 800 m a 4:42-4:49 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '2:00 min trote suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-11-19',
   'semana': 12,
   'tipo': 'TEMPO',
@@ -823,8 +818,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 km umbral controlado',
   'recuperacion': 'EN BLOQUES FRACCIONADOS: 2-3 MIN DE TROTE SUAVE',
   'enfriamiento': '1-2 km suaves',
-  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR '
-           'LADO | HIP THRUST 3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
+  'notas': 'ESFUERZO CONTROLADO. NO CONVERTIR EL TEMPO EN UNA CARRERA. FUERZA B 20-25 MIN: ZANCADA/BÚLGARA 3x8 POR LADO | HIP THRUST '
+           '3x8-10 | SÓLEO 3x12-15 | ESTABILIDAD DE CADERA + CORE. RIR 2-3.'},
  {'fecha': '2026-11-20',
   'semana': 12,
   'tipo': 'RODAJE',
@@ -839,8 +834,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-11-22',
   'semana': 12,
   'tipo': 'LARGA',
@@ -855,8 +850,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '14 km | RUTA APROX. 157 M D+ | TODO EL RECORRIDO EN ZONA AERÓBICA CONTROLADA',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5-10 min caminando + movilidad',
-  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO '
-           'COMPENSAR DESCENSOS CORRIENDO EXCESIVAMENTE RÁPIDO.'},
+  'notas': 'EL RITMO ES UNA REFERENCIA PARA LA RUTA HABITUAL. EN SUBIDAS PRIORIZAR ESFUERZO Y NO FORZAR EL RITMO. NO COMPENSAR DESCENSOS '
+           'CORRIENDO EXCESIVAMENTE RÁPIDO.'},
  {'fecha': '2026-11-24',
   'semana': 13,
   'tipo': 'SERIES',
@@ -871,8 +866,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '6 x 400 m ágiles sin máximo esfuerzo a 4:29-4:37 min/km | TERRENO PLANO O CAMINADORA 1%',
   'recuperacion': '200 m trote muy suave',
   'enfriamiento': '1.5-2 km suaves',
-  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 '
-           'MIN: SENTADILLA 3x6-8 | PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
+  'notas': 'SERIES EXCLUSIVAMENTE EN TERRENO PLANO O CAMINADORA. NO COMPENSAR REPETICIONES PERDIDAS. FUERZA A 20-25 MIN: SENTADILLA 3x6-8 '
+           '| PESO MUERTO RUMANO 3x8 | GEMELOS 3x12-15 | CORE 3 SERIES. RIR 2-3.'},
  {'fecha': '2026-11-26',
   'semana': 13,
   'tipo': 'TEMPO',
@@ -902,8 +897,8 @@ PLAN = [{'fecha': '2026-09-01',
   'bloque': '5 km conversacionales',
   'recuperacion': 'NO APLICA',
   'enfriamiento': '5 min caminando + movilidad',
-  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS '
-           'O RPE BASAL ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
+  'notas': 'POSTURNO. NO REALIZAR SI EL DESCANSO HA SIDO INSUFICIENTE, EXISTE FATIGA MARCADA, PESO EXCESIVO EN PIERNAS O RPE BASAL '
+           'ELEVADO. OMITIR ESTA SESIÓN NO DEBE RECUPERARSE OTRO DÍA.'},
  {'fecha': '2026-11-28',
   'semana': 13,
   'tipo': 'FUERZA',
@@ -915,12 +910,10 @@ PLAN = [{'fecha': '2026-09-01',
   'intensidad': 'MEDIA',
   'objetivo': 'FUERZA ESPECÍFICA, ESTABILIDAD, ECONOMÍA DE CARRERA Y PREVENCIÓN DE LESIONES',
   'calentamiento': '8-10 min movilidad dinámica',
-  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 '
-            '| CORE 3 SERIES',
+  'bloque': 'BÚLGARA 3x8/LADO | HIP THRUST 3x8-10 | PESO MUERTO UNILATERAL 3x8/LADO | SÓLEO 3x12-15 | GEMELOS 3x12-15 | CORE 3 SERIES',
   'recuperacion': '60-90 s entre series',
   'enfriamiento': 'MOVILIDAD DE TOBILLO, CADERA Y CADENA POSTERIOR',
-  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES '
-           'DE ESA SEMANA.'},
+  'notas': 'NO ENTRENAR AL FALLO. MANTENER 2-3 REPETICIONES EN RESERVA. ESTA SESIÓN SUSTITUYE LA FUERZA B DEL JUEVES DE ESA SEMANA.'},
  {'fecha': '2026-11-29',
   'semana': 13,
   'tipo': 'LARGA',
@@ -973,22 +966,37 @@ TYPE_ICONS = {
 SESSION_BY_DATE = {s["fecha"]: s for s in PLAN}
 
 
+# ------------------------------
+# Utilidades generales
+# ------------------------------
+def secret_value(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+SUPABASE_URL = str(secret_value("SUPABASE_URL", "") or "").rstrip("/")
+SUPABASE_SECRET_KEY = str(secret_value("SUPABASE_SECRET_KEY", "") or "")
+APP_PIN = str(secret_value("APP_PIN", "") or "")
+DB_READY = bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+
 def fmt_km(km):
+    km = float(km or 0)
     if abs(km - round(km)) < 1e-9:
         return f"{int(round(km))} km"
     return f"{km:.1f} km"
 
 
+def fmt_num(value, decimals=1):
+    if value is None:
+        return "—"
+    return f"{float(value):.{decimals}f}"
+
+
 def session_for(day):
     return SESSION_BY_DATE.get(day.isoformat())
-
-
-def plan_status(day):
-    if day < PLAN_START:
-        return "PRE"
-    if day > PLAN_END:
-        return "POST"
-    return "ACTIVE"
 
 
 def week_start(day):
@@ -1000,112 +1008,353 @@ def next_session_from(day):
     return future[0] if future else None
 
 
-def base_week_metrics(week_number):
-    rows = [s for s in PLAN if s["semana"] == week_number]
-    base = [s for s in rows if s["intensidad"] != "OPCIONAL"]
-    optional = [s for s in rows if s["intensidad"] == "OPCIONAL"]
+def is_optional(s):
+    return s and s["intensidad"] == "OPCIONAL"
+
+
+def is_running(s):
+    return s and s["tipo"] != "FUERZA"
+
+
+def planned_duration_default(s):
+    raw = str(s.get("duracion", "")).strip()
+    if re.fullmatch(r"\d+:\d{2}:\d{2}", raw):
+        return raw
+    if re.fullmatch(r"\d+:\d{2}", raw):
+        mm, ss = raw.split(":")
+        return f"00:{int(mm):02d}:{int(ss):02d}"
+    m = re.search(r"(\d+)\s*-\s*(\d+)\s*MIN", raw.upper())
+    if m:
+        avg = round((int(m.group(1)) + int(m.group(2))) / 2)
+        return f"00:{avg:02d}:00"
+    m = re.search(r"(\d+)\s*MIN", raw.upper())
+    if m:
+        return f"00:{int(m.group(1)):02d}:00"
+    return "00:00:00"
+
+
+def parse_duration(text):
+    text = str(text or "").strip()
+    if not text:
+        return 0, None
+
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", text):
+        minutes = float(text.replace(",", "."))
+        if minutes < 0:
+            return None, "La duración no puede ser negativa."
+        return int(round(minutes * 60)), None
+
+    parts = text.split(":")
+    try:
+        nums = [int(x) for x in parts]
+    except ValueError:
+        return None, "Usa HH:MM:SS, MM:SS o minutos."
+
+    if len(nums) == 2:
+        mm, ss = nums
+        if not (0 <= ss < 60) or mm < 0:
+            return None, "Duración inválida."
+        return mm * 60 + ss, None
+
+    if len(nums) == 3:
+        hh, mm, ss = nums
+        if hh < 0 or not (0 <= mm < 60) or not (0 <= ss < 60):
+            return None, "Duración inválida."
+        return hh * 3600 + mm * 60 + ss, None
+
+    return None, "Usa HH:MM:SS, MM:SS o minutos."
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return "—"
+    seconds = int(seconds)
+    hh, rem = divmod(seconds, 3600)
+    mm, ss = divmod(rem, 60)
+    if hh:
+        return f"{hh}:{mm:02d}:{ss:02d}"
+    return f"{mm}:{ss:02d}"
+
+
+def fmt_pace(seconds, km):
+    if not seconds or not km or float(km) <= 0:
+        return "—"
+    sec_per_km = int(round(float(seconds) / float(km)))
+    mm, ss = divmod(sec_per_km, 60)
+    return f"{mm}:{ss:02d} min/km"
+
+
+def today_or_nearest():
+    t = date.today()
+    if t < PLAN_START:
+        return t
+    if t > PLAN_END:
+        return PLAN_END
+    return t
+
+
+# ------------------------------
+# PIN de acceso
+# ------------------------------
+if DB_READY and not APP_PIN:
+    st.error(
+        "La base de datos está configurada, pero falta APP_PIN en los Secrets de Streamlit. "
+        "Añádelo antes de usar el guardado permanente."
+    )
+    st.stop()
+
+if APP_PIN:
+    if not st.session_state.get("_authenticated", False):
+        st.title("🏃 RunningCoachPro")
+        st.caption("Acceso privado")
+        entered = st.text_input("PIN", type="password")
+        if st.button("Entrar", use_container_width=True):
+            if hmac.compare_digest(str(entered), APP_PIN):
+                st.session_state["_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("PIN incorrecto.")
+        st.stop()
+
+
+# ------------------------------
+# Persistencia Supabase / fallback
+# ------------------------------
+REST_TABLE = f"{SUPABASE_URL}/rest/v1/runningcoach_logs" if DB_READY else ""
+
+
+def db_headers(extra=None):
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Content-Type": "application/json",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def load_logs():
+    if not DB_READY:
+        return list(st.session_state.get("_local_logs", {}).values())
+
+    try:
+        r = requests.get(
+            REST_TABLE,
+            params={
+                "select": "*",
+                "runner": f"eq.{NAME}",
+                "order": "session_date.asc",
+            },
+            headers=db_headers(),
+            timeout=12,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        st.error(f"No pude leer la base de datos: {exc}")
+        return []
+
+
+def save_log(record):
+    if not DB_READY:
+        store = st.session_state.setdefault("_local_logs", {})
+        store[record["session_date"]] = record
+        return True, None
+
+    try:
+        r = requests.post(
+            REST_TABLE,
+            params={"on_conflict": "runner,session_date"},
+            headers=db_headers({
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            }),
+            json=record,
+            timeout=12,
+        )
+        r.raise_for_status()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def logs_by_date(logs):
+    return {str(x.get("session_date")): x for x in logs}
+
+
+LOGS = load_logs()
+LOG_BY_DATE = logs_by_date(LOGS)
+
+
+# ------------------------------
+# Métricas
+# ------------------------------
+def log_for(day):
+    key = day.isoformat() if isinstance(day, date) else str(day)
+    return LOG_BY_DATE.get(key)
+
+
+def status_label(log):
+    if not log:
+        return "PENDIENTE"
+    return str(log.get("status") or "COMPLETADO").upper()
+
+
+def session_completed(s):
+    log = LOG_BY_DATE.get(s["fecha"])
+    return bool(log and status_label(log) in ("COMPLETADO", "MODIFICADO"))
+
+
+def week_metrics(week_no):
+    rows = [s for s in PLAN if s["semana"] == week_no]
+    base = [s for s in rows if not is_optional(s)]
+    optional = [s for s in rows if is_optional(s)]
+    actual_km = sum(
+        float(LOG_BY_DATE.get(s["fecha"], {}).get("actual_km") or 0)
+        for s in rows
+        if status_label(LOG_BY_DATE.get(s["fecha"])) in ("COMPLETADO", "MODIFICADO")
+    )
     return {
-        "sesiones_base": len(base),
-        "km_base": sum(s["km"] for s in base),
-        "km_total_con_opcional": sum(s["km"] for s in rows),
-        "opcional": optional,
+        "base_sessions": len(base),
+        "base_km": sum(s["km"] for s in base),
+        "optional_km": sum(s["km"] for s in optional),
+        "actual_km": actual_km,
     }
 
 
-def completed_key(fecha):
-    return f"completed_{fecha}"
+def dashboard_metrics(as_of):
+    due_base = [
+        s for s in PLAN
+        if date.fromisoformat(s["fecha"]) <= as_of and not is_optional(s)
+    ]
+    completed_base = [s for s in due_base if session_completed(s)]
 
+    due_running_base = [s for s in due_base if is_running(s)]
+    plan_km_due = sum(s["km"] for s in due_running_base)
 
-def record_key(fecha):
-    return f"record_{fecha}"
-
-
-def is_completed(fecha):
-    return st.session_state.get(completed_key(fecha), False)
-
-
-def completed_count():
-    return sum(1 for s in PLAN if is_completed(s["fecha"]))
-
-
-def completed_km():
-    total = 0.0
+    actual_km = 0.0
+    rpes = []
     for s in PLAN:
-        rec = st.session_state.get(record_key(s["fecha"]), {})
-        if is_completed(s["fecha"]):
-            total += float(rec.get("km_real", s["km"]) or 0)
-    return total
+        if date.fromisoformat(s["fecha"]) > as_of:
+            continue
+        log = LOG_BY_DATE.get(s["fecha"])
+        if not log:
+            continue
+        if status_label(log) in ("COMPLETADO", "MODIFICADO"):
+            actual_km += float(log.get("actual_km") or 0)
+            if log.get("rpe") is not None:
+                try:
+                    rpes.append(float(log.get("rpe")))
+                except Exception:
+                    pass
+
+    compliance = (len(completed_base) / len(due_base) * 100) if due_base else 0
+    avg_rpe = sum(rpes) / len(rpes) if rpes else None
+
+    return {
+        "due_base": len(due_base),
+        "completed_base": len(completed_base),
+        "compliance": compliance,
+        "plan_km_due": plan_km_due,
+        "actual_km": actual_km,
+        "avg_rpe": avg_rpe,
+    }
 
 
-def show_session_details(s):
-    icon = TYPE_ICONS.get(s["tipo"], "🏃")
-    st.markdown(f"## {icon} {s['entrenamiento']}")
-    st.caption(f"{s['tipo']} · Semana {s['semana']} · Intensidad {s['intensidad']}")
+def readiness(as_of):
+    recent_cutoff = as_of - timedelta(days=14)
+    recent = []
+    missed_base = 0
 
-    a, b, c, d = st.columns(4)
-    a.metric("Distancia plan", fmt_km(s["km"]))
-    b.metric("Ritmo objetivo", s["ritmo"])
-    c.metric("Duración estimada", s["duracion"])
-    d.metric("Intensidad", s["intensidad"])
+    for s in PLAN:
+        d = date.fromisoformat(s["fecha"])
+        if not (recent_cutoff <= d <= as_of):
+            continue
 
-    st.markdown("### 🎯 Objetivo")
-    st.write(s["objetivo"])
+        log = LOG_BY_DATE.get(s["fecha"])
+        if log:
+            recent.append((s, log))
+            if not is_optional(s) and status_label(log) == "OMITIDO":
+                missed_base += 1
 
-    st.markdown("### 📋 Sesión")
-    st.markdown(f"**Calentamiento:** {s['calentamiento']}")
-    st.markdown(f"**Bloque principal:** {s['bloque']}")
-    st.markdown(f"**Recuperación:** {s['recuperacion']}")
-    st.markdown(f"**Enfriamiento:** {s['enfriamiento']}")
+    rpes = []
+    for _, log in recent:
+        if status_label(log) in ("COMPLETADO", "MODIFICADO") and log.get("rpe") is not None:
+            try:
+                rpes.append(float(log["rpe"]))
+            except Exception:
+                pass
 
-    if s["descripcion"]:
-        with st.expander("Descripción completa"):
-            st.write(s["descripcion"])
+    last_rpes = rpes[-3:]
+    avg3 = sum(last_rpes) / len(last_rpes) if last_rpes else None
+    very_high = sum(1 for x in last_rpes if x >= 9)
 
-    if s["notas"]:
-        st.info(s["notas"])
-
-    if s["tipo"] == "RODAJE":
-        st.warning(
-            "Este rodaje es OPCIONAL. Si el descanso posturno fue insuficiente, hay fatiga marcada, "
-            "piernas muy pesadas o RPE basal elevado, se omite. No se recupera otro día."
+    if missed_base >= 2 or very_high >= 2 or (avg3 is not None and avg3 >= 8.5):
+        return (
+            "ROJO",
+            avg3,
+            "No añadas volumen ni intensidad extra. Omite el rodaje opcional del viernes. "
+            "Si la fatiga alta persiste o aparece dolor/síntomas anormales, suspende y busca orientación profesional.",
         )
-
-    if s["tipo"] == "SERIES":
-        st.caption(
-            f"Series en terreno plano o caminadora al {TREADMILL_INCLINE:g}% de inclinación, tal como indica el plan."
+    if missed_base >= 1 or (avg3 is not None and avg3 >= 7.5):
+        return (
+            "AMARILLO",
+            avg3,
+            "Mantén el plan sin extras. El viernes opcional solo si has recuperado bien. "
+            "No aceleres los ritmos prescritos aunque te sientas mejor al inicio.",
         )
-
-
-def show_rest(day):
-    st.markdown("## 😴 Descanso / recuperación")
-    if day.weekday() in (0, 2):
-        st.write("Día de descanso estructural del plan. No hay carrera programada.")
-    else:
-        st.write("No hay una sesión programada para esta fecha.")
-
-    nxt = next_session_from(day + timedelta(days=1))
-    if nxt:
-        nd = date.fromisoformat(nxt["fecha"])
-        st.info(
-            f"Próxima sesión: {DAY_NAMES[nd.weekday()]} {nd.strftime('%d/%m')} · "
-            f"{nxt['entrenamiento']} · {fmt_km(nxt['km'])} · {nxt['ritmo']}"
+    if avg3 is None:
+        return (
+            "SIN DATOS",
+            None,
+            "Registra al menos algunas sesiones y su RPE para que el semáforo pueda estimar la carga reciente.",
         )
+    return (
+        "VERDE",
+        avg3,
+        "La carga reciente parece tolerable según tus registros. Mantén las zonas y la progresión del plan; no añadas trabajo no programado.",
+    )
 
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption("Plan importado de tu RunningCoachPro Sep–Nov 2026")
+def csv_export():
+    out = StringIO()
+    cols = [
+        "session_date", "week_plan", "workout_type", "workout_name",
+        "planned_km", "actual_km", "actual_duration_sec", "real_pace",
+        "rpe", "avg_hr", "max_hr", "status", "notes"
+    ]
+    writer = csv.DictWriter(out, fieldnames=cols)
+    writer.writeheader()
+    for s in PLAN:
+        log = LOG_BY_DATE.get(s["fecha"], {})
+        duration = log.get("actual_duration_sec")
+        actual_km = log.get("actual_km")
+        writer.writerow({
+            "session_date": s["fecha"],
+            "week_plan": s["semana"],
+            "workout_type": s["tipo"],
+            "workout_name": s["entrenamiento"],
+            "planned_km": s["km"],
+            "actual_km": actual_km if actual_km is not None else "",
+            "actual_duration_sec": duration if duration is not None else "",
+            "real_pace": fmt_pace(duration, actual_km) if duration and actual_km else "",
+            "rpe": log.get("rpe", ""),
+            "avg_hr": log.get("avg_hr", ""),
+            "max_hr": log.get("max_hr", ""),
+            "status": log.get("status", "PENDIENTE") if log else "PENDIENTE",
+            "notes": log.get("notes", ""),
+        })
+    return out.getvalue()
 
-today = date.today()
-default_day = today
-if today < PLAN_START:
-    default_day = today
-elif today > PLAN_END:
-    default_day = PLAN_END
+
+# ------------------------------
+# SIDEBAR
+# ------------------------------
+st.sidebar.title("🏃 RunningCoachPro V3")
+st.sidebar.caption("Plan importado de RunningCoachPro Sep–Nov 2026")
 
 selected_day = st.sidebar.date_input(
     "Fecha a consultar",
-    value=default_day,
+    value=today_or_nearest(),
     min_value=date(2026, 8, 25),
     max_value=date(2026, 12, 7),
 )
@@ -1114,22 +1363,38 @@ st.sidebar.divider()
 st.sidebar.markdown(f"**Corredor:** {NAME}")
 st.sidebar.markdown(f"**Objetivo:** {GOAL.title()}")
 st.sidebar.markdown(f"**MM actual:** {CURRENT_TIME} · {CURRENT_PACE}/km")
-st.sidebar.markdown(f"**Objetivo:** {TARGET_TIME} · {TARGET_PACE}/km")
-st.sidebar.markdown(f"**Carrera objetivo:** {RACE_DATE.strftime('%d/%m/%Y')}")
+st.sidebar.markdown(f"**Meta:** {TARGET_TIME} · {TARGET_PACE}/km")
+st.sidebar.markdown(f"**Carrera:** {RACE_DATE.strftime('%d/%m/%Y')}")
 
 days_to_race = (RACE_DATE - selected_day).days
-if days_to_race >= 0:
-    st.sidebar.metric("Días para la carrera", days_to_race)
-else:
-    st.sidebar.metric("Días desde la carrera", abs(days_to_race))
-
-st.sidebar.caption(
-    "Los registros de completado/RPE de esta V2 se guardan solo durante la sesión actual de la app."
+st.sidebar.metric(
+    "Días para la carrera" if days_to_race >= 0 else "Días desde la carrera",
+    abs(days_to_race),
 )
 
-# ---------------- HEADER ----------------
+if DB_READY:
+    st.sidebar.success("🟢 Guardado permanente activo")
+else:
+    st.sidebar.warning("🟠 Modo temporal: falta Supabase")
+
+st.sidebar.download_button(
+    "⬇️ Descargar respaldo CSV",
+    data=csv_export(),
+    file_name=f"runningcoachpro_{NAME.lower()}_registros.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
+
+if APP_PIN and st.sidebar.button("Cerrar sesión", use_container_width=True):
+    st.session_state["_authenticated"] = False
+    st.rerun()
+
+
+# ------------------------------
+# HEADER
+# ------------------------------
 st.title("🏃 RunningCoachPro")
-st.caption("Tu plan real de media maratón · Septiembre a Noviembre 2026")
+st.caption("Plan real de media maratón · Septiembre a Noviembre 2026 · V3")
 
 h1, h2, h3, h4 = st.columns(4)
 h1.metric("Marca actual", CURRENT_TIME)
@@ -1137,85 +1402,118 @@ h2.metric("Ritmo actual", f"{CURRENT_PACE} min/km")
 h3.metric("Meta", TARGET_TIME)
 h4.metric("Ritmo meta", f"{TARGET_PACE} min/km")
 
-total_days = (RACE_DATE - PLAN_START).days
+total_days = max(1, (RACE_DATE - PLAN_START).days)
 elapsed = max(0, min(total_days, (selected_day - PLAN_START).days))
-progress = elapsed / total_days if total_days else 0
+progress = elapsed / total_days
 st.progress(progress, text=f"Progreso hacia la media maratón objetivo · {progress*100:.0f}%")
 
-tab_today, tab_week, tab_plan, tab_zones, tab_log = st.tabs(
-    ["📍 Hoy / fecha", "📅 Semana", "🗓️ Plan completo", "🎯 Zonas", "✅ Registro"]
+
+tab_today, tab_week, tab_progress, tab_plan, tab_zones, tab_log = st.tabs(
+    ["📍 Hoy / fecha", "📅 Semana", "📊 Progreso", "🗓️ Plan completo", "🎯 Zonas", "✅ Registro"]
 )
 
-# ---------------- TAB: HOY ----------------
-with tab_today:
-    st.subheader(
-        f"{DAY_NAMES[selected_day.weekday()]} · {selected_day.strftime('%d/%m/%Y')}"
-    )
 
-    status = plan_status(selected_day)
-    if status == "PRE":
-        st.markdown("## 🟦 Preparación previa al bloque")
-        st.write(
-            f"El bloque comienza el {PLAN_START.strftime('%d/%m/%Y')}. "
-            "Hoy no hay una sesión del plan programada."
-        )
+# ------------------------------
+# HOY
+# ------------------------------
+with tab_today:
+    st.subheader(f"{DAY_NAMES[selected_day.weekday()]} · {selected_day.strftime('%d/%m/%Y')}")
+
+    s = session_for(selected_day)
+    if selected_day < PLAN_START:
+        st.info(f"El bloque comienza el {PLAN_START.strftime('%d/%m/%Y')}.")
         nxt = next_session_from(PLAN_START)
         if nxt:
-            nd = date.fromisoformat(nxt["fecha"])
             st.success(
-                f"Primera sesión: {DAY_NAMES[nd.weekday()]} {nd.strftime('%d/%m')} · "
+                f"Primera sesión: {date.fromisoformat(nxt['fecha']).strftime('%d/%m')} · "
+                f"{nxt['entrenamiento']} · {fmt_km(nxt['km'])}"
+            )
+
+    elif selected_day > PLAN_END:
+        st.info("El bloque septiembre–noviembre 2026 ya terminó.")
+
+    elif not s:
+        st.markdown("## 😴 Descanso / recuperación")
+        st.write("No hay sesión programada para esta fecha.")
+        nxt = next_session_from(selected_day + timedelta(days=1))
+        if nxt:
+            nd = date.fromisoformat(nxt["fecha"])
+            st.info(
+                f"Próxima sesión: {DAY_NAMES[nd.weekday()]} {nd.strftime('%d/%m')} · "
                 f"{nxt['entrenamiento']} · {fmt_km(nxt['km'])} · {nxt['ritmo']}"
             )
-    elif status == "POST":
-        st.markdown("## 🏁 Bloque finalizado")
-        st.write("El bloque septiembre–noviembre 2026 ya terminó.")
+
     else:
-        s = session_for(selected_day)
-        if s:
-            show_session_details(s)
+        icon = TYPE_ICONS.get(s["tipo"], "🏃")
+        st.markdown(f"## {icon} {s['entrenamiento']}")
+        st.caption(f"{s['tipo']} · Semana {s['semana']} · {s['intensidad']}")
 
-            st.divider()
-            done = is_completed(s["fecha"])
-            if done:
-                st.success("Sesión marcada como completada ✅")
-            else:
-                if st.button("✅ Marcar esta sesión como completada", use_container_width=True):
-                    st.session_state[completed_key(s["fecha"])] = True
-                    st.rerun()
+        a, b, c, d = st.columns(4)
+        a.metric("Distancia plan", fmt_km(s["km"]))
+        b.metric("Ritmo objetivo", s["ritmo"])
+        c.metric("Duración estimada", s["duracion"])
+        d.metric("Intensidad", s["intensidad"])
+
+        st.markdown("### 🎯 Objetivo")
+        st.write(s["objetivo"])
+
+        st.markdown("### 📋 Sesión")
+        st.markdown(f"**Calentamiento:** {s['calentamiento']}")
+        st.markdown(f"**Bloque principal:** {s['bloque']}")
+        st.markdown(f"**Recuperación:** {s['recuperacion']}")
+        st.markdown(f"**Enfriamiento:** {s['enfriamiento']}")
+
+        if s["notas"]:
+            st.info(s["notas"])
+
+        existing = LOG_BY_DATE.get(s["fecha"])
+        if existing:
+            estado = status_label(existing)
+            if estado in ("COMPLETADO", "MODIFICADO"):
+                st.success(
+                    f"{estado} ✅ · Real: {fmt_km(existing.get('actual_km') or 0)} · "
+                    f"{fmt_pace(existing.get('actual_duration_sec'), existing.get('actual_km'))} · "
+                    f"RPE {existing.get('rpe') or '—'}"
+                )
+            elif estado == "OMITIDO":
+                if is_optional(s):
+                    st.warning("Sesión opcional omitida. No debe recuperarse otro día.")
+                else:
+                    st.warning("Sesión marcada como omitida.")
         else:
-            show_rest(selected_day)
+            st.caption("Aún no has registrado esta sesión.")
 
-# ---------------- TAB: SEMANA ----------------
+
+# ------------------------------
+# SEMANA
+# ------------------------------
 with tab_week:
     monday = week_start(selected_day)
     sunday = monday + timedelta(days=6)
-
-    week_rows = []
     week_no = None
+    week_rows = []
+
     for i in range(7):
         d = monday + timedelta(days=i)
         s = session_for(d)
         if s:
             week_no = s["semana"]
-            week_rows.append((d, s))
-        else:
-            week_rows.append((d, None))
+        week_rows.append((d, s))
 
-    title_suffix = f" · Semana {week_no}" if week_no else ""
-    st.subheader(
-        f"{monday.strftime('%d/%m')} – {sunday.strftime('%d/%m/%Y')}{title_suffix}"
-    )
+    suffix = f" · Semana {week_no}" if week_no else ""
+    st.subheader(f"{monday.strftime('%d/%m')} – {sunday.strftime('%d/%m/%Y')}{suffix}")
 
     if week_no:
-        met = base_week_metrics(week_no)
-        x1, x2, x3 = st.columns(3)
-        x1.metric("Sesiones base", met["sesiones_base"])
-        x2.metric("KM base", f"{met['km_base']:.1f}")
-        x3.metric("KM con rodaje opcional", f"{met['km_total_con_opcional']:.1f}")
+        wm = week_metrics(week_no)
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Sesiones base", wm["base_sessions"])
+        x2.metric("KM base", f"{wm['base_km']:.1f}")
+        x3.metric("KM opcionales", f"{wm['optional_km']:.1f}")
+        x4.metric("KM reales", f"{wm['actual_km']:.1f}")
 
     for d, s in week_rows:
         with st.container(border=True):
-            c1, c2, c3 = st.columns([1.1, 2.6, 1.2])
+            c1, c2, c3, c4 = st.columns([1.0, 2.8, 1.2, 1.2])
             c1.markdown(f"**{DAY_NAMES[d.weekday()]}**")
             c1.caption(d.strftime("%d/%m"))
 
@@ -1224,163 +1522,314 @@ with tab_week:
                 c2.markdown(f"**{icon} {s['entrenamiento']}**")
                 c2.caption(f"{s['tipo']} · {s['ritmo']}")
                 c3.markdown(f"**{fmt_km(s['km'])}**")
-                if is_completed(s["fecha"]):
-                    c3.success("Completado")
-                elif s["intensidad"] == "OPCIONAL":
-                    c3.warning("Opcional")
+                c3.caption(s["intensidad"])
+
+                log = LOG_BY_DATE.get(s["fecha"])
+                estado = status_label(log)
+                if estado == "COMPLETADO":
+                    c4.success("Completado")
+                elif estado == "MODIFICADO":
+                    c4.warning("Modificado")
+                elif estado == "OMITIDO":
+                    c4.warning("Omitido")
+                elif is_optional(s):
+                    c4.caption("Opcional")
                 else:
-                    c3.caption(s["intensidad"])
+                    c4.caption("Pendiente")
             elif PLAN_START <= d <= PLAN_END:
                 c2.markdown("**😴 Descanso**")
                 c2.caption("Sin sesión programada")
-                c3.caption("Recuperación")
-            else:
-                c2.caption("Fuera del bloque")
+                c4.caption("Recuperación")
 
-# ---------------- TAB: PLAN COMPLETO ----------------
+
+# ------------------------------
+# PROGRESO
+# ------------------------------
+with tab_progress:
+    st.subheader("Progreso PLAN vs REAL")
+
+    dm = dashboard_metrics(selected_day)
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric(
+        "Sesiones base cumplidas",
+        f"{dm['completed_base']} / {dm['due_base']}",
+    )
+    p2.metric("Cumplimiento", f"{dm['compliance']:.0f}%")
+    p3.metric("KM reales acumulados", f"{dm['actual_km']:.1f}")
+    p4.metric("RPE promedio", "—" if dm["avg_rpe"] is None else f"{dm['avg_rpe']:.1f}")
+
+    st.markdown("### KM por semana")
+    weekly_data = []
+    for w in range(1, 14):
+        wm = week_metrics(w)
+        weekly_data.append({"Semana": str(w), "Serie": "Plan base", "KM": round(wm["base_km"], 2)})
+        weekly_data.append({"Semana": str(w), "Serie": "Real", "KM": round(wm["actual_km"], 2)})
+
+    st.vega_lite_chart(
+        {
+            "data": {"values": weekly_data},
+            "mark": {"type": "bar", "tooltip": True},
+            "encoding": {
+                "x": {"field": "Semana", "type": "ordinal", "title": "Semana"},
+                "xOffset": {"field": "Serie"},
+                "y": {"field": "KM", "type": "quantitative", "title": "Kilómetros"},
+                "color": {"field": "Serie", "type": "nominal"},
+                "tooltip": [
+                    {"field": "Semana", "type": "ordinal"},
+                    {"field": "Serie", "type": "nominal"},
+                    {"field": "KM", "type": "quantitative", "format": ".1f"},
+                ],
+            },
+        },
+        use_container_width=True,
+    )
+
+    rpe_week = []
+    for w in range(1, 14):
+        vals = []
+        for s in PLAN:
+            if s["semana"] != w:
+                continue
+            log = LOG_BY_DATE.get(s["fecha"])
+            if log and status_label(log) in ("COMPLETADO", "MODIFICADO") and log.get("rpe") is not None:
+                try:
+                    vals.append(float(log["rpe"]))
+                except Exception:
+                    pass
+        if vals:
+            rpe_week.append({"Semana": w, "RPE": round(sum(vals) / len(vals), 2)})
+
+    st.markdown("### RPE promedio semanal")
+    if rpe_week:
+        st.vega_lite_chart(
+            {
+                "data": {"values": rpe_week},
+                "mark": {"type": "line", "point": True, "tooltip": True},
+                "encoding": {
+                    "x": {"field": "Semana", "type": "ordinal"},
+                    "y": {"field": "RPE", "type": "quantitative", "scale": {"domain": [1, 10]}},
+                    "tooltip": [
+                        {"field": "Semana", "type": "ordinal"},
+                        {"field": "RPE", "type": "quantitative", "format": ".1f"},
+                    ],
+                },
+            },
+            use_container_width=True,
+        )
+    else:
+        st.caption("Aún no hay RPE registrados.")
+
+    st.markdown("### 🚦 Semáforo de carga")
+    level, avg3, recommendation = readiness(selected_day)
+    if level == "VERDE":
+        st.success(f"VERDE · RPE reciente: {avg3:.1f}")
+    elif level == "AMARILLO":
+        st.warning(f"AMARILLO · RPE reciente: {avg3:.1f}" if avg3 is not None else "AMARILLO")
+    elif level == "ROJO":
+        st.error(f"ROJO · RPE reciente: {avg3:.1f}" if avg3 is not None else "ROJO")
+    else:
+        st.info("SIN DATOS")
+    st.write(recommendation)
+
+    st.caption(
+        "El semáforo no cambia automáticamente el plan del Excel; solo resume tus registros recientes "
+        "para ayudarte a decidir si conviene mantener, omitir extras o revisar la carga."
+    )
+
+
+# ------------------------------
+# PLAN COMPLETO
+# ------------------------------
 with tab_plan:
     st.subheader("Plan completo · 13 semanas")
 
-    filt1, filt2 = st.columns(2)
+    f1, f2 = st.columns(2)
     types = ["TODOS"] + sorted({s["tipo"] for s in PLAN})
-    selected_type = filt1.selectbox("Filtrar por tipo", types)
-    selected_week = filt2.selectbox("Filtrar por semana", ["TODAS"] + list(range(1, 14)))
+    selected_type = f1.selectbox("Filtrar por tipo", types)
+    selected_week = f2.selectbox("Filtrar por semana", ["TODAS"] + list(range(1, 14)))
 
-    table = []
+    rows = []
     for s in PLAN:
         if selected_type != "TODOS" and s["tipo"] != selected_type:
             continue
         if selected_week != "TODAS" and s["semana"] != selected_week:
             continue
 
-        d = date.fromisoformat(s["fecha"])
-        table.append({
-            "Fecha": d.strftime("%d/%m/%Y"),
-            "Día": DAY_NAMES[d.weekday()],
+        log = LOG_BY_DATE.get(s["fecha"])
+        rows.append({
+            "Fecha": date.fromisoformat(s["fecha"]).strftime("%d/%m/%Y"),
             "Semana": s["semana"],
             "Tipo": s["tipo"],
             "Entrenamiento": s["entrenamiento"],
-            "KM": round(s["km"], 1),
+            "KM plan": round(s["km"], 1),
             "Ritmo": s["ritmo"],
-            "Intensidad": s["intensidad"],
-            "Estado": "✅ Completado" if is_completed(s["fecha"]) else "Pendiente",
+            "KM real": log.get("actual_km") if log else None,
+            "RPE": log.get("rpe") if log else None,
+            "Estado": status_label(log),
         })
 
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "KM": st.column_config.NumberColumn("KM", format="%.1f"),
-        },
-    )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    base = [s for s in PLAN if s["intensidad"] != "OPCIONAL"]
-    optional = [s for s in PLAN if s["intensidad"] == "OPCIONAL"]
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Sesiones plan", len(PLAN))
-    p2.metric("KM totales", f"{sum(s['km'] for s in PLAN):.1f}")
-    p3.metric("Sesiones base", len(base))
-    p4.metric("KM base", f"{sum(s['km'] for s in base):.1f}")
 
-# ---------------- TAB: ZONAS ----------------
+# ------------------------------
+# ZONAS
+# ------------------------------
 with tab_zones:
     st.subheader("Zonas de ritmo del documento")
-    for name, pace, note in ZONES:
+    for zone_name, pace, note in ZONES:
         with st.container(border=True):
             z1, z2 = st.columns([1.2, 2])
-            z1.markdown(f"**{name}**")
+            z1.markdown(f"**{zone_name}**")
             z2.markdown(f"**{pace}**")
             z2.caption(note)
 
     st.info(
-        f"La tirada larga está referenciada a tu ruta habitual de aproximadamente "
-        f"{LONG_ROUTE_ELEVATION} m D+. En subidas, el plan prioriza el esfuerzo sobre el ritmo."
+        f"La tirada larga usa como referencia tu ruta habitual de aproximadamente "
+        f"{LONG_ROUTE_ELEVATION} m D+. En subidas, el documento prioriza esfuerzo sobre ritmo."
     )
+    st.caption(f"Series: terreno plano o caminadora al {TREADMILL_INCLINE:g}%.")
 
-# ---------------- TAB: REGISTRO ----------------
+
+# ------------------------------
+# REGISTRO
+# ------------------------------
 with tab_log:
     st.subheader("Registrar ejecución")
 
     s = session_for(selected_day)
     if not s:
-        st.info("Selecciona una fecha que tenga una sesión programada para registrar datos.")
+        st.info("Selecciona una fecha con sesión programada.")
     else:
-        existing = st.session_state.get(record_key(s["fecha"]), {})
+        existing = LOG_BY_DATE.get(s["fecha"], {})
+        default_status = str(existing.get("status") or "COMPLETADO").upper()
+        if default_status not in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+            default_status = "COMPLETADO"
 
-        with st.form(f"log_{s['fecha']}"):
+        st.caption(
+            f"Plan: {s['entrenamiento']} · {fmt_km(s['km'])} · {s['ritmo']} · {s['duracion']}"
+        )
+
+        with st.form(f"record_{s['fecha']}"):
             r1, r2, r3 = st.columns(3)
-            km_real = r1.number_input(
+
+            km_default = float(existing.get("actual_km") if existing.get("actual_km") is not None else s["km"])
+            actual_km = r1.number_input(
                 "Distancia real (km)",
                 min_value=0.0,
                 max_value=60.0,
-                value=float(existing.get("km_real", s["km"])),
+                value=km_default,
                 step=0.1,
             )
-            dur_min = r2.number_input(
-                "Duración real (min)",
-                min_value=0,
-                max_value=600,
-                value=int(existing.get("dur_min", 0)),
-                step=1,
+
+            duration_default = (
+                fmt_duration(existing.get("actual_duration_sec"))
+                if existing.get("actual_duration_sec") is not None
+                else planned_duration_default(s)
             )
-            rpe = r3.slider(
-                "RPE",
-                1, 10,
-                value=int(existing.get("rpe", 5)),
+            duration_text = r2.text_input(
+                "Duración real (HH:MM:SS)",
+                value=duration_default,
+                help="También acepta MM:SS o un número de minutos.",
             )
 
-            f1, f2 = st.columns(2)
-            fc_media = f1.number_input(
+            rpe = r3.slider(
+                "RPE",
+                min_value=1,
+                max_value=10,
+                value=int(existing.get("rpe") or 5),
+            )
+
+            q1, q2, q3 = st.columns(3)
+            avg_hr = q1.number_input(
                 "FC media (opcional)",
                 min_value=0,
                 max_value=230,
-                value=int(existing.get("fc_media", 0)),
+                value=int(existing.get("avg_hr") or 0),
                 step=1,
             )
-            fc_max = f2.number_input(
+            max_hr = q2.number_input(
                 "FC máxima (opcional)",
                 min_value=0,
                 max_value=240,
-                value=int(existing.get("fc_max", 0)),
+                value=int(existing.get("max_hr") or 0),
                 step=1,
             )
-
-            obs = st.text_area(
-                "Observaciones",
-                value=str(existing.get("obs", "")),
-                placeholder="Sensaciones, sueño, molestias, clima, etc.",
+            status = q3.selectbox(
+                "Estado",
+                ["COMPLETADO", "MODIFICADO", "OMITIDO"],
+                index=["COMPLETADO", "MODIFICADO", "OMITIDO"].index(default_status),
             )
 
-            save = st.form_submit_button("Guardar registro", use_container_width=True)
+            notes = st.text_area(
+                "Observaciones",
+                value=str(existing.get("notes") or ""),
+                placeholder="Sensaciones, sueño, clima, molestias, cambios realizados, etc.",
+            )
+
+            save = st.form_submit_button("💾 Guardar registro", use_container_width=True)
 
         if save:
-            st.session_state[record_key(s["fecha"])] = {
-                "km_real": km_real,
-                "dur_min": dur_min,
-                "rpe": rpe,
-                "fc_media": fc_media,
-                "fc_max": fc_max,
-                "obs": obs,
-            }
-            st.session_state[completed_key(s["fecha"])] = True
-            st.success("Registro guardado y sesión marcada como completada ✅")
-            st.rerun()
+            seconds, error = parse_duration(duration_text)
+            if error:
+                st.error(error)
+            else:
+                if status == "OMITIDO":
+                    actual_km_to_save = 0.0
+                    seconds_to_save = 0
+                else:
+                    actual_km_to_save = float(actual_km)
+                    seconds_to_save = int(seconds or 0)
 
-        if is_completed(s["fecha"]):
-            st.success("Esta sesión está completada.")
-            if st.button("↩️ Desmarcar completado"):
-                st.session_state[completed_key(s["fecha"])] = False
-                st.rerun()
+                record = {
+                    "runner": NAME,
+                    "session_date": s["fecha"],
+                    "week_plan": s["semana"],
+                    "workout_type": s["tipo"],
+                    "workout_name": s["entrenamiento"],
+                    "planned_km": float(s["km"]),
+                    "actual_km": actual_km_to_save,
+                    "actual_duration_sec": seconds_to_save,
+                    "rpe": int(rpe),
+                    "avg_hr": int(avg_hr) if avg_hr else None,
+                    "max_hr": int(max_hr) if max_hr else None,
+                    "status": status,
+                    "notes": notes.strip(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
 
-    st.divider()
-    q1, q2 = st.columns(2)
-    q1.metric("Sesiones completadas (esta sesión de app)", completed_count())
-    q2.metric("KM registrados/completados", f"{completed_km():.1f}")
+                ok, err = save_log(record)
+                if ok:
+                    st.success("Registro guardado correctamente ✅")
+                    st.rerun()
+                else:
+                    st.error(f"No se pudo guardar: {err}")
+
+        current = LOG_BY_DATE.get(s["fecha"])
+        if current:
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Estado", status_label(current))
+            c2.metric("Real", fmt_km(current.get("actual_km") or 0))
+            c3.metric(
+                "Ritmo real",
+                fmt_pace(current.get("actual_duration_sec"), current.get("actual_km")),
+            )
+            plan_diff = float(current.get("actual_km") or 0) - float(s["km"] or 0)
+            c4.metric("Diferencia vs plan", f"{plan_diff:+.1f} km")
+
+            if is_optional(s) and status_label(current) == "OMITIDO":
+                st.info("Correcto según el documento: un viernes opcional omitido no se recupera otro día.")
+
+
+if not DB_READY:
+    st.warning(
+        "La V3 está funcionando en modo temporal. Para que los registros sobrevivan a reinicios de Streamlit, "
+        "configura Supabase con los archivos incluidos en el paquete V3."
+    )
 
 st.divider()
 st.caption(
-    "Plan basado en el archivo RunningCoachPro_Sep_Nov_2026. "
-    "El rodaje opcional no debe compensarse si se omite. "
-    "Ante dolor agudo, mareos, síntomas anormales o lesión, suspende el entrenamiento y consulta a un profesional."
+    "Plan basado directamente en RunningCoachPro_Sep_Nov_2026.xlsx. "
+    "El semáforo es una ayuda de seguimiento y no sustituye evaluación profesional. "
+    "Ante dolor agudo, mareos, lesión o síntomas anormales, suspende el entrenamiento y busca orientación profesional."
 )
