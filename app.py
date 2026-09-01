@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.6.1"
+APP_VERSION = "7.6.2"
 
 
 # ============================================================
@@ -1446,15 +1446,166 @@ def treadmill_repeat_text(session):
     return out
 
 
-def treadmill_guidance(session):
-    """Resumen listo para UI/PDF. Devuelve None si la sesión se prescribe solo por RPE."""
-    speed = treadmill_speed_text((session or {}).get("target"))
-    if not speed:
+def _speed_text_from_paces(paces):
+    speeds = sorted([
+        pace_seconds_to_kmh(p) for p in (paces or [])
+        if pace_seconds_to_kmh(p) is not None
+    ])
+    if not speeds:
         return None
+    if len(speeds) == 1 or abs(speeds[-1] - speeds[0]) < 0.05:
+        return f"{speeds[0]:.1f} km/h"
+    return f"{speeds[0]:.1f}-{speeds[-1]:.1f} km/h"
+
+
+def _pace_text_from_seconds(paces):
+    values = sorted([int(round(float(p))) for p in (paces or []) if p])
+    if not values:
+        return None
+    labels = [pace_string(v) for v in values]
+    if len(labels) == 1 or labels[0] == labels[-1]:
+        return labels[0]
+    # Convención visual: rápido → lento.
+    return f"{labels[0].replace(' min/km','')}-{labels[-1]}"
+
+
+def _target_rpe_range(target):
+    raw = str(target or "").replace("–", "-").replace("—", "-")
+    m = re.search(r"RPE\s*(\d+(?:[.,]\d+)?)\s*(?:-\s*(\d+(?:[.,]\d+)?))?", raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        a = float(m.group(1).replace(",", "."))
+        b = float((m.group(2) or m.group(1)).replace(",", "."))
+    except Exception:
+        return None
+    a, b = sorted((max(1.0, min(10.0, a)), max(1.0, min(10.0, b))))
+    return a, b
+
+
+def _goal_race_pace_seconds(goal_row):
+    goal_row = goal_row or {}
+    goal_km = GOAL_KM.get(str(goal_row.get("goal_type") or ""))
+    target_seconds = goal_row.get("target_time_sec")
+    try:
+        if goal_km and target_seconds and float(goal_km) > 0:
+            return float(target_seconds) / float(goal_km)
+    except Exception:
+        pass
+    return None
+
+
+def _rpe_anchor_paces(target, goal_row):
+    """Referencia de velocidad por RPE anclada a la meta cuando no existe un pace prescrito.
+
+    No cambia la sesión ni convierte la meta en una prescripción rígida. Sirve para que el
+    usuario de caminadora tenga un punto de partida cuantitativo y ajuste para respetar RPE.
+    """
+    rpe = _target_rpe_range(target)
+    race_pace = _goal_race_pace_seconds(goal_row)
+    if not rpe or not race_pace:
+        return None
+    avg = sum(rpe) / 2.0
+    # Fracción de la velocidad de carrera objetivo. Guardrails deliberadamente amplios.
+    if avg <= 2.5:
+        lo, hi = 0.76, 0.82
+    elif avg <= 3.5:
+        lo, hi = 0.82, 0.89
+    elif avg <= 4.5:
+        lo, hi = 0.86, 0.93
+    elif avg <= 5.5:
+        lo, hi = 0.90, 0.98
+    elif avg <= 6.5:
+        lo, hi = 0.95, 1.03
+    elif avg <= 7.5:
+        lo, hi = 1.00, 1.08
+    elif avg <= 8.5:
+        lo, hi = 1.05, 1.14
+    else:
+        lo, hi = 1.10, 1.20
+    race_speed = pace_seconds_to_kmh(race_pace)
+    if not race_speed:
+        return None
+    speeds = [max(4.0, min(24.0, race_speed * lo)), max(4.0, min(24.0, race_speed * hi))]
+    # Convertimos de vuelta a pace para reutilizar toda la UI/PDF.
+    return sorted([3600.0 / s for s in speeds])
+
+
+def _session_zone_key(session):
+    wt = str((session or {}).get("workout_type") or "").upper()
+    name = str((session or {}).get("workout_name") or "").upper()
+    blob = f"{wt} {name}"
+    if "CARRERA" in blob or "RACE" in blob:
+        return "race"
+    if "LARGA" in blob or "LONG" in blob:
+        return "long"
+    if "RECUP" in blob or "RUN_WALK" in blob:
+        return "recovery"
+    if any(x in blob for x in ("SERIES", "INTERVAL", "VELOCIDAD", "CUESTA")):
+        return "interval"
+    if any(x in blob for x in ("TEMPO", "UMBRAL")):
+        return "threshold"
+    if any(x in blob for x in ("PROGRES", "STEADY")):
+        return "steady"
+    return "easy"
+
+
+def treadmill_guidance(session, goal_row=None, assessment=None):
+    """Referencia cuantitativa para caminadora.
+
+    Prioridad: pace explícito de la sesión > marca reciente utilizable > meta + RPE.
+    La referencia secundaria nunca modifica la prescripción: manda el RPE/talk test.
+    """
+    session = session or {}
+    goal_row = goal_row or globals().get("ACTIVE_GOAL") or {}
+    assessment = assessment or globals().get("ASSESSMENT") or globals().get("assessment") or {}
+
+    explicit_paces = _target_pace_seconds(session.get("target"))
+    if explicit_paces:
+        return {
+            "speed": _speed_text_from_paces(explicit_paces),
+            "pace": _pace_text_from_seconds(explicit_paces),
+            "repeats": treadmill_repeat_text(session),
+            "source": "pace prescrito",
+            "note": "Equivalencia directa del pace prescrito; la inclinación se ajusta por separado.",
+        }
+
+    # Si el plan antiguo quedó guardado solo con RPE pero hoy existe una marca reciente
+    # utilizable, recuperamos la zona correspondiente sin regenerar ni alterar el plan.
+    try:
+        profile = v7_pace_profile(assessment, goal_row)
+    except Exception:
+        profile = {}
+    zone = profile.get(_session_zone_key(session)) if profile.get("usable") else None
+    if zone:
+        paces = list(zone) if isinstance(zone, (list, tuple)) else [zone]
+        return {
+            "speed": _speed_text_from_paces(paces),
+            "pace": _pace_text_from_seconds(paces),
+            "repeats": [],
+            "source": "marca reciente + RPE",
+            "note": "Referencia RCP basada en la marca reciente; mantén el RPE indicado como control principal.",
+        }
+
+    # Último recurso útil: una meta con tiempo + el RPE de la sesión. Se muestra como
+    # referencia inicial, no como velocidad obligatoria, porque la meta puede estar por
+    # delante de la capacidad actual.
+    paces = _rpe_anchor_paces(session.get("target"), goal_row)
+    if paces:
+        return {
+            "speed": _speed_text_from_paces(paces),
+            "pace": _pace_text_from_seconds(paces),
+            "repeats": [],
+            "source": "meta + RPE",
+            "note": "Referencia inicial por meta + RPE; ajusta la velocidad hasta respetar el esfuerzo indicado.",
+        }
+
     return {
-        "speed": speed,
-        "repeats": treadmill_repeat_text(session),
-        "note": "Velocidad equivalente; la inclinación se ajusta por separado según contexto y tolerancia.",
+        "speed": None,
+        "pace": None,
+        "repeats": [],
+        "source": "RPE",
+        "note": "No hay una marca o meta temporal suficiente para asignar una velocidad responsable; usa el RPE/talk test.",
     }
 
 
@@ -7442,7 +7593,7 @@ def build_plan_pdf_bytes(
                 P(workout_kind(p)),
                 P(session_display_name(p)),
                 P(f"{float(p.get('planned_km') or 0):g}"),
-                P((p.get("target") or "Por esfuerzo") + (f" | Cinta {(treadmill_guidance(p) or {}).get('speed')}" if treadmill_guidance(p) else "")),
+                P((p.get("target") or "Por esfuerzo") + (f" | Cinta {(treadmill_guidance(p, active_goal, assessment) or {}).get('speed')}" if (treadmill_guidance(p, active_goal, assessment) or {}).get("speed") else "")),
                 P(status),
             ])
         ct = Table(compact, colWidths=[22*mm, 12*mm, 20*mm, 42*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
@@ -7516,9 +7667,9 @@ def build_plan_pdf_bytes(
                     f'<font color="{status_hex}"><b>{_pdf_esc(status)}</b></font></font>',
                     styles["RCPBody"],
                 )
-                _tm_pdf = treadmill_guidance(p)
+                _tm_pdf = treadmill_guidance(p, active_goal, assessment)
                 _tm_pdf_line = ""
-                if _tm_pdf:
+                if _tm_pdf and _tm_pdf.get('speed'):
                     _tm_pdf_line = f'<br/><font size="8" color="#475569"><b>Caminadora:</b> {_pdf_esc(_tm_pdf["speed"])}</font>'
                     if _tm_pdf.get("repeats"):
                         _tm_pdf_line += f'<br/><font size="7.5" color="#64748B">{_pdf_esc(" · ".join(_tm_pdf["repeats"]))}</font>'
@@ -7721,12 +7872,12 @@ if current_page == "Hoy":
             )
             st.markdown(f"## {today_session['workout_name']}")
             st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
-            _treadmill_today = treadmill_guidance(today_session)
-            if _treadmill_today:
+            _treadmill_today = treadmill_guidance(today_session, ACTIVE_GOAL, ASSESSMENT)
+            if _treadmill_today and _treadmill_today.get('speed'):
                 _tm_extra = ""
                 if _treadmill_today.get("repeats"):
                     _tm_extra = " · " + " · ".join(_treadmill_today["repeats"])
-                st.info(f"🏃‍♂️ **Caminadora:** {_treadmill_today['speed']}{_tm_extra}")
+                st.info(f"🏃‍♂️ **Caminadora:** {_treadmill_today['speed']} · {_treadmill_today.get('pace') or 'por esfuerzo'}{_tm_extra}\n\n{_treadmill_today.get('note') or ''}")
 
             a, b, c, dcol = st.columns(4)
             a.metric("Distancia", f"{float(today_session.get('planned_km') or 0):g} km")
@@ -8076,8 +8227,8 @@ elif current_page == "Semana":
             c1.caption(d.strftime("%d/%m"))
             if s:
                 c2.markdown(f"**{s['workout_name']}**")
-                _tm_week = treadmill_guidance(s)
-                _tm_week_text = f" · Cinta {_tm_week['speed']}" if _tm_week else ""
+                _tm_week = treadmill_guidance(s, ACTIVE_GOAL, ASSESSMENT)
+                _tm_week_text = f" · Cinta {_tm_week['speed']}" if (_tm_week and _tm_week.get('speed')) else ""
                 c2.caption(f"{workout_kind(s)} · {s.get('target') or 'Por esfuerzo'}{_tm_week_text}")
                 c3.markdown(f"**{float(s.get('planned_km') or 0):g} km**")
                 c3.caption(status_label_for_date(d))
@@ -8586,7 +8737,7 @@ elif current_page == "Plan":
             "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
             "Replanificación": str(p.get("replan_status") or "BASELINE").replace("_", " ").title() if REPLAN_READY else "—",
             "Objetivo": p.get("target"),
-            "Caminadora": (treadmill_guidance(p) or {}).get("speed") or "—",
+            "Caminadora": (treadmill_guidance(p, ACTIVE_GOAL, ASSESSMENT) or {}).get("speed") or "—",
             "Opcional": "Sí" if session_is_optional(p) else "No",
             "Estado": status,
         })
@@ -8607,12 +8758,12 @@ elif current_page == "Plan":
                 f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
             )
             st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
-            _tm_plan = treadmill_guidance(p)
-            if _tm_plan:
+            _tm_plan = treadmill_guidance(p, ACTIVE_GOAL, ASSESSMENT)
+            if _tm_plan and _tm_plan.get('speed'):
                 _tm_plan_extra = ""
                 if _tm_plan.get("repeats"):
                     _tm_plan_extra = " · " + " · ".join(_tm_plan["repeats"])
-                st.info(f"🏃‍♂️ **Caminadora:** {_tm_plan['speed']}{_tm_plan_extra}")
+                st.info(f"🏃‍♂️ **Caminadora:** {_tm_plan['speed']} · {_tm_plan.get('pace') or 'por esfuerzo'}{_tm_plan_extra}\n\n{_tm_plan.get('note') or ''}")
             if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
                 st.info(f"🔄 Replanificada V7.2 · {str(p.get('replan_status') or '').replace('_', ' ').title()}")
             st.write(p.get("description") or "Sin instrucciones adicionales.")
@@ -8656,12 +8807,12 @@ elif current_page == "Registro":
             r1.metric("Plan", f"{float(session.get('planned_km') or 0):g} km")
             r2.metric("Objetivo", str(session.get("target") or "Por esfuerzo"))
             r3.metric("Estado", status_label_for_date(selected_day).split(" ", 1)[-1])
-            _tm_reg = treadmill_guidance(session)
-            if _tm_reg:
+            _tm_reg = treadmill_guidance(session, ACTIVE_GOAL, ASSESSMENT)
+            if _tm_reg and _tm_reg.get('speed'):
                 _tm_reg_extra = ""
                 if _tm_reg.get("repeats"):
                     _tm_reg_extra = " · " + " · ".join(_tm_reg["repeats"])
-                st.caption(f"🏃‍♂️ Caminadora: **{_tm_reg['speed']}**{_tm_reg_extra}")
+                st.caption(f"🏃‍♂️ Caminadora: **{_tm_reg['speed']}** · {_tm_reg.get('pace') or 'por esfuerzo'}{_tm_reg_extra} · {_tm_reg.get('source') or 'RPE'}")
             with st.expander("📋 Instrucciones"):
                 st.write(session.get("description") or "Sin instrucciones adicionales.")
 
