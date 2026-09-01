@@ -362,7 +362,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.1.1"
+APP_VERSION = "7.2.0"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -841,6 +841,83 @@ def update_plan_session_fields(session_id, **fields):
     if not session_id:
         return
     client.table("rc_plan_sessions").update(fields).eq("user_id", USER_ID).eq("id", int(session_id)).execute()
+
+
+# ============================================================
+# V7.2 · Persistencia de replanificación
+# ============================================================
+def replanning_storage_ready():
+    """Comprueba la migración V7.2 sin modificar datos."""
+    try:
+        client.table("rc_plan_replans").select("id,decision,status").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_plan_sessions").select(
+            "id,baseline_session_date,replan_status,replan_id,replanned_at"
+        ).eq("user_id", USER_ID).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def get_replans(plan_id=None, limit=80):
+    if not plan_id:
+        active = get_active_plan_record()
+        plan_id = (active or {}).get("id")
+    if not plan_id:
+        return []
+    return (
+        client.table("rc_plan_replans")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def create_replan_record(payload):
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    result = client.table("rc_plan_replans").insert(row).execute().data or []
+    return result[0] if result else None
+
+
+def update_replan_record(replan_id, **fields):
+    if not replan_id:
+        return
+    client.table("rc_plan_replans").update(fields).eq("user_id", USER_ID).eq("id", int(replan_id)).execute()
+
+
+def get_plan_session_by_id(session_id):
+    if not session_id:
+        return None
+    rows = (
+        client.table("rc_plan_sessions")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("id", int(session_id))
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def delete_plan_session_by_id(session_id):
+    if not session_id:
+        return
+    client.table("rc_plan_sessions").delete().eq("user_id", USER_ID).eq("id", int(session_id)).execute()
+
+
+def insert_replan_session(plan_id, row):
+    payload = dict(row)
+    payload["user_id"] = USER_ID
+    payload["plan_id"] = int(plan_id)
+    result = client.table("rc_plan_sessions").insert(payload).execute().data or []
+    return result[0] if result else None
 
 
 def insert_plan_sessions(plan_id, rows):
@@ -4145,6 +4222,8 @@ ADAPTIVE_READY = adaptive_storage_ready()
 READINESS_ROWS = get_readiness_rows(ACTIVE_PLAN["id"]) if ADAPTIVE_READY and ACTIVE_PLAN else []
 READINESS_BY_DATE = {str(x.get("checkin_date")): x for x in READINESS_ROWS}
 ADJUSTMENTS = get_adjustments(ACTIVE_PLAN["id"]) if ADAPTIVE_READY and ACTIVE_PLAN else []
+REPLAN_READY = replanning_storage_ready() if ADAPTIVE_READY else False
+REPLANS = get_replans(ACTIVE_PLAN["id"]) if REPLAN_READY and ACTIVE_PLAN else []
 
 # ============================================================
 # V6.4.2 · Navigation Grid por iconos / Sidebar
@@ -4696,6 +4775,550 @@ def status_label_for_date(day_value):
     return "○ Pendiente"
 
 
+# ============================================================
+# V7.2 · Motor de replanificación RCP
+# ============================================================
+def _replan_reason_group(reason):
+    text = str(reason or "").strip().lower()
+    if text in ("fatiga", "dolor/molestia", "enfermedad"):
+        return "RECOVERY"
+    if text in ("falta de tiempo", "viaje"):
+        return "SCHEDULE"
+    return "OTHER"
+
+
+def _hard_session(session):
+    return workout_kind(session) in ("Series", "Tempo", "Larga", "Carrera")
+
+
+def _quality_session(session):
+    return workout_kind(session) in ("Series", "Tempo")
+
+
+def _available_weekday_indexes():
+    selected = ((ACTIVE_PLAN or {}).get("metadata") or {}).get("selected_days") or []
+    indexes = [DAY_NAMES.index(x) for x in selected if x in DAY_NAMES]
+    if indexes:
+        return sorted(set(indexes))
+    answers = (LATEST_ASSESSMENT or {}).get("answers") or {}
+    days = answers.get("available_days") or []
+    indexes = [DAY_NAMES.index(x) for x in days if x in DAY_NAMES]
+    return sorted(set(indexes)) if indexes else list(range(7))
+
+
+def _plan_end_date():
+    return parse_date_safe((ACTIVE_PLAN or {}).get("end_date")) or max(
+        [d for p in PLAN if (d := parse_date_safe(p.get("session_date")))],
+        default=date.today(),
+    )
+
+
+def _race_date_from_plan():
+    race_sessions = [
+        parse_date_safe(p.get("session_date"))
+        for p in PLAN
+        if workout_kind(p) == "Carrera" and parse_date_safe(p.get("session_date"))
+    ]
+    if race_sessions:
+        return min(race_sessions)
+    return parse_date_safe((ACTIVE_GOAL or {}).get("race_date"))
+
+
+def _session_on_date(day_value):
+    return PLAN_BY_DATE.get(day_value.isoformat())
+
+
+def _logged_on_date(day_value):
+    return LOG_BY_DATE.get(day_value.isoformat())
+
+
+def _adjacent_hard_conflict(day_value, ignore_session_id=None, radius=1):
+    for delta in range(-radius, radius + 1):
+        if delta == 0:
+            continue
+        d = day_value + timedelta(days=delta)
+        p = _session_on_date(d)
+        if not p or int(p.get("id") or 0) == int(ignore_session_id or -1):
+            continue
+        status = str((_logged_on_date(d) or {}).get("status") or "").upper()
+        if status in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+            continue
+        if _hard_session(p):
+            return True
+    return False
+
+
+def _week_no_for_date(day_value, fallback=None):
+    monday = day_value - timedelta(days=day_value.weekday())
+    sunday = monday + timedelta(days=6)
+    week_sessions = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date"))) and monday <= d <= sunday
+    ]
+    if week_sessions:
+        return int(week_sessions[0].get("week_no") or fallback or 1)
+    return int(fallback or 1)
+
+
+def _handled_replan_trigger(log_row, session_row):
+    log_id = int((log_row or {}).get("id") or 0)
+    session_id = int((session_row or {}).get("id") or 0)
+    for r in REPLANS:
+        if str(r.get("status") or "").upper() not in ("APPLIED", "PENDING"):
+            continue
+        if log_id and int(r.get("trigger_log_id") or 0) == log_id:
+            return True
+        if session_id and int(r.get("trigger_session_id") or 0) == session_id and str(r.get("trigger_date")) == str((log_row or {}).get("session_date")):
+            return True
+    return False
+
+
+def unresolved_missed_event(trigger_day=None, lookback_days=14):
+    """Última omisión explícitamente registrada que todavía no fue procesada por V7.2."""
+    trigger_day = trigger_day or date.today()
+    start = trigger_day - timedelta(days=max(1, int(lookback_days)))
+    candidates = []
+    for log in CURRENT_LOGS:
+        if str(log.get("status") or "").upper() != "OMITIDO":
+            continue
+        d = parse_date_safe(log.get("session_date"))
+        if not d or not (start <= d <= trigger_day):
+            continue
+        session = PLAN_BY_DATE.get(str(log.get("session_date")))
+        if not session or session_is_optional(session):
+            continue
+        if _handled_replan_trigger(log, session):
+            continue
+        candidates.append((d, log, session))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    d, log, session = candidates[0]
+    return {"date": d, "log": log, "session": session}
+
+
+def _days_since_last_completed(before_or_on=None):
+    ref = before_or_on or date.today()
+    dates = []
+    for log in CURRENT_LOGS:
+        if str(log.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
+            continue
+        d = parse_date_safe(log.get("session_date"))
+        if d and d <= ref:
+            dates.append(d)
+    if not dates:
+        return None
+    return max(0, (ref - max(dates)).days)
+
+
+def _recent_omitted_count(trigger_day, days=7):
+    start = trigger_day - timedelta(days=days - 1)
+    return sum(
+        1 for log in CURRENT_LOGS
+        if str(log.get("status") or "").upper() == "OMITIDO"
+        and (d := parse_date_safe(log.get("session_date")))
+        and start <= d <= trigger_day
+        and not session_is_optional(PLAN_BY_DATE.get(str(log.get("session_date")), {}))
+    )
+
+
+def _find_safe_replan_target(missed_session, missed_day, trigger_day, kind):
+    available = set(_available_weekday_indexes())
+    horizon = 2 if kind == "Larga" else 3
+    start = max(trigger_day, missed_day + timedelta(days=1))
+    race_day = _race_date_from_plan()
+    end = min(_plan_end_date(), missed_day + timedelta(days=horizon))
+    if race_day:
+        end = min(end, race_day - timedelta(days=1))
+    if end < start:
+        return None
+
+    options = []
+    for offset in range((end - start).days + 1):
+        d = start + timedelta(days=offset)
+        if d.weekday() not in available:
+            continue
+        existing = _session_on_date(d)
+        log = _logged_on_date(d)
+        if log and str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+            continue
+        if existing and workout_kind(existing) in ("Carrera", "Series", "Tempo", "Larga"):
+            continue
+        radius = 2 if kind == "Larga" else 1
+        if _adjacent_hard_conflict(d, ignore_session_id=(existing or {}).get("id"), radius=radius):
+            continue
+        # Prioriza sustituir un rodaje/fuerza ya previsto: no añade una sesión extra.
+        priority = 0 if existing and workout_kind(existing) in ("Rodaje", "Fuerza") else 1
+        options.append((priority, d, existing))
+    if not options:
+        return None
+    options.sort(key=lambda x: (x[0], x[1]))
+    _, d, existing = options[0]
+    return {"date": d, "existing": existing}
+
+
+def replan_snapshot(trigger_day=None):
+    """Clasifica una sesión omitida y propone una replanificación conservadora y auditable."""
+    if not REPLAN_READY or not ACTIVE_PLAN:
+        return None
+    trigger_day = trigger_day or date.today()
+    event = unresolved_missed_event(trigger_day)
+    if not event:
+        return None
+
+    missed_day = event["date"]
+    log = event["log"]
+    session = event["session"]
+    kind = workout_kind(session)
+    reason = str(log.get("missed_reason") or "No informado")
+    reason_group = _replan_reason_group(reason)
+    recent_omitted = _recent_omitted_count(trigger_day, 7)
+    gap_days = _days_since_last_completed(trigger_day)
+    race_day = _race_date_from_plan()
+    days_to_race = (race_day - trigger_day).days if race_day else None
+    today_readiness = READINESS_BY_DATE.get(trigger_day.isoformat()) or {}
+    today_readiness_status = str(today_readiness.get("readiness_status") or "").upper()
+
+    decision = "SKIP"
+    summary = "No recuperar esta sesión; continuar con el plan."
+    explanation = "Recuperar una sesión aislada puede concentrar carga sin aportar una adaptación útil."
+    target = None
+    scope_days = 0
+
+    if kind == "Carrera":
+        decision = "REVIEW_GOAL"
+        summary = "No mover automáticamente una carrera objetivo."
+        explanation = "Una carrera perdida requiere revisar el objetivo y el siguiente ciclo, no trasladarla como una sesión ordinaria."
+    elif gap_days is not None and gap_days >= 14:
+        decision = "REASSESS"
+        summary = "Reevaluar antes de reconstruir el plan."
+        explanation = "Han pasado al menos 14 días desde la última sesión completada; V7.2 evita retomar directamente la carga previa."
+    elif today_readiness_status in ("RED", "ORANGE"):
+        decision = "PROTECT_WEEK"
+        summary = "No recuperar la sesión mientras el readiness actual está comprometido."
+        explanation = "V7.2 prioriza el estado actual sobre la sesión perdida; primero reduce carga y elimina intensidad durante unos días."
+        scope_days = 5
+    elif reason_group == "RECOVERY" and gap_days is not None and gap_days >= 7:
+        decision = "RETURN_WEEK"
+        summary = "Crear una semana de retorno progresivo."
+        explanation = "Tras una interrupción de 7–13 días, se prioriza carrera fácil y menor volumen antes de recuperar calidad."
+        scope_days = 7
+    elif recent_omitted >= 2:
+        decision = "REBUILD_WEEK"
+        summary = "Reconstruir los próximos 7 días sin acumular sesiones perdidas."
+        explanation = "Hay varias omisiones recientes; V7.2 conserva un solo estímulo principal y reduce la densidad de carga."
+        scope_days = 7
+    elif reason_group == "RECOVERY" and reason.lower() in ("dolor/molestia", "enfermedad"):
+        decision = "PROTECT_WEEK"
+        summary = "No recuperar la sesión y proteger los próximos días."
+        explanation = "Dolor o enfermedad no deben compensarse acumulando entrenamiento; se retira temporalmente intensidad y se reduce volumen."
+        scope_days = 5
+    elif reason_group == "RECOVERY":
+        decision = "SKIP"
+        summary = "Dejar atrás la sesión y continuar sin compensarla."
+        explanation = "La omisión fue por recuperación/fatiga; la prioridad es absorber la carga, no recuperarla."
+    elif kind in ("Rodaje", "Fuerza") or session_is_optional(session):
+        decision = "SKIP"
+        summary = "No recuperar esta sesión."
+        explanation = "Un rodaje fácil o trabajo complementario aislado puede omitirse sin desplazar la semana."
+    elif reason_group == "SCHEDULE" and kind in ("Series", "Tempo"):
+        target = _find_safe_replan_target(session, missed_day, trigger_day, kind)
+        if target:
+            decision = "RESCHEDULE_QUALITY"
+            summary = f"Reubicar una versión reducida de la calidad al {target['date'].strftime('%d/%m')}."
+            explanation = "Existe un hueco compatible sin colocar otra sesión exigente inmediatamente alrededor."
+        else:
+            decision = "SKIP"
+            summary = "No existe un hueco seguro para recuperar la calidad."
+            explanation = "V7.2 prefiere perder una sesión a crear dos estímulos exigentes demasiado próximos."
+    elif reason_group == "SCHEDULE" and kind == "Larga":
+        if days_to_race is not None and days_to_race <= 7:
+            decision = "SKIP"
+            summary = "No recuperar la tirada larga durante la última semana precompetitiva."
+            explanation = "La proximidad de la carrera tiene prioridad sobre recuperar volumen perdido."
+        else:
+            target = _find_safe_replan_target(session, missed_day, trigger_day, kind)
+            if target:
+                decision = "RESCHEDULE_LONG"
+                summary = f"Reubicar una tirada larga reducida al {target['date'].strftime('%d/%m')}."
+                explanation = "El hueco permite mantener distancia respecto de calidad/carrera y se reduce la tirada para limitar carga residual."
+            else:
+                decision = "SKIP"
+                summary = "No existe un hueco seguro para recuperar la tirada larga."
+                explanation = "No se apilará una larga sobre la siguiente sesión exigente."
+
+    return {
+        "decision": decision,
+        "summary": summary,
+        "explanation": explanation,
+        "event": event,
+        "target": target,
+        "scope_days": scope_days,
+        "metrics": {
+            "missed_kind": kind,
+            "missed_reason": reason,
+            "reason_group": reason_group,
+            "recent_omitted_7d": recent_omitted,
+            "days_since_last_completed": gap_days,
+            "days_to_race": days_to_race,
+            "today_readiness_status": today_readiness_status or None,
+            "today_readiness_score": today_readiness.get("readiness_score"),
+        },
+    }
+
+
+def _replan_change_before(session):
+    fields = [
+        "session_date", "week_no", "workout_type", "workout_name", "planned_km",
+        "target", "intensity", "description", "is_optional", "adaptation_status",
+        "adaptation_id", "replan_status", "replan_id", "replanned_at",
+    ]
+    return {k: session.get(k) for k in fields}
+
+
+def _update_with_replan(session, fields, replan_id, status_label):
+    before = _replan_change_before(session)
+    values = dict(fields)
+    values.update({
+        "replan_id": int(replan_id),
+        "replan_status": status_label,
+        "replanned_at": datetime.now(timezone.utc).isoformat(),
+    })
+    update_plan_session_fields(session["id"], **values)
+    after = dict(before)
+    after.update(values)
+    return {"op": "UPDATE", "session_id": int(session["id"]), "before": before, "after": after}
+
+
+def _return_session_fields(session, factor, mode="RETURN"):
+    kind = workout_kind(session)
+    km = float(session.get("planned_km") or 0)
+    new_km = round(max(2.0, km * factor), 1) if km > 0 else 0.0
+    if kind in ("Series", "Tempo"):
+        return {
+            "workout_type": "RODAJE",
+            "workout_name": "Rodaje fácil · retorno",
+            "planned_km": new_km,
+            "target": "RPE 2–3 · ritmo conversacional",
+            "intensity": "BAJA",
+            "description": "V7.2: sesión de calidad sustituida temporalmente por carrera fácil durante el retorno. No compensar intensidad perdida.",
+        }
+    if kind == "Larga":
+        return {
+            "workout_name": "Tirada larga reducida · retorno",
+            "planned_km": new_km,
+            "target": "RPE 3–4 · ritmo cómodo",
+            "intensity": "BAJA-MEDIA",
+            "description": "V7.2: tirada larga reducida por replanificación. Mantener esfuerzo cómodo y detener si reaparecen síntomas o dolor relevante.",
+        }
+    return {
+        "planned_km": new_km,
+        "target": "RPE 2–4 · ritmo cómodo",
+        "intensity": "BAJA",
+        "description": f"V7.2: carga reducida temporalmente ({mode.lower()}). Priorizar continuidad y recuperación.",
+    }
+
+
+def apply_replan(recommendation, trigger_day=None):
+    if not REPLAN_READY or not ACTIVE_PLAN or not recommendation:
+        return False, "La replanificación V7.2 no está disponible."
+    event = recommendation.get("event") or {}
+    log = event.get("log") or {}
+    missed = event.get("session") or {}
+    missed_day = event.get("date") or trigger_day or date.today()
+    decision = str(recommendation.get("decision") or "SKIP")
+    scope_days = int(recommendation.get("scope_days") or 0)
+    scope_start = max(date.today(), missed_day + timedelta(days=1)) if scope_days else None
+    scope_end = (scope_start + timedelta(days=scope_days - 1)) if scope_start and scope_days else None
+
+    record = create_replan_record({
+        "plan_id": int(ACTIVE_PLAN["id"]),
+        "trigger_session_id": int(missed.get("id")) if missed.get("id") else None,
+        "trigger_log_id": int(log.get("id")) if log.get("id") else None,
+        "trigger_date": missed_day.isoformat(),
+        "trigger_type": "MISSED_SESSION",
+        "decision": decision,
+        "reason": f"{recommendation.get('summary')} {recommendation.get('explanation')}",
+        "scope_start": scope_start.isoformat() if scope_start else None,
+        "scope_end": scope_end.isoformat() if scope_end else None,
+        "metrics": recommendation.get("metrics") or {},
+        "changes": [],
+        "status": "PENDING",
+    })
+    if not record:
+        return False, "No fue posible crear la auditoría de replanificación."
+    replan_id = int(record["id"])
+    changes = []
+
+    try:
+        if decision in ("SKIP", "REVIEW_GOAL", "REASSESS"):
+            pass
+
+        elif decision in ("RESCHEDULE_QUALITY", "RESCHEDULE_LONG"):
+            target = recommendation.get("target") or {}
+            target_day = target.get("date")
+            existing = target.get("existing")
+            if not target_day:
+                raise RuntimeError("El hueco propuesto ya no está disponible.")
+            source_km = float(missed.get("planned_km") or 0)
+            factor = 0.90 if decision == "RESCHEDULE_QUALITY" else 0.82
+            if existing:
+                existing_km = float(existing.get("planned_km") or 0)
+                if decision == "RESCHEDULE_QUALITY":
+                    new_km = round(min(source_km * factor, max(3.0, existing_km)), 1)
+                    fields = {
+                        "workout_type": missed.get("workout_type"),
+                        "workout_name": f"{missed.get('workout_name')} · reubicada",
+                        "planned_km": new_km,
+                        "target": missed.get("target"),
+                        "intensity": missed.get("intensity"),
+                        "description": "V7.2: calidad reubicada por conflicto de agenda. Versión reducida; no añadir el rodaje sustituido en otro día. " + str(missed.get("description") or ""),
+                        "is_optional": False,
+                    }
+                    status_label = "RESCHEDULED_QUALITY"
+                else:
+                    new_km = round(min(source_km * factor, max(existing_km * 1.20, source_km * 0.65)), 1)
+                    fields = {
+                        "workout_type": "LARGA",
+                        "workout_name": f"{missed.get('workout_name')} · reubicada reducida",
+                        "planned_km": new_km,
+                        "target": "RPE 3–4 · ritmo cómodo",
+                        "intensity": "MEDIA",
+                        "description": "V7.2: tirada larga reubicada y reducida. No intentar completar el kilometraje originalmente perdido. " + str(missed.get("description") or ""),
+                        "is_optional": False,
+                    }
+                    status_label = "RESCHEDULED_LONG"
+                changes.append(_update_with_replan(existing, fields, replan_id, status_label))
+            else:
+                # Hueco libre: crea una única sesión reducida, no copia la carga completa.
+                new_km = round(max(3.0, source_km * factor), 1)
+                row = {
+                    "session_date": target_day.isoformat(),
+                    "week_no": _week_no_for_date(target_day, missed.get("week_no")),
+                    "workout_type": missed.get("workout_type") if decision == "RESCHEDULE_QUALITY" else "LARGA",
+                    "workout_name": f"{missed.get('workout_name')} · reubicada",
+                    "planned_km": new_km,
+                    "target": missed.get("target") if decision == "RESCHEDULE_QUALITY" else "RPE 3–4 · ritmo cómodo",
+                    "intensity": missed.get("intensity") if decision == "RESCHEDULE_QUALITY" else "MEDIA",
+                    "description": "V7.2: sesión reubicada en hueco libre y reducida para evitar compensación excesiva. " + str(missed.get("description") or ""),
+                    "is_optional": False,
+                    "replan_id": replan_id,
+                    "replan_status": "INSERTED_REPLAN",
+                    "replanned_at": datetime.now(timezone.utc).isoformat(),
+                }
+                inserted = insert_replan_session(ACTIVE_PLAN["id"], row)
+                if not inserted:
+                    raise RuntimeError("No fue posible guardar la sesión reubicada.")
+                changes.append({"op": "INSERT", "session_id": int(inserted["id"]), "after": inserted})
+
+        elif decision in ("RETURN_WEEK", "PROTECT_WEEK", "REBUILD_WEEK"):
+            if not scope_start or not scope_end:
+                raise RuntimeError("No fue posible definir el bloque de replanificación.")
+            future = [
+                p for p in PLAN
+                if (d := parse_date_safe(p.get("session_date")))
+                and scope_start <= d <= scope_end
+                and workout_kind(p) != "Carrera"
+                and str((_logged_on_date(d) or {}).get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO", "OMITIDO")
+            ]
+            quality_seen = 0
+            for p in future:
+                kind = workout_kind(p)
+                if decision == "RETURN_WEEK":
+                    fields = _return_session_fields(p, 0.68, "RETURN")
+                    label = "RETURN_WEEK"
+                elif decision == "PROTECT_WEEK":
+                    fields = _return_session_fields(p, 0.78, "PROTECT")
+                    label = "PROTECT_WEEK"
+                else:
+                    # Rebuild: máximo un estímulo de calidad; el resto baja densidad/volumen.
+                    if _quality_session(p):
+                        quality_seen += 1
+                        if quality_seen > 1:
+                            fields = _return_session_fields(p, 0.80, "REBUILD")
+                        else:
+                            fields = {"planned_km": round(max(3.0, float(p.get("planned_km") or 0) * 0.88), 1)}
+                    elif kind == "Larga":
+                        fields = {"planned_km": round(max(4.0, float(p.get("planned_km") or 0) * 0.85), 1)}
+                    else:
+                        fields = {"planned_km": round(max(2.0, float(p.get("planned_km") or 0) * 0.90), 1)}
+                    fields["description"] = "V7.2: semana reconstruida tras múltiples omisiones. No recuperar sesiones perdidas adicionalmente. " + str(p.get("description") or "")
+                    label = "REBUILT_WEEK"
+                changes.append(_update_with_replan(p, fields, replan_id, label))
+
+        update_replan_record(replan_id, changes=changes, status="APPLIED")
+        if decision == "SKIP":
+            return True, "Sesión cerrada sin recuperación. El plan continúa sin acumular carga."
+        if decision == "REASSESS":
+            return True, "V7.2 registró la interrupción. Se recomienda una nueva Evaluación RCP antes de reconstruir el ciclo."
+        if decision == "REVIEW_GOAL":
+            return True, "La carrera perdida quedó registrada para revisión del objetivo; no se movió automáticamente."
+        return True, f"Replanificación V7.2 aplicada · {len(changes)} sesión(es) ajustada(s)."
+    except Exception as exc:
+        # Rollback best-effort de cambios ya realizados en esta operación.
+        for ch in reversed(changes):
+            try:
+                if ch.get("op") == "UPDATE":
+                    update_plan_session_fields(ch["session_id"], **(ch.get("before") or {}))
+                elif ch.get("op") == "INSERT":
+                    delete_plan_session_by_id(ch["session_id"])
+            except Exception:
+                pass
+        update_replan_record(replan_id, changes=changes, status="FAILED", reason=f"{record.get('reason') or ''} Error: {exc}")
+        return False, f"No fue posible aplicar la replanificación: {exc}"
+
+
+def revert_last_replan():
+    rows = [r for r in REPLANS if str(r.get("status") or "").upper() == "APPLIED"]
+    if not rows:
+        return False, "No hay replanificaciones aplicadas para revertir."
+    record = rows[0]
+    changes = record.get("changes") or []
+    if not isinstance(changes, list):
+        return False, "La auditoría de esta replanificación no es válida."
+
+    # No revierte una replanificación si alguna sesión afectada ya fue ejecutada/registrada.
+    for ch in changes:
+        sid = int(ch.get("session_id") or 0)
+        current = get_plan_session_by_id(sid)
+        if not current and ch.get("op") == "INSERT":
+            continue
+        current_date = parse_date_safe((current or {}).get("session_date") or (ch.get("after") or {}).get("session_date"))
+        if current_date:
+            log = get_logs(ACTIVE_PLAN["id"])
+            log = next((x for x in log if str(x.get("session_date")) == current_date.isoformat()), None)
+            if log and str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+                return False, "No se puede revertir: una de las sesiones replanificadas ya tiene un registro."
+
+    try:
+        for ch in reversed(changes):
+            if ch.get("op") == "UPDATE":
+                update_plan_session_fields(ch["session_id"], **(ch.get("before") or {}))
+            elif ch.get("op") == "INSERT":
+                delete_plan_session_by_id(ch["session_id"])
+        update_replan_record(
+            record["id"],
+            status="REVERTED",
+            reverted_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return True, "Última replanificación revertida."
+    except Exception as exc:
+        return False, f"No fue posible revertir la replanificación: {exc}"
+
+
+def replan_decision_label(decision):
+    return {
+        "SKIP": "Continuar sin recuperar",
+        "RESCHEDULE_QUALITY": "Reubicar calidad",
+        "RESCHEDULE_LONG": "Reubicar larga reducida",
+        "PROTECT_WEEK": "Proteger próximos días",
+        "RETURN_WEEK": "Semana de retorno",
+        "REBUILD_WEEK": "Reconstruir semana",
+        "REASSESS": "Reevaluación recomendada",
+        "REVIEW_GOAL": "Revisar objetivo",
+    }.get(str(decision or ""), str(decision or "—"))
+
+
 def week_bounds(day_value):
     monday = day_value - timedelta(days=day_value.weekday())
     return monday, monday + timedelta(days=6)
@@ -4860,7 +5483,7 @@ if ACTIVE_GOAL.get("race_date"):
     st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
 
 if ADAPTIVE_READY:
-    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.1")
+    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.2")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -5139,6 +5762,64 @@ if current_page == "Hoy":
                     (st.success if ok else st.error)(msg)
                     if ok:
                         st.rerun()
+
+    # V7.2 · Replanificación de una sesión omitida explícitamente registrada.
+    if REPLAN_READY and selected_day == date.today():
+        replan = replan_snapshot(date.today())
+        if replan:
+            event = replan.get("event") or {}
+            missed = event.get("session") or {}
+            missed_day = event.get("date")
+            metrics = replan.get("metrics") or {}
+            st.markdown("### 🔄 Replanificación V7.2")
+            with st.container(border=True):
+                st.caption(
+                    f"Sesión perdida: {missed_day.strftime('%d/%m') if missed_day else '—'} · "
+                    f"{missed.get('workout_name') or '—'} · Motivo: {metrics.get('missed_reason') or 'No informado'}"
+                )
+                st.markdown(f"**{replan_decision_label(replan.get('decision'))}**")
+                st.write(replan.get("summary") or "")
+                st.caption(replan.get("explanation") or "")
+                target = replan.get("target") or {}
+                if target.get("date"):
+                    existing_target = target.get("existing")
+                    if existing_target:
+                        st.info(
+                            f"Hueco propuesto: {target['date'].strftime('%d/%m')} · sustituye "
+                            f"{existing_target.get('workout_name') or 'la sesión prevista'}; no añade otra sesión."
+                        )
+                    else:
+                        st.info(f"Hueco propuesto: {target['date'].strftime('%d/%m')} · día disponible sin sesión planificada.")
+
+                decision = str(replan.get("decision") or "")
+                if decision == "REASSESS":
+                    c1, c2 = st.columns(2)
+                    if c1.button("🧭 Ir a Evaluación", use_container_width=True, type="primary"):
+                        set_page("Evaluación")
+                        st.rerun()
+                    if c2.button("✅ Registrar recomendación", use_container_width=True):
+                        ok, msg = apply_replan(replan, date.today())
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+                elif decision == "REVIEW_GOAL":
+                    c1, c2 = st.columns(2)
+                    if c1.button("🎯 Revisar objetivo", use_container_width=True, type="primary"):
+                        set_page("Objetivo")
+                        st.rerun()
+                    if c2.button("✅ Registrar sin mover", use_container_width=True):
+                        ok, msg = apply_replan(replan, date.today())
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+                else:
+                    if st.button("🔄 Aplicar propuesta V7.2", use_container_width=True, type="primary"):
+                        ok, msg = apply_replan(replan, date.today())
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+    elif ADAPTIVE_READY and not REPLAN_READY and selected_day == date.today():
+        st.caption("🔄 Replanificación V7.2 pendiente de activar en Supabase.")
 
     # Resumen semanal
     st.markdown("### Esta semana")
@@ -5620,6 +6301,32 @@ elif current_page == "Progreso":
                         st.rerun()
 
 
+    # 8 · V7.2 Replanificación
+    if REPLAN_READY:
+        st.divider()
+        st.markdown("## 🔄 Replanificación V7.2")
+        if REPLANS:
+            rows = []
+            for r in REPLANS[:20]:
+                changes = r.get("changes") or []
+                rows.append({
+                    "Fecha detonante": r.get("trigger_date"),
+                    "Decisión": replan_decision_label(r.get("decision")),
+                    "Cambios": len(changes) if isinstance(changes, list) else 0,
+                    "Estado": r.get("status"),
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            latest = next((r for r in REPLANS if str(r.get("status") or "").upper() == "APPLIED"), None)
+            if latest:
+                if st.button("↩️ Revertir última replanificación", use_container_width=True):
+                    ok, msg = revert_last_replan()
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+        else:
+            st.info("Todavía no hay replanificaciones. Solo se crean cuando una sesión se registra como OMITIDA y V7.2 propone una acción.")
+
+
 # ============================================================
 # 🗓️ PLAN
 # ============================================================
@@ -5662,6 +6369,7 @@ elif current_page == "Plan":
             "KM": float(p.get("planned_km") or 0),
             "KM base": float(p.get("baseline_planned_km") or p.get("planned_km") or 0) if ADAPTIVE_READY else float(p.get("planned_km") or 0),
             "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
+            "Replanificación": str(p.get("replan_status") or "BASELINE").replace("_", " ").title() if REPLAN_READY else "—",
             "Objetivo": p.get("target"),
             "Opcional": "Sí" if session_is_optional(p) else "No",
             "Estado": status,
@@ -5683,6 +6391,8 @@ elif current_page == "Plan":
                 f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
             )
             st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
+            if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
+                st.info(f"🔄 Replanificada V7.2 · {str(p.get('replan_status') or '').replace('_', ' ').title()}")
             st.write(p.get("description") or "Sin instrucciones adicionales.")
             d = parse_date_safe(p.get("session_date"))
             if st.button("✅ Ir a registrar esta sesión", use_container_width=True, type="primary"):
@@ -5810,8 +6520,12 @@ elif current_page == "Registro":
                     "missed_reason": (missed_reason if ADAPTIVE_READY and status == "OMITIDO" and missed_reason != "—" else None),
                     "notes": notes.strip(),
                 })
-                st.success("Entrenamiento guardado ✅")
-                set_page("Hoy", selected_day)
+                if status == "OMITIDO" and REPLAN_READY:
+                    st.success("Sesión omitida registrada. V7.2 evaluará si conviene replanificarla sin acumular carga.")
+                    set_page("Hoy", date.today())
+                else:
+                    st.success("Entrenamiento guardado ✅")
+                    set_page("Hoy", selected_day)
                 st.rerun()
 
         if existing:
