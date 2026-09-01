@@ -363,7 +363,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.3.0"
+APP_VERSION = "7.4.0"
 
 
 # ============================================================
@@ -654,10 +654,116 @@ def save_profile(payload):
 
 
 def update_profile_fields(payload):
-    """Actualiza únicamente campos legacy existentes sin intentar insertar un perfil nuevo."""
+    """Actualiza únicamente campos del perfil existente sin recrearlo."""
     values = dict(payload)
     values["updated_at"] = datetime.now(timezone.utc).isoformat()
     client.table("rc_profiles").update(values).eq("user_id", USER_ID).execute()
+
+
+# ============================================================
+# V7.4 · Perfil fisiológico / antropométrico
+# ============================================================
+def profile_v74_storage_ready():
+    """Comprueba la migración V7.4 sin modificar datos."""
+    try:
+        (
+            client.table("rc_profiles")
+            .select(
+                "user_id,date_of_birth,weight_kg,height_cm,resting_hr,max_hr,"
+                "max_hr_source,device_brand,work_context,habitual_sleep_hours,"
+                "physiology_updated_at"
+            )
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        (
+            client.table("rc_profile_metrics")
+            .select("id,metric_date,weight_kg,resting_hr")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _profile_date(value):
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except Exception:
+        return None
+
+
+def age_from_birth_date(value, reference_day=None):
+    dob = _profile_date(value)
+    if not dob:
+        return None
+    ref = reference_day or rcp_today()
+    if dob > ref:
+        return None
+    return ref.year - dob.year - ((ref.month, ref.day) < (dob.month, dob.day))
+
+
+def physiological_profile_snapshot(profile_row=None):
+    """Contexto fisiológico actual. V7.4 lo registra, pero no prescribe carga por peso/IMC."""
+    row = dict(profile_row or {})
+    dob = _profile_date(row.get("date_of_birth"))
+    age = age_from_birth_date(dob)
+    weight = float(row.get("weight_kg") or 0) or None
+    height = float(row.get("height_cm") or 0) or None
+    bmi = None
+    if weight and height and height > 0:
+        bmi = round(weight / ((height / 100.0) ** 2), 1)
+    return {
+        "date_of_birth": dob.isoformat() if dob else None,
+        "age_years": age,
+        "weight_kg": round(weight, 2) if weight else None,
+        "height_cm": round(height, 1) if height else None,
+        "bmi": bmi,
+        "resting_hr": int(row.get("resting_hr")) if row.get("resting_hr") else None,
+        "max_hr": int(row.get("max_hr")) if row.get("max_hr") else None,
+        "max_hr_source": row.get("max_hr_source") or None,
+        "device_brand": row.get("device_brand") or None,
+        "work_context": row.get("work_context") or None,
+        "habitual_sleep_hours": float(row.get("habitual_sleep_hours")) if row.get("habitual_sleep_hours") else None,
+        "updated_at": row.get("physiology_updated_at") or None,
+        "prescription_policy": "CONTEXT_ONLY_V7_4",
+    }
+
+
+def get_profile_metrics(limit=30):
+    if not profile_v74_storage_ready():
+        return []
+    return (
+        client.table("rc_profile_metrics")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .order("metric_date", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def save_profile_metric(metric_date, weight_kg=None, resting_hr=None):
+    """Una fila por día; sirve para tendencias, no para diagnóstico."""
+    if not profile_v74_storage_ready():
+        return
+    row = {
+        "user_id": USER_ID,
+        "metric_date": str(metric_date),
+        "weight_kg": float(weight_kg) if weight_kg else None,
+        "resting_hr": int(resting_hr) if resting_hr else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    client.table("rc_profile_metrics").upsert(
+        row, on_conflict="user_id,metric_date"
+    ).execute()
 
 
 def planning_storage_ready():
@@ -1616,7 +1722,7 @@ def goal_readiness(answers, safety_status):
     return "PREPARACIÓN ADECUADA", base_reasons
 
 
-def build_runner_profile(answers, safety_status, safety_message, score, level, components):
+def build_runner_profile(answers, safety_status, safety_message, score, level, components, profile_row=None):
     """Snapshot técnico estable que será la entrada del Plan Engine V7."""
     base_status, base_reasons = base_goal_readiness(answers, safety_status)
     calendar_status, calendar_reasons = calendar_goal_readiness(answers, safety_status)
@@ -1640,7 +1746,7 @@ def build_runner_profile(answers, safety_status, safety_message, score, level, c
             pass
 
     return {
-        "schema_version": "RCP-RUNNER-PROFILE-1.0",
+        "schema_version": "RCP-RUNNER-PROFILE-1.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "classification": {
             "level": str(level).upper(),
@@ -1696,6 +1802,9 @@ def build_runner_profile(answers, safety_status, safety_message, score, level, c
             "calendar": calendar_status,
             "calendar_reasons": calendar_reasons,
         },
+        "physiology": physiological_profile_snapshot(
+            profile_row if profile_row is not None else globals().get("profile") or {}
+        ),
         "performance": perf,
     }
 
@@ -3062,6 +3171,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         "peak_weekly_km": round(max(weekly_volumes) if weekly_volumes else initial_km, 1),
         "pace_basis": pace_profile.get("basis"),
         "pace_profile": {k: v for k, v in pace_profile.items() if k != "source"},
+        "physiology_snapshot": physiological_profile_snapshot(globals().get("profile") or {}),
         "weeks": week_meta,
         "methodology": {
             "load": "Progresión RCP individualizada por historial, nivel, base y modo de progresión; incluye descargas y límites de pico.",
@@ -3317,6 +3427,7 @@ def show_assessment_result(assessment):
             score,
             level,
             components,
+            profile_row=globals().get("profile") or {},
         )
 
     classification = runner_profile.get("classification") or {}
@@ -3826,6 +3937,7 @@ def assessment_form(existing_assessment=None, onboarding=False):
         runner_score,
         runner_level,
         components,
+        profile_row=globals().get("profile") or {},
     )
     explanation["runner_profile"] = runner_profile
     explanation["level_display"] = runner_profile["classification"]["level_display"]
@@ -6050,6 +6162,7 @@ if ACTIVE_GOAL.get("race_date"):
 
 if ADAPTIVE_READY:
     st.sidebar.markdown("🧠 **Motor adaptativo:** V7.3")
+    st.sidebar.markdown("🧬 **Perfil fisiológico:** V7.4")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -7232,6 +7345,198 @@ elif current_page == "Perfil":
             update_profile_fields({"display_name": display_name.strip()})
             st.success("Nombre actualizado.")
             st.rerun()
+
+    st.divider()
+    st.markdown("### 🧬 Datos personales y fisiológicos")
+    st.caption(
+        "Estos datos caracterizan mejor al corredor. En V7.4 se guardan como contexto técnico; "
+        "peso, talla e IMC no modifican por sí solos el kilometraje, los ritmos ni la intensidad."
+    )
+
+    _v74_ready = profile_v74_storage_ready()
+    if not _v74_ready:
+        st.warning(
+            "Perfil fisiológico pendiente de activar. Ejecuta `supabase_v7_4_physiological_profile.sql` "
+            "en Supabase y vuelve a cargar la app."
+        )
+    else:
+        _dob_value = str(profile.get("date_of_birth") or "")
+        _max_hr_sources = [
+            "No informada",
+            "Reloj / entrenamiento",
+            "Prueba de campo",
+            "Prueba de laboratorio",
+            "Estimación",
+        ]
+        _work_contexts = [
+            "No informado",
+            "Sedentario",
+            "Mixto",
+            "Activo / muchas horas de pie",
+            "Trabajo físico",
+            "Turnos / guardias",
+        ]
+        _current_source = str(profile.get("max_hr_source") or "No informada")
+        _current_work = str(profile.get("work_context") or "No informado")
+
+        with st.form("profile_physiology_form"):
+            p1, p2 = st.columns(2)
+            dob_text = p1.text_input(
+                "Fecha de nacimiento",
+                value=_dob_value,
+                placeholder="AAAA-MM-DD",
+                help="Se guarda la fecha, no una edad fija; RCP calcula la edad automáticamente.",
+            )
+            weight_kg = p2.number_input(
+                "Peso actual (kg)",
+                min_value=0.0,
+                max_value=300.0,
+                value=float(profile.get("weight_kg") or 0),
+                step=0.1,
+                help="0 = no informado. El peso aislado no reduce ni aumenta la carga en V7.4.",
+            )
+
+            p3, p4 = st.columns(2)
+            height_cm = p3.number_input(
+                "Estatura (cm)",
+                min_value=0.0,
+                max_value=250.0,
+                value=float(profile.get("height_cm") or 0),
+                step=0.5,
+                help="0 = no informada.",
+            )
+            sleep_hours = p4.number_input(
+                "Sueño habitual (h/noche)",
+                min_value=0.0,
+                max_value=16.0,
+                value=float(profile.get("habitual_sleep_hours") or 0),
+                step=0.5,
+                help="0 = no informado. El check-in diario sigue siendo la fuente para readiness agudo.",
+            )
+
+            p5, p6 = st.columns(2)
+            resting_hr = p5.number_input(
+                "FC en reposo (opcional)",
+                min_value=0,
+                max_value=180,
+                value=int(profile.get("resting_hr") or 0),
+                step=1,
+                help="Idealmente una medición habitual/basal, no una lectura aislada tras ejercicio.",
+            )
+            max_hr = p6.number_input(
+                "FC máxima conocida (opcional)",
+                min_value=0,
+                max_value=240,
+                value=int(profile.get("max_hr") or 0),
+                step=1,
+                help="Si no la conoces, deja 0. RCP no usa automáticamente 220 − edad.",
+            )
+
+            p7, p8 = st.columns(2)
+            max_hr_source = p7.selectbox(
+                "Fuente de FC máxima",
+                _max_hr_sources,
+                index=_max_hr_sources.index(_current_source) if _current_source in _max_hr_sources else 0,
+            )
+            device_brand = p8.text_input(
+                "Reloj / sensor (opcional)",
+                value=str(profile.get("device_brand") or ""),
+                placeholder="Ej. Garmin, Apple Watch, Coros, Polar…",
+            )
+
+            work_context = st.selectbox(
+                "Contexto laboral habitual",
+                _work_contexts,
+                index=_work_contexts.index(_current_work) if _current_work in _work_contexts else 0,
+            )
+
+            save_phys = st.form_submit_button("💾 Guardar perfil fisiológico", use_container_width=True)
+
+        if save_phys:
+            _dob = None
+            if str(dob_text).strip():
+                try:
+                    _dob = date.fromisoformat(str(dob_text).strip())
+                    if _dob >= rcp_today():
+                        raise ValueError
+                    if age_from_birth_date(_dob) is None or age_from_birth_date(_dob) > 120:
+                        raise ValueError
+                except Exception:
+                    st.error("Fecha de nacimiento inválida. Usa AAAA-MM-DD.")
+                    _dob = "INVALID"
+
+            if _dob != "INVALID":
+                _phys_errors = []
+                if weight_kg and not (20 <= float(weight_kg) <= 300):
+                    _phys_errors.append("El peso debe estar entre 20 y 300 kg, o quedar en 0 si no deseas informarlo.")
+                if height_cm and not (80 <= float(height_cm) <= 250):
+                    _phys_errors.append("La estatura debe estar entre 80 y 250 cm, o quedar en 0 si no deseas informarla.")
+                if resting_hr and not (25 <= int(resting_hr) <= 180):
+                    _phys_errors.append("La FC en reposo debe estar entre 25 y 180 lpm, o quedar en 0 si no la conoces.")
+                if max_hr and not (60 <= int(max_hr) <= 240):
+                    _phys_errors.append("La FC máxima debe estar entre 60 y 240 lpm, o quedar en 0 si no la conoces.")
+                if sleep_hours and not (2 <= float(sleep_hours) <= 16):
+                    _phys_errors.append("El sueño habitual debe estar entre 2 y 16 h/noche, o quedar en 0 si no deseas informarlo.")
+                if max_hr and resting_hr and int(max_hr) <= int(resting_hr):
+                    _phys_errors.append("La FC máxima debe ser mayor que la FC en reposo.")
+
+                if _phys_errors:
+                    for _err in _phys_errors:
+                        st.error(_err)
+                else:
+                    previous_weight = float(profile.get("weight_kg") or 0)
+                    previous_resting = int(profile.get("resting_hr") or 0)
+                    update_profile_fields({
+                        "date_of_birth": _dob.isoformat() if _dob else None,
+                        "weight_kg": float(weight_kg) if weight_kg else None,
+                        "height_cm": float(height_cm) if height_cm else None,
+                        "resting_hr": int(resting_hr) if resting_hr else None,
+                        "max_hr": int(max_hr) if max_hr else None,
+                        "max_hr_source": None if max_hr_source == "No informada" else max_hr_source,
+                        "device_brand": device_brand.strip() or None,
+                        "work_context": None if work_context == "No informado" else work_context,
+                        "habitual_sleep_hours": float(sleep_hours) if sleep_hours else None,
+                        "physiology_updated_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    if (
+                        (weight_kg and abs(float(weight_kg) - previous_weight) >= 0.05)
+                        or (resting_hr and int(resting_hr) != previous_resting)
+                    ):
+                        save_profile_metric(
+                            rcp_today(),
+                            weight_kg=float(weight_kg) if weight_kg else None,
+                            resting_hr=int(resting_hr) if resting_hr else None,
+                        )
+                    st.success("Perfil fisiológico actualizado.")
+                    st.rerun()
+
+        _phys = physiological_profile_snapshot(profile)
+        if any(_phys.get(k) is not None for k in ("age_years", "weight_kg", "height_cm", "resting_hr", "max_hr")):
+            f1, f2, f3, f4 = st.columns(4)
+            f1.metric("Edad", f"{_phys['age_years']} años" if _phys.get("age_years") is not None else "—")
+            f2.metric("Peso", f"{_phys['weight_kg']:g} kg" if _phys.get("weight_kg") else "—")
+            f3.metric("FC reposo", f"{_phys['resting_hr']} lpm" if _phys.get("resting_hr") else "—")
+            f4.metric("FC máx.", f"{_phys['max_hr']} lpm" if _phys.get("max_hr") else "—")
+            if _phys.get("bmi") is not None:
+                st.caption(
+                    f"IMC descriptivo: {_phys['bmi']}. En V7.4 no se usa como regla automática para prescribir entrenamiento."
+                )
+
+        _metric_history = get_profile_metrics(limit=12)
+        if _metric_history:
+            with st.expander("📈 Historial de métricas", expanded=False):
+                st.dataframe(
+                    [
+                        {
+                            "Fecha": m.get("metric_date"),
+                            "Peso (kg)": m.get("weight_kg"),
+                            "FC reposo": m.get("resting_hr"),
+                        }
+                        for m in _metric_history
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     if LATEST_ASSESSMENT:
         st.markdown("### Perfil RCP vigente")
