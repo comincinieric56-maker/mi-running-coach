@@ -99,7 +99,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.3.2"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -326,11 +326,88 @@ def save_profile(payload):
     client.table("rc_profiles").upsert(payload, on_conflict="user_id").execute()
 
 
-def get_plan():
+def update_profile_fields(payload):
+    """Actualiza únicamente campos legacy existentes sin intentar insertar un perfil nuevo."""
+    values = dict(payload)
+    values["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_profiles").update(values).eq("user_id", USER_ID).execute()
+
+
+def planning_storage_ready():
+    """Comprueba que la migración V6.3.2 de objetivos/planes está instalada."""
+    try:
+        client.table("rc_goals").select("id").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_plans").select("id").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_plan_sessions").select("id,plan_id").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_workout_logs").select("id,plan_id").eq("user_id", USER_ID).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def get_goals(limit=50):
+    return (
+        client.table("rc_goals")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def get_active_goal():
+    rows = (
+        client.table("rc_goals")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("status", "ACTIVE")
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def get_plans(limit=50):
+    return (
+        client.table("rc_plans")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def get_active_plan_record():
+    rows = (
+        client.table("rc_plans")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("status", "ACTIVE")
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+def get_plan(plan_id=None):
+    plan_record = get_active_plan_record() if plan_id is None else {"id": plan_id}
+    if not plan_record:
+        return []
     return (
         client.table("rc_plan_sessions")
         .select("*")
         .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_record["id"]))
         .order("session_date")
         .execute()
         .data
@@ -338,18 +415,15 @@ def get_plan():
     )
 
 
-def replace_plan(rows):
-    client.table("rc_workout_logs").delete().eq("user_id", USER_ID).execute()
-    client.table("rc_plan_sessions").delete().eq("user_id", USER_ID).execute()
-    if rows:
-        client.table("rc_plan_sessions").insert(rows).execute()
-
-
-def get_logs():
+def get_logs(plan_id=None):
+    plan_record = get_active_plan_record() if plan_id is None else {"id": plan_id}
+    if not plan_record:
+        return []
     return (
         client.table("rc_workout_logs")
         .select("*")
         .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_record["id"]))
         .order("session_date")
         .execute()
         .data
@@ -357,19 +431,69 @@ def get_logs():
     )
 
 
+def get_unassigned_logs():
+    """Legacy/orphans sin plan_id. No alimentan métricas del plan activo."""
+    try:
+        return (
+            client.table("rc_workout_logs")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .is_("plan_id", "null")
+            .order("session_date")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+
 def save_log(payload):
     payload = dict(payload)
+    active_plan = get_active_plan_record()
+    plan_id = payload.get("plan_id") or (active_plan or {}).get("id")
+    if not plan_id:
+        raise RuntimeError("No existe un plan activo para asociar este registro.")
+
     payload["user_id"] = USER_ID
+    payload["plan_id"] = int(plan_id)
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     client.table("rc_workout_logs").upsert(
-        payload, on_conflict="user_id,session_date"
+        payload, on_conflict="user_id,plan_id,session_date"
     ).execute()
 
 
-def delete_log(session_date):
-    client.table("rc_workout_logs").delete().eq(
-        "user_id", USER_ID
-    ).eq("session_date", str(session_date)).execute()
+def delete_log(session_date, plan_id=None):
+    active_plan = get_active_plan_record()
+    pid = plan_id or (active_plan or {}).get("id")
+    if not pid:
+        return
+    (
+        client.table("rc_workout_logs")
+        .delete()
+        .eq("user_id", USER_ID)
+        .eq("plan_id", int(pid))
+        .eq("session_date", str(session_date))
+        .execute()
+    )
+
+
+def delete_log_by_id(log_id):
+    if log_id is None:
+        return
+    client.table("rc_workout_logs").delete().eq("user_id", USER_ID).eq("id", int(log_id)).execute()
+
+
+def insert_plan_sessions(plan_id, rows):
+    if not rows:
+        return
+    prepared = []
+    for raw in rows:
+        row = dict(raw)
+        row["user_id"] = USER_ID
+        row["plan_id"] = int(plan_id)
+        prepared.append(row)
+    client.table("rc_plan_sessions").insert(prepared).execute()
 
 
 def get_assessments(limit=20):
@@ -1364,6 +1488,269 @@ def generate_plan(profile):
     return rows
 
 
+
+def goal_analysis_snapshot(goal_type, goal_style, race_date_value, target_time_sec, assessment=None):
+    """Evalúa un objetivo oficial usando el último snapshot del corredor."""
+    assessment = assessment or require_completed_assessment(show_message=False)
+    if not assessment:
+        return {
+            "base_status": "EVALUAR SEGURIDAD",
+            "calendar_status": "EVALUAR SEGURIDAD",
+            "base_reasons": ["No existe una Evaluación RCP completa."],
+            "calendar_reasons": [],
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    answers = dict(assessment.get("answers") or {})
+    answers["goal"] = goal_type
+    answers["goal_style"] = goal_style
+    answers["has_goal_race"] = bool(race_date_value)
+    answers["goal_race_date"] = str(race_date_value) if race_date_value else None
+    answers["goal_target_time"] = fmt_time(target_time_sec) if target_time_sec else None
+
+    safety = str(assessment.get("safety_status") or "")
+    base_status, base_reasons = base_goal_readiness(answers, safety)
+    calendar_status, calendar_reasons = calendar_goal_readiness(answers, safety)
+    return {
+        "assessment_id": assessment.get("id"),
+        "assessment_version": assessment.get("assessment_version"),
+        "safety_status": safety,
+        "base_status": base_status,
+        "calendar_status": calendar_status,
+        "base_reasons": base_reasons,
+        "calendar_reasons": calendar_reasons,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def create_goal_record(goal_type, goal_style, race_date_value=None, target_time_sec=None,
+                       status="FUTURE", notes=None, assessment=None):
+    assessment = assessment or require_completed_assessment(show_message=False)
+    snapshot = goal_analysis_snapshot(
+        goal_type, goal_style, race_date_value, target_time_sec, assessment
+    )
+    payload = {
+        "user_id": USER_ID,
+        "source_assessment_id": (assessment or {}).get("id"),
+        "goal_type": goal_type,
+        "goal_style": goal_style,
+        "race_date": str(race_date_value) if race_date_value else None,
+        "target_time_sec": int(target_time_sec) if target_time_sec else None,
+        "status": status,
+        "readiness_snapshot": snapshot,
+        "notes": notes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = client.table("rc_goals").insert(payload).execute().data or []
+    return result[0] if result else None
+
+
+def update_goal_record(goal_id, **changes):
+    values = dict(changes)
+    values["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_goals").update(values).eq("user_id", USER_ID).eq("id", int(goal_id)).execute()
+
+
+def update_plan_record(plan_id, **changes):
+    values = dict(changes)
+    values["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_plans").update(values).eq("user_id", USER_ID).eq("id", int(plan_id)).execute()
+
+
+def archive_active_goal_and_plan(except_goal_id=None):
+    """Archiva solo el estado; nunca borra sesiones ni logs."""
+    active_plan = get_active_plan_record()
+    if active_plan:
+        update_plan_record(active_plan["id"], status="ARCHIVED")
+
+    active_goal = get_active_goal()
+    if active_goal and int(active_goal["id"]) != int(except_goal_id or -1):
+        update_goal_record(active_goal["id"], status="ARCHIVED")
+
+
+def legacy_profile_for_goal(goal_row, profile, assessment):
+    """Adaptador temporal entre el objetivo oficial V6.3.2 y el generador V6."""
+    answers = dict((assessment or {}).get("answers") or {})
+    available_days = answers.get("available_days") or []
+    available_count = len(available_days)
+    current_days = int(answers.get("current_days") or 0)
+    candidate_days = available_count or current_days or int((profile or {}).get("days_per_week") or 3)
+    days = max(3, min(6, candidate_days))
+
+    weekly_km = float(answers.get("weekly_km") or (profile or {}).get("weekly_km") or 8.0)
+    weekly_km = max(8.0, weekly_km)
+
+    assessed_level = str((assessment or {}).get("runner_level") or "PRINCIPIANTE").upper()
+    level_map = {
+        "INICIACIÓN": "Principiante",
+        "PRINCIPIANTE": "Principiante",
+        "INTERMEDIO": "Intermedio",
+        "AVANZADO": "Avanzado",
+    }
+
+    goal_type = str(goal_row.get("goal_type") or "Condición física")
+    legacy_goal = goal_type if goal_type in GOAL_KM else "Condición física"
+    race_date_value = goal_row.get("race_date")
+    has_race = bool(race_date_value and legacy_goal != "Condición física")
+
+    recent_seconds = None
+    recent_distance_km = None
+    if answers.get("race_or_test_recent"):
+        recent_seconds = parse_hms(answers.get("recent_mark_time"))
+        recent_distance_km = performance_distance_km(
+            answers.get("recent_mark_distance"), answers.get("recent_mark_custom_km")
+        )
+
+    return {
+        "display_name": str((profile or {}).get("display_name") or USER_EMAIL.split("@")[0]),
+        "goal": legacy_goal,
+        "level": level_map.get(assessed_level, "Principiante"),
+        "days_per_week": days,
+        "weekly_km": weekly_km,
+        "has_race": has_race,
+        "race_date": str(race_date_value) if has_race else None,
+        "target_time_sec": goal_row.get("target_time_sec"),
+        "current_distance_km": recent_distance_km,
+        "current_time_sec": recent_seconds,
+    }
+
+
+def can_generate_legacy_plan(goal_row, assessment):
+    """V6.3.2 conserva el motor legacy, pero evita forzarlo donde no aplica."""
+    if not assessment_is_complete(assessment):
+        return False, "Falta una Evaluación RCP completa."
+
+    if str(assessment.get("safety_status") or "") != "SIN ALERTAS DECLARADAS":
+        return False, "El cribado de seguridad no permite iniciar una prescripción de intensidad automáticamente."
+
+    goal_type = str(goal_row.get("goal_type") or "")
+    if goal_type not in GOAL_KM:
+        return False, "Este objetivo será soportado por el Plan Engine V7; el generador V6 no tiene una plantilla válida para esta modalidad."
+
+    answers = assessment.get("answers") or {}
+    available_count = len(answers.get("available_days") or [])
+    if available_count < 3:
+        return False, "El generador V6 requiere al menos 3 días disponibles. V7 permitirá planes de iniciación con 2 días."
+
+    snapshot = goal_row.get("readiness_snapshot") or goal_analysis_snapshot(
+        goal_type,
+        goal_row.get("goal_style") or "Terminar",
+        goal_row.get("race_date"),
+        goal_row.get("target_time_sec"),
+        assessment,
+    )
+    if str(snapshot.get("base_status") or "") in ("BASE PREVIA", "INSUFICIENTE", "EVALUAR SEGURIDAD"):
+        return False, (
+            "La base actual requiere una fase previa. El motor legacy no debe convertir esa necesidad "
+            "en un plan específico; esta transición se resolverá con el Plan Engine V7."
+        )
+    if str(snapshot.get("calendar_status") or "") in ("INSUFICIENTE", "FECHA INVÁLIDA", "EVALUAR SEGURIDAD"):
+        return False, "El calendario disponible no permite generar de forma responsable este plan con el motor legacy."
+
+    return True, None
+
+
+def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTIVE"):
+    """Crea un ciclo y sus sesiones sin borrar ningún plan anterior."""
+    can_generate, reason = can_generate_legacy_plan(goal_row, assessment)
+    if not can_generate:
+        return None, reason
+
+    legacy_profile = legacy_profile_for_goal(goal_row, base_profile, assessment)
+    rows = generate_plan(legacy_profile)
+    if not rows:
+        return None, "El generador no produjo sesiones para este objetivo."
+
+    plan_payload = {
+        "user_id": USER_ID,
+        "goal_id": int(goal_row["id"]),
+        "status": status,
+        "engine_version": "LEGACY-V6.3.2",
+        "start_date": rows[0]["session_date"],
+        "end_date": rows[-1]["session_date"],
+        "initial_weekly_km": float(legacy_profile["weekly_km"]),
+        "days_per_week": int(legacy_profile["days_per_week"]),
+        "metadata": {
+            "source": "official_goal",
+            "assessment_id": assessment.get("id"),
+            "assessment_version": assessment.get("assessment_version"),
+            "note": "Plan generado por motor legacy; se preservará al migrar al Plan Engine V7.",
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = client.table("rc_plans").insert(plan_payload).execute().data or []
+    if not result:
+        return None, "No fue posible crear el registro del plan."
+
+    plan_row = result[0]
+    insert_plan_sessions(plan_row["id"], rows)
+
+    # Mantener rc_profiles solo como capa de compatibilidad del motor legacy.
+    update_profile_fields({
+        "goal": legacy_profile["goal"],
+        "level": legacy_profile["level"],
+        "days_per_week": legacy_profile["days_per_week"],
+        "weekly_km": legacy_profile["weekly_km"],
+        "has_race": legacy_profile["has_race"],
+        "race_date": legacy_profile["race_date"],
+        "target_time_sec": legacy_profile["target_time_sec"],
+        "current_distance_km": legacy_profile["current_distance_km"],
+        "current_time_sec": legacy_profile["current_time_sec"],
+    })
+    return plan_row, None
+
+
+def activate_existing_goal(goal_row, profile, assessment):
+    """
+    Activa un FUTURE conservando el objetivo/plan anterior como historial.
+
+    Si ya existe un plan ACTIVE, V6.3.2 NO lo archiva hasta comprobar que el
+    nuevo objetivo puede recibir un plan con el motor disponible. Así evitamos
+    dejar al usuario sin entrenamiento por activar una modalidad todavía no
+    soportada por el motor legacy.
+    """
+    snapshot = goal_analysis_snapshot(
+        goal_row.get("goal_type"),
+        goal_row.get("goal_style") or "Terminar",
+        goal_row.get("race_date"),
+        goal_row.get("target_time_sec"),
+        assessment,
+    )
+    candidate = dict(goal_row)
+    candidate["readiness_snapshot"] = snapshot
+
+    can_generate, generation_reason = can_generate_legacy_plan(candidate, assessment)
+    current_active_plan = get_active_plan_record()
+
+    if current_active_plan and not can_generate:
+        update_goal_record(goal_row["id"], readiness_snapshot=snapshot)
+        return None, generation_reason, False
+
+    archive_active_goal_and_plan(except_goal_id=goal_row["id"])
+    update_goal_record(
+        goal_row["id"],
+        status="ACTIVE",
+        readiness_snapshot=snapshot,
+        source_assessment_id=assessment.get("id"),
+    )
+    candidate["status"] = "ACTIVE"
+
+    plan_row = None
+    if can_generate:
+        plan_row, generation_reason = create_plan_record_for_goal(candidate, profile, assessment, status="ACTIVE")
+
+    return plan_row, generation_reason, True
+
+
+def complete_active_goal():
+    active_plan = get_active_plan_record()
+    active_goal = get_active_goal()
+    if active_plan:
+        update_plan_record(active_plan["id"], status="COMPLETED")
+    if active_goal:
+        update_goal_record(active_goal["id"], status="COMPLETED")
+
+
 def _option_index(options, value, fallback=0):
     try:
         return options.index(value)
@@ -1774,10 +2161,11 @@ def assessment_form(existing_assessment=None, onboarding=False):
             index=_option_index(TIME_AVAILABLE_OPTIONS, existing_answers.get("weekend_time"), 4),
         )
 
-        st.markdown("### 6 · Objetivo")
+        st.markdown("### 6 · Objetivo a evaluar")
+        st.caption("Este objetivo se usa para estimar preparación durante la evaluación. En V6.3.2 el objetivo deportivo oficial se gestiona aparte en 🎯 Objetivo y no se cambia al reevaluarte.")
         g1, g2 = st.columns(2)
         goal = g1.selectbox(
-            "¿Qué quieres conseguir?",
+            "¿Qué objetivo quieres evaluar?",
             RCP_GOALS,
             index=_option_index(RCP_GOALS, existing_answers.get("goal"), 4),
         )
@@ -2103,17 +2491,362 @@ def profile_form(existing=None, assessed_level=None):
     if require_completed_assessment() is None:
         return False
 
-    save_profile(profile)
-    try:
-        generated = generate_plan(profile)
-    except PermissionError as exc:
-        st.error(str(exc))
-        return False
-    replace_plan(generated)
+    st.error(
+        "V6.3.2 ya no permite regenerar un plan desde Perfil porque eso podía destruir el historial. "
+        "Usa la sección 🎯 Objetivo para crear, cambiar o activar objetivos."
+    )
+    return False
 
-    st.success(f"Plan creado: {len(generated)} sesiones.")
+
+def basic_profile_form(assessment):
+    """Crea solo la identidad/compatibilidad legacy. NO crea ni reemplaza planes."""
+    answers = dict((assessment or {}).get("answers") or {})
+    st.subheader("👤 Completa tu perfil básico")
+    st.caption(
+        "Tu Evaluación RCP ya está guardada. Solo falta el nombre con el que quieres aparecer en la app."
+    )
+    with st.form("basic_profile_form"):
+        name = st.text_input("Nombre", value=USER_EMAIL.split("@")[0])
+        submit = st.form_submit_button("Continuar", use_container_width=True)
+
+    if not submit:
+        return False
+    if not name.strip():
+        st.error("Escribe tu nombre.")
+        return False
+
+    assessed_level = str((assessment or {}).get("runner_level") or "PRINCIPIANTE").upper()
+    level_map = {
+        "INICIACIÓN": "Principiante",
+        "PRINCIPIANTE": "Principiante",
+        "INTERMEDIO": "Intermedio",
+        "AVANZADO": "Avanzado",
+    }
+    available_count = len(answers.get("available_days") or [])
+    current_days = int(answers.get("current_days") or 0)
+    days_legacy = max(3, min(6, available_count or current_days or 3))
+    weekly_legacy = max(8.0, float(answers.get("weekly_km") or 0.0))
+    assessment_goal = str(answers.get("goal") or "Condición física")
+    legacy_goal = assessment_goal if assessment_goal in GOAL_KM else "Condición física"
+    race_date_value = answers.get("goal_race_date") if answers.get("has_goal_race") else None
+    target_seconds = parse_hms(answers.get("goal_target_time"))
+
+    save_profile({
+        "display_name": name.strip(),
+        "goal": legacy_goal,
+        "level": level_map.get(assessed_level, "Principiante"),
+        "days_per_week": days_legacy,
+        "weekly_km": weekly_legacy,
+        "has_race": bool(race_date_value and legacy_goal != "Condición física"),
+        "race_date": race_date_value if legacy_goal != "Condición física" else None,
+        "target_time_sec": target_seconds,
+        "current_distance_km": None,
+        "current_time_sec": None,
+    })
+    st.success("Perfil básico guardado.")
     st.rerun()
     return True
+
+
+def _goal_label(goal):
+    race = f" · {goal.get('race_date')}" if goal.get("race_date") else ""
+    target = f" · {fmt_time(goal.get('target_time_sec'))}" if goal.get("target_time_sec") else ""
+    return f"{goal.get('goal_type')} · {goal.get('status')}{race}{target}"
+
+
+def _validate_goal_time(goal_style, target_text):
+    target_seconds = parse_hms(target_text) if str(target_text or "").strip() else None
+    if str(target_text or "").strip() and target_seconds is None:
+        return None, "La marca objetivo no tiene un formato válido. Usa MM:SS o HH:MM:SS."
+    if goal_style == "Buscar una marca concreta" and not target_seconds:
+        return None, "Para buscar una marca concreta debes indicar el tiempo objetivo."
+    return target_seconds, None
+
+
+def official_goal_setup(profile, assessment):
+    """Paso obligatorio posterior a evaluación cuando todavía no existe objetivo ACTIVE."""
+    st.title("🎯 Define tu objetivo")
+    st.info(
+        "Tu evaluación ya está completa. Ahora RunningCoachPro necesita un objetivo oficial antes de mostrar el plan."
+    )
+
+    future_goals = [g for g in get_goals() if str(g.get("status")) == "FUTURE"]
+    if future_goals:
+        st.markdown("### Objetivos futuros guardados")
+        options = {int(g["id"]): _goal_label(g) for g in future_goals}
+        selected_id = st.selectbox(
+            "Puedes activar uno de ellos",
+            list(options.keys()),
+            format_func=lambda x: options[x],
+            key="setup_future_goal_select",
+        )
+        if st.button("▶️ Activar objetivo seleccionado", use_container_width=True, key="setup_activate_future"):
+            goal_row = next(g for g in future_goals if int(g["id"]) == int(selected_id))
+            plan_row, reason, activated = activate_existing_goal(goal_row, profile, assessment)
+            if plan_row:
+                st.success("Objetivo activado y nuevo plan creado sin borrar el historial anterior.")
+            elif activated:
+                st.warning(f"Objetivo activado. Aún no se creó un plan: {reason}")
+            else:
+                st.warning(f"No se activó el objetivo; el plan actual permanece intacto. Motivo: {reason}")
+            st.rerun()
+        st.divider()
+
+    with st.form("official_goal_setup_form"):
+        g1, g2 = st.columns(2)
+        goal_type = g1.selectbox(
+            "Objetivo principal",
+            RCP_GOALS,
+            index=_option_index(RCP_GOALS, (assessment.get("answers") or {}).get("goal"), 4),
+        )
+        styles = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
+        goal_style = g2.selectbox("Finalidad", styles)
+        has_date = st.checkbox("Tengo una fecha objetivo", value=bool((assessment.get("answers") or {}).get("has_goal_race")))
+        default_date = date.today() + timedelta(weeks=12)
+        old_date = (assessment.get("answers") or {}).get("goal_race_date")
+        if old_date:
+            try:
+                default_date = max(date.today() + timedelta(days=1), date.fromisoformat(str(old_date)))
+            except Exception:
+                pass
+        race_date_value = st.date_input(
+            "Fecha objetivo",
+            value=default_date,
+            min_value=date.today() + timedelta(days=1),
+            max_value=date.today() + timedelta(days=730),
+        )
+        target_text = st.text_input(
+            "Marca objetivo (opcional)",
+            value=str((assessment.get("answers") or {}).get("goal_target_time") or ""),
+            placeholder="Ej. 45:00 o 1:47:12",
+        )
+        submit = st.form_submit_button("Guardar objetivo y continuar", use_container_width=True)
+
+    if not submit:
+        return False
+
+    target_seconds, error = _validate_goal_time(goal_style, target_text)
+    if error:
+        st.error(error)
+        return False
+
+    goal_row = create_goal_record(
+        goal_type=goal_type,
+        goal_style=goal_style,
+        race_date_value=race_date_value.isoformat() if has_date else None,
+        target_time_sec=target_seconds,
+        status="ACTIVE",
+        notes="Objetivo oficial creado durante onboarding V6.3.2",
+        assessment=assessment,
+    )
+    if not goal_row:
+        st.error("No fue posible guardar el objetivo.")
+        return False
+
+    plan_row, reason = create_plan_record_for_goal(goal_row, profile, assessment, status="ACTIVE")
+    if plan_row:
+        st.success("Objetivo guardado y plan creado. Tu historial queda preparado para futuras planificaciones.")
+    else:
+        st.warning(f"Objetivo guardado. No se creó un plan automático todavía: {reason}")
+    st.rerun()
+    return True
+
+
+def goal_management_ui(active_goal, active_plan, profile, assessment):
+    st.subheader("🎯 Objetivo actual")
+    if not active_goal:
+        st.warning("No existe un objetivo activo.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Objetivo", active_goal.get("goal_type") or "—")
+    c2.metric("Finalidad", active_goal.get("goal_style") or "—")
+    c3.metric("Fecha", active_goal.get("race_date") or "Sin fecha")
+    c4.metric("Meta", fmt_time(active_goal.get("target_time_sec")) if active_goal.get("target_time_sec") else "Sin marca")
+
+    snapshot = active_goal.get("readiness_snapshot") or {}
+    if snapshot:
+        r1, r2 = st.columns(2)
+        r1.info(f"Base para el objetivo: {_readiness_compact(snapshot.get('base_status'))}")
+        r2.info(f"Calendario: {_readiness_compact(snapshot.get('calendar_status'))}")
+
+    if active_plan:
+        st.success(
+            f"Plan activo #{active_plan['id']} · {active_plan.get('engine_version')} · "
+            f"{active_plan.get('start_date') or '—'} → {active_plan.get('end_date') or '—'}"
+        )
+    else:
+        st.warning(
+            "Este objetivo está activo pero todavía no tiene plan. Puede ocurrir si la base/seguridad no permite "
+            "prescripción automática o si el objetivo requiere el futuro Plan Engine V7."
+        )
+
+    with st.expander("✏️ Cambiar fecha o marca del objetivo actual"):
+        styles = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
+        with st.form("edit_active_goal_form"):
+            style = st.selectbox(
+                "Finalidad",
+                styles,
+                index=_option_index(styles, active_goal.get("goal_style"), 0),
+            )
+            has_date = st.checkbox("Tiene fecha", value=bool(active_goal.get("race_date")))
+            default_date = date.today() + timedelta(weeks=12)
+            if active_goal.get("race_date"):
+                try:
+                    default_date = max(date.today() + timedelta(days=1), date.fromisoformat(str(active_goal["race_date"])))
+                except Exception:
+                    pass
+            race_date_value = st.date_input(
+                "Fecha",
+                value=default_date,
+                min_value=date.today() + timedelta(days=1),
+                max_value=date.today() + timedelta(days=730),
+            )
+            target_text = st.text_input(
+                "Marca objetivo",
+                value=fmt_time(active_goal.get("target_time_sec")) if active_goal.get("target_time_sec") else "",
+            )
+            save_changes = st.form_submit_button("Guardar cambios", use_container_width=True)
+
+        if save_changes:
+            target_seconds, error = _validate_goal_time(style, target_text)
+            if error:
+                st.error(error)
+            else:
+                race_iso = race_date_value.isoformat() if has_date else None
+                new_snapshot = goal_analysis_snapshot(
+                    active_goal.get("goal_type"), style, race_iso, target_seconds, assessment
+                )
+                update_goal_record(
+                    active_goal["id"],
+                    goal_style=style,
+                    race_date=race_iso,
+                    target_time_sec=target_seconds,
+                    readiness_snapshot=new_snapshot,
+                    source_assessment_id=assessment.get("id"),
+                )
+                legacy_goal = active_goal.get("goal_type") if active_goal.get("goal_type") in GOAL_KM else "Condición física"
+                update_profile_fields({
+                    "goal": legacy_goal,
+                    "has_race": bool(race_iso and legacy_goal != "Condición física"),
+                    "race_date": race_iso if legacy_goal != "Condición física" else None,
+                    "target_time_sec": target_seconds,
+                })
+                st.success("Objetivo actualizado. El plan actual NO fue borrado ni recalibrado.")
+                st.info("La recalibración automática de sesiones futuras se conectará al Plan Engine V7.")
+                st.rerun()
+
+    with st.expander("➕ Crear otro objetivo"):
+        with st.form("create_additional_goal_form"):
+            n1, n2 = st.columns(2)
+            new_type = n1.selectbox("Nuevo objetivo", RCP_GOALS, key="new_goal_type")
+            styles = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
+            new_style = n2.selectbox("Finalidad", styles, key="new_goal_style")
+            new_has_date = st.checkbox("Tiene fecha", value=True, key="new_goal_has_date")
+            new_date = st.date_input(
+                "Fecha",
+                value=date.today() + timedelta(weeks=16),
+                min_value=date.today() + timedelta(days=1),
+                max_value=date.today() + timedelta(days=1095),
+                key="new_goal_date",
+            )
+            new_target = st.text_input("Marca objetivo (opcional)", key="new_goal_target")
+            mode = st.radio(
+                "Qué hacer",
+                ["Guardar como FUTURO", "Activar ahora"],
+                horizontal=True,
+            )
+            create_submit = st.form_submit_button("Guardar nuevo objetivo", use_container_width=True)
+
+        if create_submit:
+            target_seconds, error = _validate_goal_time(new_style, new_target)
+            if error:
+                st.error(error)
+            else:
+                race_iso = new_date.isoformat() if new_has_date else None
+                new_goal = create_goal_record(
+                    new_type, new_style, race_iso, target_seconds,
+                    status="FUTURE",
+                    notes="Creado desde Gestión de Objetivos V6.3.2",
+                    assessment=assessment,
+                )
+                if not new_goal:
+                    st.error("No fue posible crear el objetivo.")
+                elif mode == "Guardar como FUTURO":
+                    st.success("Objetivo futuro guardado. El plan actual permanece intacto.")
+                    st.rerun()
+                else:
+                    plan_row, reason, activated = activate_existing_goal(new_goal, profile, assessment)
+                    if plan_row:
+                        st.success("Nuevo objetivo activado y nuevo plan creado. El plan anterior quedó archivado, no borrado.")
+                    elif activated:
+                        st.warning(f"Objetivo activado sin plan automático: {reason}")
+                    else:
+                        st.warning(f"El nuevo objetivo quedó FUTURO y el plan actual sigue activo. Motivo: {reason}")
+                    st.rerun()
+
+    goals = get_goals()
+    future_goals = [g for g in goals if str(g.get("status")) == "FUTURE"]
+    if future_goals:
+        st.markdown("### Próximos objetivos")
+        options = {int(g["id"]): _goal_label(g) for g in future_goals}
+        selected = st.selectbox(
+            "Objetivo futuro",
+            list(options.keys()),
+            format_func=lambda x: options[x],
+            key="future_goal_activate_select",
+        )
+        if st.button("▶️ Convertir en objetivo activo", use_container_width=True, key="activate_future_goal_button"):
+            goal_row = next(g for g in future_goals if int(g["id"]) == int(selected))
+            plan_row, reason, activated = activate_existing_goal(goal_row, profile, assessment)
+            if plan_row:
+                st.success("Objetivo activado. El plan anterior quedó archivado y el nuevo plan fue creado.")
+            elif activated:
+                st.warning(f"Objetivo activado sin plan automático: {reason}")
+            else:
+                st.warning(f"No se activó; el plan actual permanece intacto. Motivo: {reason}")
+            st.rerun()
+
+    with st.expander("🏁 Finalizar objetivo actual"):
+        st.caption(
+            "Marca el objetivo y su plan como COMPLETADOS. Los entrenamientos y registros permanecen en el historial."
+        )
+        if st.button("Marcar como COMPLETADO", use_container_width=True, key="complete_active_goal"):
+            complete_active_goal()
+            st.success("Objetivo completado. Ahora puedes activar o crear el siguiente.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### Historial de objetivos")
+    goal_rows = []
+    for g in get_goals():
+        goal_rows.append({
+            "ID": g.get("id"),
+            "Objetivo": g.get("goal_type"),
+            "Finalidad": g.get("goal_style"),
+            "Fecha": g.get("race_date") or "—",
+            "Meta": fmt_time(g.get("target_time_sec")) if g.get("target_time_sec") else "—",
+            "Estado": g.get("status"),
+        })
+    if goal_rows:
+        st.dataframe(goal_rows, use_container_width=True, hide_index=True)
+
+    st.markdown("### Historial de planes")
+    plan_rows = []
+    goals_by_id = {int(g["id"]): g for g in get_goals()}
+    for p in get_plans():
+        g = goals_by_id.get(int(p.get("goal_id") or 0), {})
+        plan_rows.append({
+            "Plan": p.get("id"),
+            "Objetivo": g.get("goal_type") or "—",
+            "Inicio": p.get("start_date") or "—",
+            "Fin": p.get("end_date") or "—",
+            "Motor": p.get("engine_version"),
+            "Estado": p.get("status"),
+        })
+    if plan_rows:
+        st.dataframe(plan_rows, use_container_width=True, hide_index=True)
+
 
 
 profile = get_profile()
@@ -2155,27 +2888,54 @@ if not ASSESSMENT_COMPLETE:
 if not profile:
     st.title("🏃 RunningCoachPro")
     st.success("Evaluación inicial completada ✅")
-    show_assessment_result(LATEST_ASSESSMENT)
-    st.divider()
-    st.markdown("### Crear el plan actual")
-    st.caption(
-        "V6.3.1 mantiene temporalmente el generador V6, pero ya no permite crear un plan sin evaluación previa."
-    )
-    profile_form(assessed_level=LATEST_ASSESSMENT.get("runner_level"))
+    basic_profile_form(LATEST_ASSESSMENT)
     st.stop()
 
-PLAN = get_plan()
-LOGS = get_logs()
+# V6.3.2 requiere la capa de objetivos/planes históricos.
+PLANNING_READY = planning_storage_ready()
+if not PLANNING_READY:
+    st.title("🏃 RunningCoachPro")
+    st.error("Falta instalar la migración V6.3.2 de Objetivos y Planes.")
+    st.write(
+        "Ejecuta **supabase_v6_3_2_goals_plans.sql** en Supabase → SQL Editor y vuelve a cargar la app."
+    )
+    st.caption("La migración conserva tu plan, sesiones y registros actuales.")
+    st.stop()
+
+ACTIVE_GOAL = get_active_goal()
+if not ACTIVE_GOAL:
+    official_goal_setup(profile, LATEST_ASSESSMENT)
+    st.stop()
+
+# Los objetivos migrados desde V6.3.1 no tenían snapshot de readiness.
+# Se calcula una vez, sin tocar el plan existente.
+if not (ACTIVE_GOAL.get("readiness_snapshot") or {}):
+    _migrated_snapshot = goal_analysis_snapshot(
+        ACTIVE_GOAL.get("goal_type"),
+        ACTIVE_GOAL.get("goal_style") or "Terminar",
+        ACTIVE_GOAL.get("race_date"),
+        ACTIVE_GOAL.get("target_time_sec"),
+        LATEST_ASSESSMENT,
+    )
+    update_goal_record(
+        ACTIVE_GOAL["id"],
+        readiness_snapshot=_migrated_snapshot,
+        source_assessment_id=LATEST_ASSESSMENT.get("id"),
+    )
+    ACTIVE_GOAL["readiness_snapshot"] = _migrated_snapshot
+    ACTIVE_GOAL["source_assessment_id"] = LATEST_ASSESSMENT.get("id")
+
+ACTIVE_PLAN = get_active_plan_record()
+PLAN = get_plan(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
+LOGS = get_logs(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 PLAN_BY_DATE = {str(x["session_date"]): x for x in PLAN}
 
-# Solo los registros asociados por fecha al plan vigente alimentan métricas y gráficos.
-# Esto evita que registros de prueba o restos de una planificación anterior contaminen
-# KM reales, RPE y PLAN vs REAL.
+# Solo los registros asociados al plan ACTIVE alimentan KPI y gráficos.
 CURRENT_LOGS = [
     x for x in LOGS
     if str(x.get("session_date")) in PLAN_BY_DATE
 ]
-ORPHAN_LOGS = [
+ORPHAN_LOGS = get_unassigned_logs() + [
     x for x in LOGS
     if str(x.get("session_date")) not in PLAN_BY_DATE
 ]
@@ -2188,7 +2948,7 @@ st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} Multiusuario · Web + móvil")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
-st.sidebar.markdown(f"🎯 **Objetivo:** {profile['goal']}")
+st.sidebar.markdown(f"🎯 **Objetivo:** {ACTIVE_GOAL.get('goal_type') or '—'}")
 st.sidebar.markdown(f"📅 **Días/sem:** {profile['days_per_week']}")
 st.sidebar.markdown(f"📏 **Base:** {float(profile['weekly_km']):g} km/sem")
 if LATEST_ASSESSMENT:
@@ -2263,6 +3023,7 @@ tabs = st.tabs([
     "📊 Progreso",
     "🗓️ Plan",
     "✅ Registro",
+    "🎯 Objetivo",
     "🧭 Evaluación",
     "⚙️ Perfil",
 ])
@@ -2539,9 +3300,15 @@ with tabs[4]:
                 st.rerun()
 
 # ============================================================
-# EVALUACIÓN RCP
+# OBJETIVO / PLANES HISTÓRICOS
 # ============================================================
 with tabs[5]:
+    goal_management_ui(ACTIVE_GOAL, ACTIVE_PLAN, profile, LATEST_ASSESSMENT)
+
+# ============================================================
+# EVALUACIÓN RCP
+# ============================================================
+with tabs[6]:
     st.subheader("Evaluación del corredor")
     if not ASSESSMENT_READY:
         st.error(
@@ -2551,8 +3318,8 @@ with tabs[5]:
     elif LATEST_ASSESSMENT:
         show_assessment_result(LATEST_ASSESSMENT)
         st.caption(
-            "Tu plan actual NO se modifica al reevaluarte. El resultado queda guardado como historial "
-            "y se utilizará por el motor adaptativo en una versión posterior."
+            "Reevaluarte NO modifica tu objetivo oficial ni tu plan activo. El resultado queda guardado como historial "
+            "y servirá como snapshot actualizado del corredor."
         )
         with st.expander("🔄 Hacer una nueva evaluación"):
             assessment_form(existing_assessment=LATEST_ASSESSMENT)
@@ -2593,16 +3360,35 @@ with tabs[5]:
 # ============================================================
 # PERFIL
 # ============================================================
-with tabs[6]:
+with tabs[7]:
     st.subheader("Mi perfil")
-    st.warning(
-        "Si actualizas y regeneras el plan, los registros actuales se eliminarán "
-        "para evitar mezclar dos planificaciones distintas."
+    st.caption(
+        "El objetivo deportivo se gestiona ahora en 🎯 Objetivo. Cambiar nombre o consultar tu perfil ya no regenera ni borra el plan."
     )
-    profile_form(
-        profile,
-        assessed_level=LATEST_ASSESSMENT.get("runner_level") if LATEST_ASSESSMENT else None,
-    )
+
+    with st.form("profile_identity_form"):
+        display_name = st.text_input("Nombre", value=str(profile.get("display_name") or ""))
+        save_name = st.form_submit_button("Guardar nombre", use_container_width=True)
+    if save_name:
+        if not display_name.strip():
+            st.error("Escribe tu nombre.")
+        else:
+            update_profile_fields({"display_name": display_name.strip()})
+            st.success("Nombre actualizado.")
+            st.rerun()
+
+    if LATEST_ASSESSMENT:
+        st.markdown("### Perfil RCP vigente")
+        st.write(
+            f"**Nivel:** {str(LATEST_ASSESSMENT.get('runner_level') or '—').title()} · "
+            f"**Score:** {int(LATEST_ASSESSMENT.get('runner_score') or 0)}/100"
+        )
+        a = LATEST_ASSESSMENT.get("answers") or {}
+        st.caption(
+            f"Base declarada: {float(a.get('weekly_km') or 0):g} km/sem · "
+            f"{int(a.get('current_days') or 0)} días/sem · "
+            f"larga {float(a.get('long_run_km') or 0):g} km"
+        )
 
     st.divider()
     st.markdown("### Mantenimiento de registros")
@@ -2627,7 +3413,8 @@ with tabs[6]:
             use_container_width=True,
         ):
             for old_log in ORPHAN_LOGS:
-                delete_log(old_log["session_date"])
+                if old_log.get("id") is not None:
+                    delete_log_by_id(old_log.get("id"))
             st.success("Registros fuera del plan eliminados.")
             st.rerun()
     else:
