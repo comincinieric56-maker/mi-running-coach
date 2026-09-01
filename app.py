@@ -7,9 +7,6 @@ import re
 import html
 import itertools
 import io
-import json
-import urllib.request
-import urllib.error
 from supabase import create_client
 
 st.set_page_config(
@@ -20,7 +17,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V9.0 · Coach IA RCP · Core V8.1 + conversación inteligente supervisada
+# V8.1 · Motor Estadístico Adaptativo · Core V8 + modelos multivariables
 # ============================================================
 st.markdown(
     """
@@ -367,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "9.0.0"
+APP_VERSION = "8.1.0"
 
 
 # ============================================================
@@ -3090,338 +3087,6 @@ def v81_statistical_summary():
         "recovery_pairs":sum(1 for r in rows if r.get("recovery_y") is not None),
         "confidence":_v81_model_confidence(int(hist.get("context_n") or 0),len(rows)),
     }
-
-
-# ============================================================
-# V9.0 · COACH IA RCP
-# IA conversacional supervisada por el motor determinista/estadístico.
-# ============================================================
-def coach_ai_storage_ready():
-    """Comprueba tablas V9.0. No verifica la Edge Function ni la clave externa."""
-    try:
-        client.table("rc_ai_threads").select("id").eq("user_id", USER_ID).limit(1).execute()
-        client.table("rc_ai_messages").select("id").eq("user_id", USER_ID).limit(1).execute()
-        client.table("rc_ai_actions").select("id").eq("user_id", USER_ID).limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-
-def _coach_json_safe(value):
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {str(k): _coach_json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_coach_json_safe(v) for v in value]
-    return str(value)
-
-
-def get_coach_threads(limit=12):
-    if not coach_ai_storage_ready():
-        return []
-    return (
-        client.table("rc_ai_threads")
-        .select("*")
-        .eq("user_id", USER_ID)
-        .eq("status", "ACTIVE")
-        .order("updated_at", desc=True)
-        .limit(limit)
-        .execute().data or []
-    )
-
-
-def create_coach_thread(title="Conversación con Entrenador RCP"):
-    row={
-        "user_id": USER_ID,
-        "title": str(title or "Conversación con Entrenador RCP")[:100],
-        "status": "ACTIVE",
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    data=client.table("rc_ai_threads").insert(row).execute().data or []
-    return data[0] if data else None
-
-
-def get_coach_messages(thread_id, limit=40):
-    if not thread_id or not coach_ai_storage_ready():
-        return []
-    rows=(
-        client.table("rc_ai_messages")
-        .select("*")
-        .eq("user_id", USER_ID)
-        .eq("thread_id", int(thread_id))
-        .order("created_at", desc=False)
-        .limit(limit)
-        .execute().data or []
-    )
-    return rows
-
-
-def save_coach_message(thread_id, role, content, model=None, context_snapshot=None, structured=None):
-    row={
-        "user_id": USER_ID,
-        "thread_id": int(thread_id),
-        "role": str(role).upper(),
-        "content": str(content or ""),
-        "model": model,
-        "context_snapshot": _coach_json_safe(context_snapshot or {}),
-        "structured": _coach_json_safe(structured or {}),
-    }
-    data=client.table("rc_ai_messages").insert(row).execute().data or []
-    try:
-        client.table("rc_ai_threads").update({"updated_at":datetime.now(timezone.utc).isoformat()}).eq("id",int(thread_id)).eq("user_id",USER_ID).execute()
-    except Exception:
-        pass
-    return data[0] if data else None
-
-
-def create_coach_action(thread_id, assistant_message_id, proposal, engine_validation):
-    action_type=str((proposal or {}).get("type") or "NONE")
-    if action_type in {"NONE","KEEP_PLAN"}:
-        return None
-    row={
-        "user_id":USER_ID,
-        "thread_id":int(thread_id),
-        "assistant_message_id":int(assistant_message_id) if assistant_message_id else None,
-        "action_type":action_type,
-        "proposal":_coach_json_safe(proposal or {}),
-        "engine_validation":_coach_json_safe(engine_validation or {}),
-        "status":"PENDING",
-    }
-    data=client.table("rc_ai_actions").insert(row).execute().data or []
-    return data[0] if data else None
-
-
-def get_coach_action_for_message(message_id):
-    if not message_id or not coach_ai_storage_ready():
-        return None
-    data=(client.table("rc_ai_actions").select("*")
-          .eq("user_id",USER_ID).eq("assistant_message_id",int(message_id))
-          .order("created_at",desc=True).limit(1).execute().data or [])
-    return data[0] if data else None
-
-
-def update_coach_action(action_id, status, engine_validation=None):
-    fields={"status":status,"resolved_at":datetime.now(timezone.utc).isoformat()}
-    if engine_validation is not None:
-        fields["engine_validation"]=_coach_json_safe(engine_validation)
-    client.table("rc_ai_actions").update(fields).eq("id",int(action_id)).eq("user_id",USER_ID).execute()
-
-
-def coach_ai_context_snapshot():
-    """Snapshot compacto. Evita correo, dirección y otros identificadores directos."""
-    today=rcp_today()
-    session=PLAN_BY_DATE.get(today.isoformat()) or {}
-    readiness=READINESS_BY_DATE.get(today.isoformat()) or {}
-    stat=None
-    if V81_READY and session and readiness:
-        try:
-            stat=v81_statistical_prediction(session, readiness)
-        except Exception:
-            stat=None
-    try:
-        adaptive=adaptation_snapshot(today) if ADAPTIVE_READY else None
-    except Exception:
-        adaptive=None
-    try:
-        state=v8_runner_state()
-    except Exception:
-        state={}
-    try:
-        weekly=week_snapshot(today)
-    except Exception:
-        weekly={}
-    try:
-        test_rec=v8_test_recommendation()
-    except Exception:
-        test_rec={}
-    try:
-        zones=v8_zone_rows(LATEST_ASSESSMENT, ACTIVE_GOAL)
-    except Exception:
-        zones=[]
-    try:
-        physiology=physiological_profile_snapshot(profile)
-    except Exception:
-        physiology={}
-    answers=(LATEST_ASSESSMENT or {}).get("answers") or {}
-    recent=[]
-    start=today-timedelta(days=13)
-    for log in CURRENT_LOGS:
-        d=parse_date_safe(log.get("session_date"))
-        if not d or not (start <= d <= today):
-            continue
-        recent.append({
-            "date":d.isoformat(),"status":ui_status_label(log.get("status")),
-            "km":float(log.get("actual_km") or 0),
-            "duration_min":round(float(log.get("actual_duration_sec") or 0)/60,1),
-            "rpe":log.get("rpe"),"post_pain":log.get("post_pain"),"post_fatigue":log.get("post_fatigue"),
-            "prescription_adherence":log.get("prescription_adherence"),
-        })
-    upcoming=[]
-    for p in PLAN:
-        d=parse_date_safe(p.get("session_date"))
-        if d and today <= d <= today+timedelta(days=7):
-            upcoming.append({
-                "date":d.isoformat(),"name":session_display_name(p),"type":workout_kind(p),
-                "km":float(p.get("planned_km") or 0),"target":p.get("target"),"intensity":p.get("intensity"),
-                "adaptation_status":ui_status_label(p.get("adaptation_status") or "BASELINE"),
-            })
-    hard_reasons=[]
-    pain=float(readiness.get("pain") or 0)
-    if bool(readiness.get("illness")): hard_reasons.append("síntomas agudos de enfermedad informados")
-    if bool(readiness.get("pain_changes_gait")): hard_reasons.append("dolor que modifica marcha/zancada")
-    if pain >= 7: hard_reasons.append("dolor localizado >=7/10")
-    if stat and str(stat.get("decision") or "").upper()=="PROTEGER": hard_reasons.append("motor estadístico V8.1 indica PROTEGER")
-    perf={}
-    try:
-        perf=performance_summary(answers) or {}
-    except Exception:
-        perf={}
-    return _coach_json_safe({
-        "schema_version":"RCP_COACH_CONTEXT_1",
-        "date":today.isoformat(),
-        "runner":{
-            "age_years":physiology.get("age_years"),
-            "level":(LATEST_ASSESSMENT or {}).get("runner_level"),
-            "score":(LATEST_ASSESSMENT or {}).get("runner_score"),
-            "weekly_km_baseline":answers.get("weekly_km"),
-            "long_run_baseline_km":answers.get("long_run_km"),
-            "days_per_week":answers.get("days_per_week"),
-            "training_surface":training_surface_label(profile),
-            "focus":development_focus_label(((ACTIVE_PLAN or {}).get("metadata") or {}).get("development_focus") or resolve_development_focus(ACTIVE_GOAL, LATEST_ASSESSMENT).get("resolved")),
-        },
-        "goal":{
-            "type":(ACTIVE_GOAL or {}).get("goal_type"),
-            "race_date":(ACTIVE_GOAL or {}).get("race_date"),
-            "target_time":fmt_time((ACTIVE_GOAL or {}).get("target_time_sec")) if (ACTIVE_GOAL or {}).get("target_time_sec") else None,
-            "recent_performance":perf,
-        },
-        "today":{
-            "session":upcoming[0] if upcoming and upcoming[0].get("date")==today.isoformat() else ({
-                "date":session.get("session_date"),"name":session_display_name(session) if session else None,
-                "type":workout_kind(session) if session else None,"km":session.get("planned_km"),
-                "target":session.get("target"),"intensity":session.get("intensity")
-            } if session else None),
-            "readiness":readiness,
-            "statistical_prediction":stat,
-        },
-        "engine":{
-            "hard_block":bool(hard_reasons),"hard_block_reasons":hard_reasons,
-            "adaptive_decision":(adaptive or {}).get("decision"),
-            "adaptive_severity":(adaptive or {}).get("severity"),
-            "adaptive_reasons":(adaptive or {}).get("reasons") or [],
-            "statistical_decision":(stat or {}).get("decision"),
-            "statistical_confidence":(stat or {}).get("confidence"),
-        },
-        "week":{
-            "planned_km":round(float(weekly.get("planned_km") or 0),1),
-            "real_km":round(float(weekly.get("real_km") or 0),1),
-            "due":weekly.get("due"),"done":weekly.get("done"),"adherence_pct":weekly.get("compliance"),
-            "avg_rpe":weekly.get("avg_rpe"),
-        },
-        "runner_state":state,
-        "zones":zones,
-        "test_recommendation":test_rec,
-        "recent_training_14d":recent[-14:],
-        "upcoming_7d":upcoming,
-    })
-
-
-def coach_ai_audit_context(context):
-    """Reduce el snapshot persistido: conserva trazabilidad sin duplicar toda la historia sensible."""
-    context=context or {}
-    today=context.get("today") or {}
-    return _coach_json_safe({
-        "schema_version":context.get("schema_version"),
-        "date":context.get("date"),
-        "runner":context.get("runner"),
-        "goal":context.get("goal"),
-        "engine":context.get("engine"),
-        "today_session":today.get("session"),
-        "statistical_prediction":today.get("statistical_prediction"),
-        "week":context.get("week"),
-        "runner_state":context.get("runner_state"),
-    })
-
-
-def coach_ai_call(question, history, context):
-    token=st.session_state.get("access_token")
-    if not token:
-        return {"ok":False,"error":"La sesión de usuario no está disponible. Vuelve a iniciar sesión."}
-    url=f"{SUPABASE_URL}/functions/v1/rcp-coach-ai"
-    body=json.dumps({"question":question,"history":history[-10:],"context":context},ensure_ascii=False).encode("utf-8")
-    req=urllib.request.Request(url,data=body,method="POST",headers={
-        "Authorization":f"Bearer {token}","apikey":SUPABASE_PUBLISHABLE_KEY,
-        "Content-Type":"application/json","User-Agent":"RunningCoachPro/9.0",
-    })
-    try:
-        with urllib.request.urlopen(req,timeout=100) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            detail=json.loads(exc.read().decode("utf-8"))
-            return {"ok":False,"error":detail.get("error") or f"HTTP {exc.code}"}
-        except Exception:
-            return {"ok":False,"error":f"Error HTTP {exc.code} al contactar el Coach IA."}
-    except Exception as exc:
-        return {"ok":False,"error":f"No fue posible contactar el Coach IA: {exc}"}
-
-
-def coach_action_label(action_type):
-    return {
-        "NONE":"Sin cambios","KEEP_PLAN":"Mantener el plan","APPLY_ENGINE_REDUCTION":"Aplicar reducción validada",
-        "APPLY_ENGINE_PROTECTION":"Proteger la recuperación","REPLAN":"Reorganizar el plan",
-        "OPEN_READINESS":"Completar estado para entrenar","OPEN_REGISTER":"Registrar entrenamiento",
-        "CONSIDER_TEST":"Considerar una Prueba RCP",
-    }.get(str(action_type or ""),str(action_type or "—"))
-
-
-def coach_ai_render_latest_action(message_row):
-    structured=(message_row or {}).get("structured") or {}
-    proposal=structured.get("proposed_action") or {}
-    action_type=str(proposal.get("type") or "NONE")
-    if action_type in {"NONE","KEEP_PLAN"}:
-        if action_type=="KEEP_PLAN": st.success("✅ El Coach propone mantener el plan vigente.")
-        return
-    st.markdown("### 🧭 Propuesta supervisada")
-    with st.container(border=True):
-        st.markdown(f"**{coach_action_label(action_type)}**")
-        if proposal.get("reason"): st.write(proposal.get("reason"))
-        st.caption("La IA no ejecuta cambios por sí sola. RunningCoachPro vuelve a validar la propuesta con el motor antes de habilitar una acción.")
-        action_row=get_coach_action_for_message(message_row.get("id"))
-        status=str((action_row or {}).get("status") or "PENDING")
-        if status=="APPLIED":
-            st.success("Esta propuesta ya fue aplicada mediante el motor RCP.")
-            return
-        if status=="BLOCKED":
-            st.error("La propuesta fue bloqueada por el motor RCP y no se aplicó.")
-            return
-        if action_type in {"APPLY_ENGINE_REDUCTION","APPLY_ENGINE_PROTECTION"}:
-            engine=adaptation_snapshot(rcp_today()) if ADAPTIVE_READY else {}
-            expected="REDUCE" if action_type=="APPLY_ENGINE_REDUCTION" else "PROTECT"
-            if str(engine.get("decision") or "") != expected:
-                st.error(f"Bloqueado: el motor vigente no valida **{expected}** en este momento.")
-                if action_row: update_coach_action(action_row["id"],"BLOCKED",{"current_engine_decision":engine.get("decision")})
-            elif st.button("✅ Aplicar ajuste validado por RCP",type="primary",use_container_width=True,key=f"ai_apply_{message_row.get('id')}"):
-                ok,msg=apply_adaptation(engine,rcp_today())
-                (st.success if ok else st.error)(msg)
-                if action_row: update_coach_action(action_row["id"],"APPLIED" if ok else "BLOCKED",{"engine":engine,"result":msg})
-                if ok: st.rerun()
-        elif action_type=="REPLAN":
-            if st.button("🔄 Ir a reorganización del plan",use_container_width=True,key=f"ai_replan_{message_row.get('id')}"):
-                set_page("Hoy",rcp_today()); st.rerun()
-        elif action_type=="OPEN_READINESS":
-            if st.button("🧠 Completar estado de hoy",use_container_width=True,key=f"ai_ready_{message_row.get('id')}"):
-                set_page("Hoy",rcp_today()); st.rerun()
-        elif action_type=="OPEN_REGISTER":
-            if st.button("✅ Registrar entrenamiento",use_container_width=True,key=f"ai_register_{message_row.get('id')}"):
-                set_page("Registro",rcp_today()); st.rerun()
-        elif action_type=="CONSIDER_TEST":
-            if st.button("🧪 Ver Pruebas RCP",use_container_width=True,key=f"ai_test_{message_row.get('id')}"):
-                set_page("Progreso"); st.rerun()
-
 
 def v8_self_checks():
     checks = []
@@ -6921,7 +6586,6 @@ PAGE_META = {
     "Registro": ("✅", "Registrar entrenamiento"),
     "Objetivo": ("🎯", "Objetivo activo"),
     "Evaluación": ("🧭", "Evaluación RCP"),
-    "Coach IA": ("🤖", "Hablar con tu entrenador"),
     "Perfil": ("⚙️", "Cuenta y perfil"),
 }
 
@@ -8848,7 +8512,7 @@ def render_goal_hero():
 
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption(f"V{APP_VERSION} · motor estadístico + Coach IA")
+st.sidebar.caption(f"V{APP_VERSION} · motor estadístico adaptativo")
 if st.sidebar.button("🧪 Modo de pruebas", use_container_width=True, key="enter_qa_sandbox_sidebar"):
     st.session_state["rcp_qa_mode"] = True
     st.rerun()
@@ -8871,7 +8535,6 @@ if ADAPTIVE_READY:
     st.sidebar.markdown("🎯 **Ritmos de entrenamiento:** V8")
     st.sidebar.markdown("🧪 **Pruebas RCP:** V8")
     st.sidebar.markdown("📄 **PDF del plan:** V8")
-    st.sidebar.markdown("🤖 **Entrenador IA:** V9")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -11235,96 +10898,6 @@ elif current_page == "Evaluación":
 # ============================================================
 # ⚙️ PERFIL
 # ============================================================
-elif current_page == "Coach IA":
-    st.subheader("🤖 Entrenador RCP IA")
-    st.caption("Conversa sobre tu entrenamiento usando tu plan, recuperación y análisis estadístico real. La IA propone; el motor RCP valida y tú confirmas.")
-
-    if not coach_ai_storage_ready():
-        st.warning("Coach IA pendiente de activar. Ejecuta `supabase_v9_0_coach_ai.sql` en Supabase.")
-        st.info("Después despliega la Edge Function `rcp-coach-ai` y configura `OPENAI_API_KEY` en los secretos de Edge Functions. La clave no debe ir en GitHub ni en Streamlit.")
-    else:
-        threads=get_coach_threads()
-        top_a,top_b=st.columns([3,1])
-        options={f"{t.get('title') or 'Conversación'} · #{t['id']}":t for t in threads}
-        selected_label=None
-        if options:
-            current_id=st.session_state.get("rcp_ai_thread_id")
-            labels=list(options.keys())
-            default_idx=next((i for i,k in enumerate(labels) if int(options[k]['id'])==int(current_id or -1)),0)
-            selected_label=top_a.selectbox("Conversación",labels,index=default_idx,key="rcp_ai_thread_selector")
-            st.session_state["rcp_ai_thread_id"]=int(options[selected_label]["id"])
-        else:
-            top_a.info("Aún no tienes conversaciones con el Entrenador RCP IA.")
-        if top_b.button("➕ Nuevo chat",use_container_width=True,key="new_ai_chat"):
-            row=create_coach_thread()
-            if row:
-                st.session_state["rcp_ai_thread_id"]=int(row["id"])
-                st.rerun()
-
-        thread_id=st.session_state.get("rcp_ai_thread_id")
-        if not thread_id:
-            if st.button("🤖 Iniciar mi primera conversación",type="primary",use_container_width=True):
-                row=create_coach_thread()
-                if row:
-                    st.session_state["rcp_ai_thread_id"]=int(row["id"])
-                    st.rerun()
-        else:
-            messages=get_coach_messages(thread_id,limit=40)
-            if not messages:
-                st.markdown("#### Puedes preguntarme, por ejemplo:")
-                st.caption("“¿Qué opinas de mi entrenamiento de hoy?” · “Estoy muy cansado, ¿qué hago?” · “¿Estoy mejorando?” · “¿Por qué cambió mi velocidad?” · “Mañana no puedo entrenar.”")
-            latest_assistant=None
-            for msg in messages:
-                role="assistant" if str(msg.get("role") or "").upper()=="ASSISTANT" else "user"
-                with st.chat_message(role,avatar="🤖" if role=="assistant" else None):
-                    st.markdown(msg.get("content") or "")
-                    if role=="assistant":
-                        structured=msg.get("structured") or {}
-                        c=structured.get("confidence")
-                        align=structured.get("engine_alignment")
-                        if c or align:
-                            st.caption(f"Confianza del Coach: { {'LOW':'baja','MEDIUM':'moderada','HIGH':'alta'}.get(c,c or '—') } · Alineación con motor: { {'ALIGNED':'alineada','MORE_CONSERVATIVE':'más conservadora','INFORMATION_ONLY':'informativa','CONFLICT_BLOCKED':'conflicto bloqueado'}.get(align,align or '—') }")
-                        latest_assistant=msg
-
-            if latest_assistant:
-                coach_ai_render_latest_action(latest_assistant)
-
-            prompt=st.chat_input("Pregúntale a tu Entrenador RCP…",key="rcp_ai_chat_input")
-            if prompt:
-                prompt=prompt.strip()
-                if prompt:
-                    if not messages:
-                        try:
-                            client.table("rc_ai_threads").update({"title":prompt[:70],"updated_at":datetime.now(timezone.utc).isoformat()}).eq("id",int(thread_id)).eq("user_id",USER_ID).execute()
-                        except Exception:
-                            pass
-                    save_coach_message(thread_id,"USER",prompt)
-                    context=coach_ai_context_snapshot()
-                    history=[{"role":str(m.get("role") or "").lower(),"content":m.get("content") or ""} for m in messages[-10:]]
-                    history.append({"role":"user","content":prompt})
-                    with st.spinner("El Entrenador RCP está analizando tu contexto…"):
-                        res=coach_ai_call(prompt,history,context)
-                    if not res.get("ok"):
-                        st.error(res.get("error") or "No fue posible obtener respuesta del Coach IA.")
-                    else:
-                        result=res.get("result") or {}
-                        answer=str(result.get("answer") or result.get("summary") or "Respuesta recibida.")
-                        assistant_row=save_coach_message(
-                            thread_id,"ASSISTANT",answer,model=res.get("model"),
-                            context_snapshot=coach_ai_audit_context(context),structured=result,
-                        )
-                        proposal=result.get("proposed_action") or {}
-                        if assistant_row and str(proposal.get("type") or "NONE") not in {"NONE","KEEP_PLAN"}:
-                            create_coach_action(thread_id,assistant_row.get("id"),proposal,(context or {}).get("engine") or {})
-                        st.rerun()
-
-        with st.expander("🔒 Cómo funciona y qué puede hacer",expanded=False):
-            st.markdown("**La IA puede:** interpretar tus datos, responder preguntas, explicar por qué RCP recomienda algo y proponer una acción permitida.")
-            st.markdown("**La IA no puede:** editar libremente Supabase, saltarse límites de seguridad ni aumentar carga por su cuenta.")
-            st.markdown("**Antes de un cambio real:** el motor RCP vuelve a validar la propuesta y la app exige tu confirmación.")
-            st.caption("Las conversaciones se guardan en tu cuenta para mantener continuidad. El snapshot enviado al proveedor se limita a información deportiva necesaria y omite correo/dirección.")
-
-
 elif current_page == "Perfil":
     st.subheader("⚙️ Mi perfil")
     st.caption(
@@ -11662,7 +11235,7 @@ elif current_page == "Perfil":
 
 st.divider()
 st.caption(
-    "RunningCoachPro genera orientación general de entrenamiento. El Coach IA interpreta el contexto, pero los cambios del plan siguen sujetos a los límites deterministas y estadísticos RCP. La puntuación de estado para entrenar y las decisiones adaptativas y longitudinales V8 "
+    "RunningCoachPro genera orientación general de entrenamiento. La puntuación de estado para entrenar y las decisiones adaptativas y longitudinales V8 "
     "son reglas internas de apoyo al entrenamiento, no escalas médicas validadas. No sustituye evaluación médica "
     "ni asesoría individual de un entrenador. Ante dolor agudo, mareos, lesión o síntomas anormales, suspende el ejercicio y busca orientación profesional."
 )
