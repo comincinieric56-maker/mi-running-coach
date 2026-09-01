@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.5.1"
+APP_VERSION = "7.6.0"
 
 
 # ============================================================
@@ -1012,6 +1012,62 @@ def update_plan_session_fields(session_id, **fields):
     if not session_id:
         return
     client.table("rc_plan_sessions").update(fields).eq("user_id", USER_ID).eq("id", int(session_id)).execute()
+
+
+# ============================================================
+# V7.6 · Persistencia de revisión semanal
+# ============================================================
+def weekly_review_storage_ready():
+    """Comprueba la migración V7.6 sin modificar datos."""
+    try:
+        client.table("rc_weekly_reviews").select(
+            "id,plan_id,week_no,decision,status,metrics,proposal"
+        ).eq("user_id", USER_ID).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def get_weekly_reviews(plan_id=None, limit=80):
+    if not plan_id:
+        active = get_active_plan_record()
+        plan_id = (active or {}).get("id")
+    if not plan_id:
+        return []
+    return (
+        client.table("rc_weekly_reviews")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_id))
+        .order("week_start", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def upsert_weekly_review(payload):
+    if not ACTIVE_PLAN:
+        raise RuntimeError("No existe un plan activo para asociar la revisión semanal.")
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    row["plan_id"] = int(ACTIVE_PLAN["id"])
+    row["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = client.table("rc_weekly_reviews").upsert(
+        row, on_conflict="user_id,plan_id,week_no"
+    ).execute().data or []
+    return result[0] if result else None
+
+
+def update_weekly_review(review_id, **fields):
+    if not review_id:
+        return
+    fields = dict(fields)
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_weekly_reviews").update(fields).eq(
+        "user_id", USER_ID
+    ).eq("id", int(review_id)).execute()
 
 
 # ============================================================
@@ -4731,6 +4787,11 @@ ADJUSTMENTS = get_adjustments(ACTIVE_PLAN["id"]) if ADAPTIVE_READY and ACTIVE_PL
 REPLAN_READY = replanning_storage_ready() if ADAPTIVE_READY else False
 REPLANS = get_replans(ACTIVE_PLAN["id"]) if REPLAN_READY and ACTIVE_PLAN else []
 
+# V7.6 · Revisión semanal persistente del plan activo.
+WEEKLY_REVIEW_READY = weekly_review_storage_ready() if ADAPTIVE_READY else False
+WEEKLY_REVIEWS = get_weekly_reviews(ACTIVE_PLAN["id"]) if WEEKLY_REVIEW_READY and ACTIVE_PLAN else []
+WEEKLY_REVIEW_BY_WEEK = {int(x.get("week_no") or 0): x for x in WEEKLY_REVIEWS}
+
 # ============================================================
 # V6.4.2 · Navigation Grid por iconos / Sidebar
 # ============================================================
@@ -6046,6 +6107,482 @@ def week_snapshot(day_value):
     }
 
 
+# ============================================================
+# V7.6 · MOTOR DE REVISIÓN SEMANAL
+# ============================================================
+def weekly_review_decision_label(decision):
+    return {
+        "COLLECTING": "Recolectando datos",
+        "PROGRESS": "Progresar según el plan",
+        "MAINTAIN": "Mantener carga",
+        "REDUCE": "Reducir carga",
+        "PROTECT": "Proteger recuperación",
+    }.get(str(decision or ""), str(decision or "—"))
+
+
+def weekly_review_decision_icon(decision):
+    return {
+        "COLLECTING": "⏳",
+        "PROGRESS": "✅",
+        "MAINTAIN": "🟦",
+        "REDUCE": "🟡",
+        "PROTECT": "🛡️",
+    }.get(str(decision or ""), "🧠")
+
+
+def _weekly_review_accounted_status(day_value):
+    log = LOG_BY_DATE.get(day_value.isoformat()) or {}
+    return str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO")
+
+
+def weekly_review_snapshot(day_value):
+    """Analiza una semana del plan. Heurística de entrenamiento, no score clínico validado."""
+    monday, sunday = week_bounds(day_value)
+    sessions = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date"))) and monday <= d <= sunday
+    ]
+    base_sessions = [p for p in sessions if not session_is_optional(p)]
+    if not base_sessions:
+        return None
+
+    week_no = int(base_sessions[0].get("week_no") or 0)
+    local_logs = {
+        str(l.get("session_date")): l
+        for l in CURRENT_LOGS
+        if (d := parse_date_safe(l.get("session_date"))) and monday <= d <= sunday
+    }
+
+    completed = []
+    omitted = []
+    accounted = []
+    for p in base_sessions:
+        log = local_logs.get(str(p.get("session_date"))) or {}
+        status = str(log.get("status") or "").upper()
+        if status in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+            accounted.append(p)
+        if status in ("COMPLETADO", "MODIFICADO"):
+            completed.append((p, log))
+        elif status == "OMITIDO":
+            omitted.append((p, log))
+
+    # La semana queda cerrada al pasar el domingo o, en domingo, cuando todas las
+    # sesiones base ya fueron registradas explícitamente.
+    today = rcp_today()
+    closed = sunday < today or (sunday == today and len(accounted) == len(base_sessions))
+
+    planned_km = sum(float(p.get("planned_km") or 0) for p in base_sessions)
+    actual_km = sum(float(log.get("actual_km") or 0) for _, log in completed)
+    adherence = (len(completed) / len(base_sessions) * 100) if base_sessions else None
+    km_ratio = (actual_km / planned_km) if planned_km > 0 else None
+
+    rpes = []
+    rpe_excess = []
+    post_pains = []
+    post_fatigues = []
+    for p, log in completed:
+        if log.get("rpe") is not None:
+            rpe = float(log.get("rpe"))
+            rpes.append(rpe)
+            _, upper = expected_rpe_range(p)
+            rpe_excess.append(max(0.0, rpe - float(upper)))
+        if log.get("post_pain") is not None:
+            post_pains.append(int(log.get("post_pain")))
+        if log.get("post_fatigue") is not None:
+            post_fatigues.append(int(log.get("post_fatigue")))
+
+    readiness = [
+        r for r in READINESS_ROWS
+        if (d := parse_date_safe(r.get("checkin_date"))) and monday <= d <= sunday
+    ]
+    readiness_scores = [int(r.get("readiness_score") or 0) for r in readiness if r.get("readiness_score") is not None]
+    readiness_avg = sum(readiness_scores) / len(readiness_scores) if readiness_scores else None
+    readiness_min = min(readiness_scores) if readiness_scores else None
+    readiness_statuses = [str(r.get("readiness_status") or "").upper() for r in readiness]
+    red_checkins = sum(1 for x in readiness_statuses if x == "RED")
+    orange_checkins = sum(1 for x in readiness_statuses if x == "ORANGE")
+    illness_checkins = sum(1 for r in readiness if bool(r.get("illness")))
+    gait_pain_checkins = sum(1 for r in readiness if bool(r.get("pain_changes_gait")))
+
+    avg_rpe = sum(rpes) / len(rpes) if rpes else None
+    avg_rpe_excess = sum(rpe_excess) / len(rpe_excess) if rpe_excess else 0.0
+    max_post_pain = max(post_pains) if post_pains else 0
+    avg_post_fatigue = sum(post_fatigues) / len(post_fatigues) if post_fatigues else None
+
+    recovery_reasons = {"fatiga", "dolor/molestia", "enfermedad"}
+    schedule_reasons = {"falta de tiempo", "viaje"}
+    recovery_omissions = sum(
+        1 for _, log in omitted
+        if str(log.get("missed_reason") or "").strip().lower() in recovery_reasons
+    )
+    schedule_omissions = sum(
+        1 for _, log in omitted
+        if str(log.get("missed_reason") or "").strip().lower() in schedule_reasons
+    )
+
+    long_sessions = [p for p in base_sessions if workout_kind(p) == "Larga"]
+    quality_sessions = [p for p in base_sessions if workout_kind(p) in ("Tempo", "Series")]
+    long_completed = sum(
+        1 for p in long_sessions
+        if str((local_logs.get(str(p.get("session_date"))) or {}).get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")
+    )
+    quality_completed = sum(
+        1 for p in quality_sessions
+        if str((local_logs.get(str(p.get("session_date"))) or {}).get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")
+    )
+
+    metrics = {
+        "week_no": week_no,
+        "week_start": monday.isoformat(),
+        "week_end": sunday.isoformat(),
+        "closed": closed,
+        "scheduled_sessions": len(base_sessions),
+        "accounted_sessions": len(accounted),
+        "completed_sessions": len(completed),
+        "omitted_sessions": len(omitted),
+        "adherence_pct": round(adherence, 1) if adherence is not None else None,
+        "planned_km": round(planned_km, 1),
+        "actual_km": round(actual_km, 1),
+        "km_ratio": round(km_ratio, 3) if km_ratio is not None else None,
+        "avg_rpe": round(avg_rpe, 2) if avg_rpe is not None else None,
+        "avg_rpe_excess": round(avg_rpe_excess, 2),
+        "max_post_pain": int(max_post_pain),
+        "avg_post_fatigue": round(avg_post_fatigue, 2) if avg_post_fatigue is not None else None,
+        "readiness_avg": round(readiness_avg, 1) if readiness_avg is not None else None,
+        "readiness_min": int(readiness_min) if readiness_min is not None else None,
+        "readiness_checkins": len(readiness),
+        "red_checkins": red_checkins,
+        "orange_checkins": orange_checkins,
+        "illness_checkins": illness_checkins,
+        "gait_pain_checkins": gait_pain_checkins,
+        "recovery_related_omissions": recovery_omissions,
+        "schedule_related_omissions": schedule_omissions,
+        "long_runs_planned": len(long_sessions),
+        "long_runs_completed": long_completed,
+        "quality_sessions_planned": len(quality_sessions),
+        "quality_sessions_completed": quality_completed,
+    }
+
+    if not closed:
+        reasons = ["La semana sigue abierta. RCP actualizará la revisión cuando todas las sesiones hayan vencido o se registren."]
+        decision = "COLLECTING"
+        severity = "none"
+    else:
+        reasons = []
+        decision = "MAINTAIN"
+        severity = "normal"
+
+        hard_flag = (
+            red_checkins > 0
+            or max_post_pain >= 7
+            or gait_pain_checkins > 0
+        )
+        major_reduce = (
+            orange_checkins >= 2
+            or (readiness_avg is not None and readiness_avg < 58)
+            or max_post_pain >= 5
+            or recovery_omissions >= 2
+            or avg_rpe_excess >= 2.0
+            or illness_checkins >= 2
+        )
+        moderate_reduce = (
+            (adherence is not None and adherence < 70 and recovery_omissions > 0)
+            or (km_ratio is not None and km_ratio < 0.70)
+            or (readiness_avg is not None and readiness_avg < 65)
+            or avg_rpe_excess >= 1.0
+            or (avg_post_fatigue is not None and avg_post_fatigue >= 4.0)
+        )
+
+        enough_evidence = (len(completed) + len(readiness)) >= 3
+        progress_ready = (
+            enough_evidence
+            and adherence is not None and adherence >= 85
+            and km_ratio is not None and 0.85 <= km_ratio <= 1.15
+            and (readiness_avg is None or readiness_avg >= 72)
+            and max_post_pain <= 2
+            and avg_rpe_excess <= 0.5
+            and (avg_post_fatigue is None or avg_post_fatigue <= 3.5)
+            and recovery_omissions == 0
+            and illness_checkins == 0
+            and (not long_sessions or long_completed == len(long_sessions))
+        )
+
+        if hard_flag:
+            decision = "PROTECT"
+            severity = "high"
+            reasons.append("Hay una señal de protección relevante en dolor/readiness; no conviene aumentar la carga de la próxima semana.")
+        elif major_reduce:
+            decision = "REDUCE"
+            severity = "major"
+            reasons.append("La respuesta de recuperación de la semana justifica una descarga clara antes de volver a progresar.")
+        elif moderate_reduce:
+            decision = "REDUCE"
+            severity = "moderate"
+            reasons.append("La carga fue peor tolerada de lo previsto; conviene reducir parcialmente la siguiente semana.")
+        elif progress_ready:
+            decision = "PROGRESS"
+            severity = "normal"
+            reasons.append("La semana fue bien tolerada y permite continuar con la progresión que ya estaba programada.")
+        else:
+            decision = "MAINTAIN"
+            severity = "normal"
+            reasons.append("No hay evidencia suficiente para añadir más carga; se recomienda consolidar antes de progresar.")
+
+        if schedule_omissions >= 2:
+            reasons.append("Hubo varias omisiones por disponibilidad; RCP no intentará compensarlas acumulando sesiones.")
+        if long_sessions and long_completed < len(long_sessions):
+            reasons.append("La tirada larga no quedó completada; RCP evita progresar automáticamente el volumen semanal.")
+        if not enough_evidence:
+            reasons.append("La cantidad de registros/readiness es limitada; la decisión se mantiene conservadora.")
+
+    # Propuesta para la SEMANA SIGUIENTE. Nunca aumenta por encima de lo ya programado.
+    next_start = sunday + timedelta(days=1)
+    next_end = next_start + timedelta(days=6)
+    next_sessions = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date")))
+        and next_start <= d <= next_end
+        and not session_is_optional(p)
+        and workout_kind(p) != "Carrera"
+    ]
+    current_next_km = sum(float(p.get("planned_km") or 0) for p in next_sessions)
+    if decision == "PROGRESS":
+        target_next_km = current_next_km
+        intensity_policy = "Mantener la progresión ya programada; no añadir carga extra."
+    elif decision == "MAINTAIN":
+        target_next_km = min(current_next_km, planned_km) if current_next_km else 0.0
+        intensity_policy = "Conservar estructura; impedir que el volumen semanal suba respecto de la semana revisada."
+    elif decision == "REDUCE":
+        factor = 0.82 if severity == "major" else 0.90
+        target_next_km = min(current_next_km, planned_km * factor) if current_next_km else 0.0
+        intensity_policy = "Reducir volumen; si la reducción es mayor, convertir la calidad en trabajo fácil."
+    elif decision == "PROTECT":
+        target_next_km = min(current_next_km, planned_km * 0.75) if current_next_km else 0.0
+        intensity_policy = "Retirar intensidad y priorizar recuperación; no compensar sesiones perdidas."
+    else:
+        target_next_km = current_next_km
+        intensity_policy = "Sin cambios mientras la semana siga abierta."
+
+    proposal = {
+        "next_week_start": next_start.isoformat(),
+        "next_week_end": next_end.isoformat(),
+        "current_next_km": round(current_next_km, 1),
+        "target_next_km": round(max(0.0, target_next_km), 1),
+        "intensity_policy": intensity_policy,
+    }
+    if current_next_km > 0:
+        proposal["change_pct"] = round((target_next_km / current_next_km - 1) * 100, 1)
+    else:
+        proposal["change_pct"] = 0.0
+
+    summaries = {
+        "COLLECTING": "Semana en curso: RCP está reuniendo información antes de emitir una recomendación final.",
+        "PROGRESS": "Semana bien tolerada: continuar con la progresión ya prevista por el plan, sin añadir carga extra.",
+        "MAINTAIN": "Semana aceptable pero no concluyente: consolidar la carga antes de seguir aumentando.",
+        "REDUCE": "Señales de tolerancia subóptima: descargar la próxima semana de forma conservadora.",
+        "PROTECT": "Prioridad de recuperación: retirar intensidad y reducir carga antes de retomar progresión.",
+    }
+
+    return {
+        "week_no": week_no,
+        "week_start": monday,
+        "week_end": sunday,
+        "closed": closed,
+        "decision": decision,
+        "severity": severity,
+        "summary": summaries.get(decision, ""),
+        "reasons": reasons,
+        "metrics": metrics,
+        "proposal": proposal,
+    }
+
+
+def persist_weekly_review(snapshot):
+    if not WEEKLY_REVIEW_READY or not snapshot or not snapshot.get("closed"):
+        return None
+    return upsert_weekly_review({
+        "week_no": int(snapshot.get("week_no") or 0),
+        "week_start": snapshot["week_start"].isoformat(),
+        "week_end": snapshot["week_end"].isoformat(),
+        "decision": snapshot.get("decision") or "MAINTAIN",
+        "severity": snapshot.get("severity") or "normal",
+        "summary": snapshot.get("summary") or "",
+        "reasons": snapshot.get("reasons") or [],
+        "metrics": snapshot.get("metrics") or {},
+        "proposal": snapshot.get("proposal") or {},
+        "engine_version": "RCP-WEEKLY-7.6",
+        "status": "PENDING",
+    })
+
+
+def apply_weekly_review(review):
+    """Aplica SOLO la propuesta confirmada; nunca aumenta por encima del plan ya programado."""
+    if not WEEKLY_REVIEW_READY or not ACTIVE_PLAN or not review:
+        return False, "La revisión semanal V7.6 no está disponible."
+    if str(review.get("status") or "").upper() == "APPLIED":
+        return False, "Esta revisión ya fue aplicada."
+
+    decision = str(review.get("decision") or "MAINTAIN").upper()
+    metrics = review.get("metrics") or {}
+    proposal = review.get("proposal") or {}
+    next_start = parse_date_safe(proposal.get("next_week_start"))
+    next_end = parse_date_safe(proposal.get("next_week_end"))
+    if not next_start or not next_end:
+        return False, "La propuesta no contiene una semana siguiente válida."
+
+    # PROGRESS solo autoriza la progresión existente. Nunca añade km extra.
+    if decision == "PROGRESS":
+        update_weekly_review(
+            review.get("id"), status="APPLIED", applied_at=datetime.now(timezone.utc).isoformat()
+        )
+        return True, "Progresión prevista confirmada. RCP no añadió kilometraje adicional al plan."
+
+    all_next_sessions = []
+    targets = []
+    actual_already = 0.0
+    for p in PLAN:
+        d = parse_date_safe(p.get("session_date"))
+        if not d or not (next_start <= d <= next_end):
+            continue
+        if session_is_optional(p) or workout_kind(p) == "Carrera":
+            continue
+        all_next_sessions.append(p)
+        _next_log = LOG_BY_DATE.get(str(p.get("session_date"))) or {}
+        _next_status = str(_next_log.get("status") or "").upper()
+        if _next_status in ("COMPLETADO", "MODIFICADO"):
+            actual_already += float(_next_log.get("actual_km") or 0)
+            continue
+        if _next_status == "OMITIDO":
+            continue
+        targets.append(p)
+
+    if not targets:
+        update_weekly_review(
+            review.get("id"), status="APPLIED", applied_at=datetime.now(timezone.utc).isoformat()
+        )
+        return True, "Revisión confirmada. No había sesiones futuras elegibles que modificar."
+
+    current_total = sum(float(p.get("planned_km") or 0) for p in targets)
+    original_next_total = sum(float(p.get("planned_km") or 0) for p in all_next_sessions)
+    proposed_total = float(proposal.get("target_next_km") or original_next_total)
+    # Si la revisión se confirma tarde, descuenta lo ya realizado y ajusta solo lo pendiente.
+    target_remaining = max(0.0, proposed_total - actual_already)
+    target_remaining = min(current_total, target_remaining)
+    scale = (target_remaining / current_total) if current_total > 0 else 1.0
+
+    if decision == "MAINTAIN" and scale >= 0.999:
+        update_weekly_review(
+            review.get("id"), status="APPLIED", applied_at=datetime.now(timezone.utc).isoformat()
+        )
+        return True, "Carga consolidada. La semana siguiente ya estaba dentro del límite recomendado, por lo que no se modificó."
+
+    adjustment = create_adjustment_record({
+        "plan_id": int(ACTIVE_PLAN["id"]),
+        "trigger_date": str(review.get("week_end") or rcp_today().isoformat()),
+        "scope_start": next_start.isoformat(),
+        "scope_end": next_end.isoformat(),
+        "decision": f"WEEKLY_{decision}",
+        "severity": str(review.get("severity") or "normal"),
+        "reason": str(review.get("summary") or "Revisión semanal RCP V7.6"),
+        "metrics": metrics,
+        "changes": [],
+        "status": "PENDING",
+    })
+    if not adjustment:
+        return False, "No fue posible crear la auditoría del ajuste semanal."
+
+    changes = []
+    touched = []
+    try:
+        for p in sorted(targets, key=lambda x: str(x.get("session_date"))):
+            before = {
+                "planned_km": float(p.get("planned_km") or 0),
+                "workout_type": p.get("workout_type"),
+                "workout_name": p.get("workout_name"),
+                "target": p.get("target"),
+                "intensity": p.get("intensity"),
+                "description": p.get("description"),
+                "adaptation_status": p.get("adaptation_status") or "BASELINE",
+                "adaptation_id": p.get("adaptation_id"),
+            }
+            new_km = max(2.0, round(float(p.get("planned_km") or 0) * scale, 1))
+            new_km = min(float(p.get("planned_km") or 0), new_km)
+            after = {
+                "planned_km": new_km,
+                "adaptation_status": f"WEEKLY_{decision}",
+                "adaptation_id": int(adjustment["id"]),
+                "adapted_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            # Protección semanal: sin intensidad. Descarga mayor: también retira calidad.
+            remove_quality = (
+                decision == "PROTECT"
+                or (decision == "REDUCE" and str(review.get("severity") or "") == "major")
+            )
+            if remove_quality and workout_kind(p) in ("Tempo", "Series"):
+                after.update({
+                    "workout_type": "RODAJE",
+                    "workout_name": "Rodaje suave · revisión semanal RCP",
+                    "target": "RPE 2–3 · conversación completa",
+                    "intensity": "BAJA",
+                    "description": "ADAPTADO V7.6: se retira temporalmente la intensidad según la revisión semanal confirmada.",
+                })
+            elif decision in ("REDUCE", "PROTECT"):
+                after["description"] = (
+                    f"ADAPTADO V7.6: volumen ajustado por revisión semanal confirmada. "
+                    f"{str(p.get('description') or '')}"
+                )
+
+            update_plan_session_fields(p.get("id"), **after)
+            touched.append((p, before))
+            changes.append({
+                "session_id": p.get("id"),
+                "session_date": str(p.get("session_date")),
+                "before": before,
+                "after": after,
+            })
+
+        update_adjustment_record(adjustment.get("id"), changes=changes, status="APPLIED")
+        update_weekly_review(
+            review.get("id"),
+            status="APPLIED",
+            applied_at=datetime.now(timezone.utc).isoformat(),
+            applied_adjustment_id=int(adjustment["id"]),
+        )
+        return True, f"Revisión semanal aplicada a {len(changes)} sesión(es) de la próxima semana."
+    except Exception as exc:
+        # Rollback conservador de lo tocado en esta operación.
+        for p, before in reversed(touched):
+            try:
+                update_plan_session_fields(p.get("id"), **before)
+            except Exception:
+                pass
+        update_adjustment_record(adjustment.get("id"), status="FAILED", changes=changes)
+        update_weekly_review(review.get("id"), status="FAILED")
+        return False, f"No fue posible aplicar la revisión semanal: {exc}"
+
+
+def latest_weekly_review_candidate():
+    """Última semana del plan ya cerrada y susceptible de revisión."""
+    candidates = []
+    for p in PLAN:
+        d = parse_date_safe(p.get("session_date"))
+        if not d:
+            continue
+        monday, sunday = week_bounds(d)
+        if sunday < rcp_today():
+            candidates.append((sunday, monday, int(p.get("week_no") or 0)))
+    if not candidates:
+        # Domingo actual: permitir revisión si todas las sesiones ya fueron registradas.
+        if rcp_today().weekday() == 6:
+            snap = weekly_review_snapshot(rcp_today())
+            if snap and snap.get("closed"):
+                return snap
+        return None
+    _, monday, _ = sorted(set(candidates), reverse=True)[0]
+    return weekly_review_snapshot(monday)
+
+
 def all_weekly_stats():
     weekly = {}
     for p in PLAN:
@@ -6165,6 +6702,7 @@ if ADAPTIVE_READY:
     st.sidebar.markdown("🧠 **Motor adaptativo:** V7.3")
     st.sidebar.markdown("🧬 **Perfil fisiológico:** V7.4")
     st.sidebar.markdown("📄 **Exportador PDF:** V7.5.1 Premium")
+    st.sidebar.markdown("🧠 **Revisión semanal:** V7.6")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -7076,8 +7614,9 @@ if current_page == "Hoy":
 
             if str(today_session.get("adaptation_status") or "BASELINE").upper() != "BASELINE":
                 base_km = float(today_session.get("baseline_planned_km") or today_session.get("planned_km") or 0)
+                _adapt_source = "V7.6 revisión semanal" if str(today_session.get("adaptation_status") or "").upper().startswith("WEEKLY_") else "V7.1 adaptación diaria"
                 st.warning(
-                    f"🧠 Sesión adaptada V7.1 · plan original {base_km:g} km → actual {float(today_session.get('planned_km') or 0):g} km."
+                    f"🧠 Sesión adaptada · {_adapt_source} · plan original {base_km:g} km → actual {float(today_session.get('planned_km') or 0):g} km."
                 )
 
             with st.expander("📋 Cómo hacerlo", expanded=False):
@@ -7232,6 +7771,22 @@ if current_page == "Hoy":
         st.progress(min(1.0, max(0.0, snap["compliance"] / 100)))
         st.caption(f"{snap['done']} de {snap['due']} sesiones base vencidas completadas.")
 
+    # V7.6 · Recordatorio de la última semana cerrada pendiente de revisión.
+    if WEEKLY_REVIEW_READY and selected_day == rcp_today():
+        _review_candidate = latest_weekly_review_candidate()
+        if _review_candidate:
+            _saved_week_review = WEEKLY_REVIEW_BY_WEEK.get(int(_review_candidate.get("week_no") or 0))
+            if not _saved_week_review or str(_saved_week_review.get("status") or "").upper() != "APPLIED":
+                with st.container(border=True):
+                    st.markdown("### 🧠 Revisión semanal disponible")
+                    st.write(
+                        f"La semana {_review_candidate.get('week_no')} ya cerró. RCP puede integrar adherencia, "
+                        "RPE, readiness y recuperación antes de consolidar la siguiente semana."
+                    )
+                    if st.button("Abrir revisión semanal", use_container_width=True, key="home_weekly_review_open"):
+                        set_page("Semana", _review_candidate.get("week_start"))
+                        st.rerun()
+
     # Vista rápida de 4 semanas
     weekly_all = all_weekly_stats()
     if weekly_all:
@@ -7318,6 +7873,77 @@ elif current_page == "Semana":
         "Cumplimiento",
         "—" if snap["compliance"] is None else f"{snap['compliance']:.0f}%",
     )
+
+    # V7.6 · Revisión semanal inteligente
+    if _week_sessions:
+        if not WEEKLY_REVIEW_READY:
+            st.info("🧠 Revisión semanal V7.6 pendiente: ejecuta `supabase_v7_6_weekly_review.sql` para activarla.")
+        else:
+            _weekly_live = weekly_review_snapshot(selected_day)
+            if _weekly_live:
+                _week_no = int(_weekly_live.get("week_no") or 0)
+                _weekly_saved = WEEKLY_REVIEW_BY_WEEK.get(_week_no)
+                _weekly_view = _weekly_saved or _weekly_live
+                _wm = (_weekly_view.get("metrics") or {})
+                _wp = (_weekly_view.get("proposal") or {})
+                _decision = str(_weekly_view.get("decision") or "COLLECTING").upper()
+                _status = str((_weekly_saved or {}).get("status") or "PREVIEW").upper()
+
+                with st.expander(
+                    f"🧠 Revisión RCP · Semana {_week_no} · {weekly_review_decision_label(_decision)}",
+                    expanded=bool(_weekly_live.get("closed")),
+                ):
+                    if not _weekly_live.get("closed") and not _weekly_saved:
+                        st.info("Semana en curso. Puedes ver la tendencia, pero RCP no permite aplicar cambios hasta el cierre.")
+                    elif _status == "APPLIED":
+                        st.success("Revisión confirmada y aplicada al plan.")
+                    elif _status == "PENDING":
+                        st.warning("Revisión final generada. Falta confirmar la propuesta para la semana siguiente.")
+
+                    st.markdown(
+                        f"### {weekly_review_decision_icon(_decision)} {weekly_review_decision_label(_decision)}"
+                    )
+                    st.write(_weekly_view.get("summary") or _weekly_live.get("summary") or "")
+
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric("Adherencia", "—" if _wm.get("adherence_pct") is None else f"{float(_wm['adherence_pct']):.0f}%")
+                    r2.metric("KM", f"{float(_wm.get('actual_km') or 0):.1f}/{float(_wm.get('planned_km') or 0):.1f}")
+                    r3.metric("Readiness", "—" if _wm.get("readiness_avg") is None else f"{float(_wm['readiness_avg']):.0f}/100")
+                    r4.metric("Dolor post máx.", f"{int(_wm.get('max_post_pain') or 0)}/10")
+
+                    if _weekly_view.get("reasons"):
+                        st.caption(" ".join(str(x) for x in (_weekly_view.get("reasons") or [])))
+
+                    if _wp:
+                        _current_next = float(_wp.get("current_next_km") or 0)
+                        _target_next = float(_wp.get("target_next_km") or 0)
+                        if _current_next > 0:
+                            st.markdown(
+                                f"**Próxima semana:** {_current_next:.1f} km programados → "
+                                f"**{_target_next:.1f} km propuestos**"
+                            )
+                        st.caption(str(_wp.get("intensity_policy") or ""))
+
+                    if _weekly_live.get("closed") and not _weekly_saved:
+                        if st.button("🧠 Generar revisión final", type="primary", use_container_width=True, key=f"weekly_generate_{_week_no}"):
+                            _saved = persist_weekly_review(_weekly_live)
+                            if _saved:
+                                st.success("Revisión semanal guardada. Ahora puedes confirmar o dejar el plan sin cambios.")
+                                st.rerun()
+                            else:
+                                st.error("No fue posible guardar la revisión semanal.")
+                    elif _weekly_saved and _status == "PENDING":
+                        _label = {
+                            "PROGRESS": "✅ Confirmar progresión prevista",
+                            "MAINTAIN": "🟦 Confirmar mantenimiento",
+                            "REDUCE": "🟡 Aplicar descarga semanal",
+                            "PROTECT": "🛡️ Aplicar protección semanal",
+                        }.get(_decision, "Aplicar propuesta")
+                        if st.button(_label, type="primary", use_container_width=True, key=f"weekly_apply_{_week_no}"):
+                            _ok, _msg = apply_weekly_review(_weekly_saved)
+                            (st.success if _ok else st.error)(_msg)
+                            if _ok:
+                                st.rerun()
 
     for i in range(7):
         d = monday + timedelta(days=i)
