@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V7.1 · Plan Engine RCP + Motor Adaptativo + UI/UX responsive
+# V8.0 · Core Complete · Plan Engine + adaptación + zonas + carga + tests
 # ============================================================
 st.markdown(
     """
@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.6.4"
+APP_VERSION = "8.0.0"
 
 
 # ============================================================
@@ -1827,12 +1827,19 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
             "note": "Equivalencia directa del pace prescrito; la inclinación se ajusta por separado.",
         }
 
-    # V7.6.4 · Si la sesión está prescrita por RPE, aprende primero de sesiones reales
-    # registradas en caminadora. No usa velocidad habitual declarada ni convierte costumbre
-    # en prescripción; usa la relación observada velocidad↔RPE.
-    personal = personal_pace_rpe_guidance(session, surface="CAMINADORA")
-    if personal:
-        return personal
+    # V8.0 · Zonas dinámicas: test reciente + marca + calibración personal.
+    v8 = v8_dynamic_zones(assessment, goal_row)
+    zone = (v8.get("zones") or {}).get(_session_zone_key(session))
+    if zone:
+        paces = list(zone) if isinstance(zone, (list, tuple)) else [zone]
+        return {
+            "speed": _speed_text_from_paces(paces),
+            "pace": _pace_text_from_seconds(paces),
+            "repeats": treadmill_repeat_text(session),
+            "source": f"zonas dinámicas V8 · {v8.get('source')}",
+            "confidence": v8.get("confidence"),
+            "note": "Referencia dinámica RCP V8. El RPE/talk test sigue siendo el control principal del esfuerzo.",
+        }
 
     # Si aún no hay calibración personal suficiente pero existe una marca reciente
     # utilizable, recuperamos la zona correspondiente sin regenerar ni alterar el plan.
@@ -1871,6 +1878,496 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
         "source": "RPE",
         "note": "No hay una marca o meta temporal suficiente para asignar una velocidad responsable; usa el RPE/talk test.",
     }
+
+
+# ============================================================
+# V8.0 · CORE COMPLETE
+# Zonas dinámicas + tests RCP + carga/recuperación + tendencia
+# ============================================================
+def core_v8_storage_ready():
+    """Comprueba la migración V8.0 sin modificar datos."""
+    try:
+        (
+            client.table("rc_performance_tests")
+            .select("id,test_type,test_date,status,distance_km,duration_sec")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_performance_tests(limit=30):
+    if not core_v8_storage_ready():
+        return []
+    return (
+        client.table("rc_performance_tests")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .order("test_date", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def save_performance_test(payload):
+    if not core_v8_storage_ready():
+        raise RuntimeError("Falta instalar la migración V8.0 en Supabase.")
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    if ACTIVE_PLAN:
+        row["plan_id"] = int(ACTIVE_PLAN["id"])
+    row["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = client.table("rc_performance_tests").insert(row).execute().data or []
+    return result[0] if result else None
+
+
+def latest_completed_performance_test(max_age_days=120):
+    rows = globals().get("PERFORMANCE_TESTS")
+    if rows is None:
+        rows = get_performance_tests(limit=30)
+    cutoff = rcp_today() - timedelta(days=int(max_age_days))
+    valid = []
+    for row in rows or []:
+        if str(row.get("status") or "").upper() != "COMPLETED":
+            continue
+        d = parse_date_safe(row.get("test_date"))
+        try:
+            km = float(row.get("distance_km") or 0)
+            sec = float(row.get("duration_sec") or 0)
+        except Exception:
+            continue
+        if not d or d < cutoff or km <= 0 or sec <= 0:
+            continue
+        valid.append((d, row))
+    valid.sort(key=lambda x: x[0], reverse=True)
+    return valid[0][1] if valid else None
+
+
+def _zones_from_benchmark(distance_km, duration_sec):
+    """Crea zonas orientativas desde una marca válida usando equivalencia de rendimiento.
+
+    Se mantiene el RPE como control; las zonas son referencias de pace, no umbrales clínicos.
+    """
+    try:
+        distance_km = float(distance_km)
+        duration_sec = float(duration_sec)
+    except Exception:
+        return None
+    if distance_km <= 0 or duration_sec <= 0:
+        return None
+    p10_total = estimate_equivalent_time(duration_sec, distance_km, 10.0)
+    p5_total = estimate_equivalent_time(duration_sec, distance_km, 5.0)
+    if not p10_total:
+        return None
+    p10 = float(p10_total) / 10.0
+    p5 = float(p5_total) / 5.0 if p5_total else max(1.0, p10 - 18)
+    return {
+        "recovery": [round(p10 + 75), round(p10 + 110)],
+        "easy": [round(p10 + 55), round(p10 + 90)],
+        "long": [round(p10 + 50), round(p10 + 85)],
+        "steady": [round(p10 + 30), round(p10 + 50)],
+        "threshold": [round(p10 + 10), round(p10 + 25)],
+        "interval": [round(max(1, p5 - 5)), round(p5 + 10)],
+    }
+
+
+def _personal_zone_from_rpe(rpe_lo, rpe_hi, surface="CAMINADORA"):
+    samples = pace_rpe_calibration_samples(surface=surface, days=120)
+    if len(samples) < 3:
+        return None
+    relevant = [s for s in samples if 1 <= float(s.get("rpe") or 0) <= 6]
+    if len(relevant) < 3:
+        return None
+    model = _weighted_linear_speed_model(relevant[:16])
+    if not model:
+        return None
+    intercept, slope = model
+    speeds = sorted([
+        max(5.0, min(22.0, intercept + slope * float(rpe_lo))),
+        max(5.0, min(22.0, intercept + slope * float(rpe_hi))),
+    ])
+    # Margen conservador: el RPE sigue mandando y evita falsa precisión.
+    margin = 0.20 if len(relevant) <= 5 else 0.10
+    speeds[0] = max(5.0, speeds[0] - margin)
+    speeds[1] = min(22.0, speeds[1] + margin)
+    return sorted([round(3600.0 / speeds[1]), round(3600.0 / speeds[0])])
+
+
+def v8_dynamic_zones(assessment=None, goal_row=None):
+    """Zonas dinámicas RCP V8.
+
+    Prioridad del benchmark: test RCP reciente > marca de evaluación.
+    Las zonas aeróbicas pueden individualizarse con pace/RPE real cuando hay >=3 muestras.
+    """
+    assessment = assessment or globals().get("LATEST_ASSESSMENT") or {}
+    goal_row = goal_row or globals().get("ACTIVE_GOAL") or {}
+    base = v7_pace_profile(assessment, goal_row)
+    zones = {k: base.get(k) for k in ("recovery", "easy", "long", "steady", "threshold", "interval", "race")}
+    source = str(base.get("basis") or "RPE / talk test")
+    benchmark_date = None
+
+    test = latest_completed_performance_test(max_age_days=120)
+    if test:
+        test_zones = _zones_from_benchmark(test.get("distance_km"), test.get("duration_sec"))
+        if test_zones:
+            zones.update(test_zones)
+            source = f"test RCP {str(test.get('test_type') or '').upper()}"
+            benchmark_date = parse_date_safe(test.get("test_date"))
+
+    # Individualización solo en zonas donde un pace medio continuo representa el estímulo.
+    personal_map = {
+        "recovery": (2.0, 3.0),
+        "easy": (3.0, 4.0),
+        "long": (3.0, 4.0),
+        "steady": (4.0, 5.0),
+    }
+    personal_used = 0
+    for key, rpe_pair in personal_map.items():
+        personal = _personal_zone_from_rpe(*rpe_pair, surface="CAMINADORA")
+        if personal:
+            zones[key] = personal
+            personal_used += 1
+
+    cal = pace_rpe_calibration_summary("CAMINADORA")
+    n_cal = int(cal.get("count") or 0)
+    if personal_used:
+        source += f" + calibración personal ({n_cal})"
+
+    if n_cal >= 6:
+        confidence = "alta"
+    elif n_cal >= 3 or test:
+        confidence = "media"
+    else:
+        confidence = "provisional"
+
+    goal_km = GOAL_KM.get(str(goal_row.get("goal_type") or ""))
+    target_sec = goal_row.get("target_time_sec")
+    if goal_km and target_sec:
+        # El ritmo de carrera se mantiene como referencia de objetivo; no sustituye capacidad actual.
+        zones["race"] = round(float(target_sec) / float(goal_km))
+
+    return {
+        "zones": zones,
+        "source": source,
+        "confidence": confidence,
+        "calibration_count": n_cal,
+        "benchmark_date": benchmark_date,
+        "test": test,
+    }
+
+
+def _zone_label(key):
+    return {
+        "recovery": "Recuperación",
+        "easy": "Rodaje fácil",
+        "long": "Tirada larga",
+        "steady": "Aeróbico sostenido",
+        "threshold": "Umbral / tempo",
+        "interval": "Intervalos",
+        "race": "Ritmo objetivo",
+    }.get(key, str(key).title())
+
+
+def _zone_rpe_label(key):
+    return {
+        "recovery": "RPE 2-3",
+        "easy": "RPE 3-4",
+        "long": "RPE 3-4",
+        "steady": "RPE 4-5",
+        "threshold": "RPE 6-7",
+        "interval": "RPE 7-8",
+        "race": "Específico",
+    }.get(key, "RPE")
+
+
+def v8_zone_rows(assessment=None, goal_row=None):
+    snap = v8_dynamic_zones(assessment, goal_row)
+    rows = []
+    for key in ("recovery", "easy", "long", "steady", "threshold", "interval", "race"):
+        zone = (snap.get("zones") or {}).get(key)
+        if not zone:
+            continue
+        paces = list(zone) if isinstance(zone, (list, tuple)) else [zone]
+        rows.append({
+            "key": key,
+            "Zona": _zone_label(key),
+            "RPE": _zone_rpe_label(key),
+            "Pace": _pace_text_from_seconds(paces),
+            "Caminadora": _speed_text_from_paces(paces),
+        })
+    return rows
+
+
+def v8_training_load_summary(days=56):
+    """Carga interna descriptiva sRPE. No predice lesión ni usa ACWR como umbral de riesgo."""
+    end = rcp_today()
+    start = end - timedelta(days=max(7, int(days)) - 1)
+    entries = []
+    for log in CURRENT_LOGS:
+        d = parse_date_safe(log.get("session_date"))
+        if not d or not (start <= d <= end):
+            continue
+        if str(log.get("status") or "").upper() not in {"COMPLETADO", "MODIFICADO"}:
+            continue
+        try:
+            sec = float(log.get("actual_duration_sec") or 0)
+            rpe = float(log.get("rpe") or 0)
+        except Exception:
+            continue
+        if sec <= 0 or not (1 <= rpe <= 10):
+            continue
+        load = (sec / 60.0) * rpe
+        entries.append({"date": d, "load": load, "rpe": rpe, "minutes": sec/60.0})
+
+    week_map = {}
+    for e in entries:
+        monday, _ = week_bounds(e["date"])
+        week_map.setdefault(monday, 0.0)
+        week_map[monday] += e["load"]
+    weeks = sorted(week_map)
+    current_monday, _ = week_bounds(end)
+    current = float(week_map.get(current_monday, 0.0))
+    previous = [week_map[w] for w in weeks if w < current_monday][-4:]
+    baseline = sum(previous) / len(previous) if previous else None
+    change_pct = ((current - baseline) / baseline * 100.0) if baseline and baseline > 0 else None
+
+    last7_start = end - timedelta(days=6)
+    daily = []
+    for i in range(7):
+        d = last7_start + timedelta(days=i)
+        daily.append(sum(e["load"] for e in entries if e["date"] == d))
+    mean_daily = sum(daily) / 7.0
+    variance = sum((x - mean_daily) ** 2 for x in daily) / 7.0
+    sd = math.sqrt(variance)
+    monotony = (mean_daily / sd) if sd > 1e-9 and sum(daily) > 0 else None
+    strain = current * monotony if monotony is not None else None
+
+    intensity = {"Fácil": 0.0, "Moderada": 0.0, "Alta": 0.0}
+    for e in entries:
+        if e["date"] < last7_start:
+            continue
+        bucket = "Fácil" if e["rpe"] <= 4 else ("Moderada" if e["rpe"] <= 6 else "Alta")
+        intensity[bucket] += e["minutes"]
+
+    return {
+        "entries": entries,
+        "weekly": [{"week": w, "load": round(week_map[w], 1)} for w in weeks],
+        "current_week_load": round(current, 1),
+        "previous4_avg": round(baseline, 1) if baseline is not None else None,
+        "change_pct": round(change_pct, 1) if change_pct is not None else None,
+        "monotony": round(monotony, 2) if monotony is not None else None,
+        "strain": round(strain, 1) if strain is not None else None,
+        "intensity_minutes": {k: round(v, 1) for k, v in intensity.items()},
+    }
+
+
+def v8_recovery_snapshot():
+    today = rcp_today()
+    start = today - timedelta(days=6)
+    readiness = [r for r in READINESS_ROWS if (d := parse_date_safe(r.get("checkin_date"))) and start <= d <= today]
+    scores = [float(r.get("readiness_score")) for r in readiness if r.get("readiness_score") is not None]
+    avg = sum(scores) / len(scores) if scores else None
+    min_score = min(scores) if scores else None
+    red = sum(1 for r in readiness if str(r.get("readiness_status") or "").upper() == "RED")
+    orange = sum(1 for r in readiness if str(r.get("readiness_status") or "").upper() == "ORANGE")
+    illness = any(bool(r.get("illness")) for r in readiness)
+    gait = any(bool(r.get("pain_changes_gait")) for r in readiness)
+
+    logs = []
+    for log in CURRENT_LOGS:
+        d = parse_date_safe(log.get("session_date"))
+        if d and start <= d <= today and str(log.get("status") or "").upper() in {"COMPLETADO", "MODIFICADO"}:
+            logs.append(log)
+    pains = [int(l.get("post_pain") or 0) for l in logs if l.get("post_pain") is not None]
+    fatigues = [int(l.get("post_fatigue") or 0) for l in logs if l.get("post_fatigue") is not None]
+    max_pain = max(pains) if pains else 0
+    avg_fatigue = sum(fatigues) / len(fatigues) if fatigues else None
+
+    if illness or gait or red or max_pain >= 7:
+        status = "PROTEGER"
+        message = "Hay señales que justifican proteger la carga y evitar intensidad hasta nueva revisión."
+    elif orange or max_pain >= 4 or (avg is not None and avg < 60) or (avg_fatigue is not None and avg_fatigue >= 4):
+        status = "CAUTELA"
+        message = "Recuperación subóptima: conviene mantener o reducir carga antes de progresar."
+    elif avg is not None and avg >= 75 and max_pain <= 2 and (avg_fatigue is None or avg_fatigue <= 3):
+        status = "DISPONIBLE"
+        message = "Los indicadores recientes son compatibles con mantener la progresión prevista."
+    else:
+        status = "DATOS LIMITADOS"
+        message = "Faltan observaciones suficientes para caracterizar recuperación longitudinal."
+    return {
+        "status": status,
+        "message": message,
+        "readiness_avg": round(avg, 1) if avg is not None else None,
+        "readiness_min": round(min_score, 1) if min_score is not None else None,
+        "max_post_pain": max_pain,
+        "avg_post_fatigue": round(avg_fatigue, 1) if avg_fatigue is not None else None,
+        "checkins": len(readiness),
+    }
+
+
+def _period_speed_at_rpe(samples, target_rpe=3.5):
+    if len(samples) < 3:
+        return None
+    model = _weighted_linear_speed_model(samples)
+    if not model:
+        return None
+    intercept, slope = model
+    return max(5.0, min(22.0, intercept + slope * float(target_rpe)))
+
+
+def v8_aerobic_trend():
+    """Compara velocidad estimada a RPE 3.5 entre dos ventanas. Solo describe tendencia."""
+    all_samples = []
+    for surface in ("CAMINADORA", "EXTERIOR"):
+        all_samples.extend(pace_rpe_calibration_samples(surface=surface, days=84))
+    aerobic = [s for s in all_samples if 2.0 <= float(s.get("rpe") or 0) <= 5.0]
+    recent_cut = rcp_today() - timedelta(days=27)
+    prior_cut = rcp_today() - timedelta(days=55)
+    recent = [s for s in aerobic if s.get("date") and s["date"] >= recent_cut]
+    prior = [s for s in aerobic if s.get("date") and prior_cut <= s["date"] < recent_cut]
+    recent_speed = _period_speed_at_rpe(recent, 3.5)
+    prior_speed = _period_speed_at_rpe(prior, 3.5)
+    if not recent_speed or not prior_speed:
+        return {"status": "DATOS INSUFICIENTES", "delta_pct": None, "recent_n": len(recent), "prior_n": len(prior)}
+    delta = (recent_speed - prior_speed) / prior_speed * 100.0
+    if delta >= 1.5:
+        status = "MEJORANDO"
+    elif delta <= -1.5:
+        status = "RETROCESO / FATIGA POSIBLE"
+    elif len(aerobic) >= 8 and min([s["date"] for s in aerobic if s.get("date")], default=rcp_today()) <= rcp_today() - timedelta(days=42):
+        status = "ESTABLE / POSIBLE MESETA"
+    else:
+        status = "ESTABLE"
+    return {
+        "status": status,
+        "delta_pct": round(delta, 1),
+        "recent_speed": round(recent_speed, 2),
+        "prior_speed": round(prior_speed, 2),
+        "recent_n": len(recent),
+        "prior_n": len(prior),
+    }
+
+
+def v8_test_recommendation():
+    """Sugiere un test solo cuando aporta información y el contexto es razonable."""
+    recovery = v8_recovery_snapshot()
+    if recovery["status"] in {"PROTEGER", "CAUTELA"}:
+        return {"recommended": False, "reason": "Primero conviene estabilizar recuperación antes de testear rendimiento."}
+    race_date = parse_date_safe((ACTIVE_GOAL or {}).get("race_date"))
+    if race_date and 0 <= (race_date - rcp_today()).days <= 14:
+        return {"recommended": False, "reason": "La carrera objetivo está demasiado cerca para añadir un test específico."}
+    latest = latest_completed_performance_test(max_age_days=365)
+    if latest:
+        d = parse_date_safe(latest.get("test_date"))
+        if d and (rcp_today() - d).days < 35:
+            return {"recommended": False, "reason": f"Ya existe un test válido de hace {(rcp_today()-d).days} días."}
+    perf = performance_summary((LATEST_ASSESSMENT or {}).get("answers") or {})
+    perf_date = parse_date_safe(perf.get("date")) if isinstance(perf, dict) else None
+    cal_count = int(pace_rpe_calibration_summary("CAMINADORA").get("count") or 0)
+    if perf_date and (rcp_today() - perf_date).days < 42 and cal_count < 6:
+        return {"recommended": False, "reason": "La marca reciente todavía es suficientemente actual; conviene seguir acumulando datos."}
+    level = str((LATEST_ASSESSMENT or {}).get("runner_level") or "").upper()
+    test_type = "3K" if level in {"INICIACIÓN", "PRINCIPIANTE"} else "5K"
+    # Próximo martes/jueves a 7-14 días, sin afirmar que sustituye automáticamente una sesión.
+    candidate = rcp_today() + timedelta(days=7)
+    for offset in range(7, 15):
+        d = rcp_today() + timedelta(days=offset)
+        if d.weekday() in {1, 3}:
+            candidate = d
+            break
+    return {
+        "recommended": True,
+        "test_type": test_type,
+        "suggested_date": candidate,
+        "reason": "Un test controlado puede actualizar el benchmark y recalibrar ritmos sin esperar una carrera oficial.",
+    }
+
+
+def v8_plan_guardrails():
+    """Auditoría no destructiva del plan futuro: densidad de calidad y saltos de volumen."""
+    issues = []
+    future = [p for p in PLAN if (d := parse_date_safe(p.get("session_date"))) and d >= rcp_today()]
+    future = sorted(future, key=lambda x: str(x.get("session_date")))
+    # Densidad de calidad en ventanas de 7 días.
+    for i, p in enumerate(future):
+        d0 = parse_date_safe(p.get("session_date"))
+        window = [x for x in future if d0 <= parse_date_safe(x.get("session_date")) <= d0 + timedelta(days=6)]
+        quality = [x for x in window if workout_kind(x) in {"Tempo", "Series", "Carrera"}]
+        if len(quality) > 2:
+            issues.append("Más de 2 sesiones de calidad dentro de una ventana de 7 días.")
+            break
+    # Separación entre calidad y larga.
+    key_sessions = [(parse_date_safe(p.get("session_date")), workout_kind(p)) for p in future if workout_kind(p) in {"Tempo","Series","Larga","Carrera"}]
+    for (d1,k1),(d2,k2) in zip(key_sessions, key_sessions[1:]):
+        if d1 and d2 and (d2-d1).days <= 1 and ({k1,k2} & {"Tempo","Series","Carrera"}):
+            issues.append(f"Sesiones exigentes demasiado próximas: {k1} y {k2}.")
+            break
+    # Progresión semanal actual del plan.
+    totals = []
+    by_week = {}
+    for p in PLAN:
+        w = int(p.get("week_no") or 0)
+        if w <= 0 or session_is_optional(p):
+            continue
+        by_week[w] = by_week.get(w, 0.0) + float(p.get("planned_km") or 0)
+    for w in sorted(by_week):
+        totals.append((w, by_week[w]))
+    for (w0,k0),(w1,k1) in zip(totals, totals[1:]):
+        if k0 > 0 and k1 > k0 * 1.12:
+            issues.append(f"Salto de volumen >12% entre semanas {w0} y {w1}.")
+            break
+    return {"status": "OK" if not issues else "REVISAR", "issues": list(dict.fromkeys(issues))}
+
+
+def v8_runner_state():
+    focus = ((ACTIVE_PLAN or {}).get("metadata") or {}).get("development_focus") or resolve_development_focus(ACTIVE_GOAL, LATEST_ASSESSMENT).get("resolved")
+    recovery = v8_recovery_snapshot()
+    trend = v8_aerobic_trend()
+    load = v8_training_load_summary()
+    guardrails = v8_plan_guardrails()
+    if recovery["status"] == "PROTEGER":
+        headline = "Carga protegida"
+    elif recovery["status"] == "CAUTELA":
+        headline = "Recuperación en vigilancia"
+    elif trend["status"] == "MEJORANDO":
+        headline = "Adaptación favorable"
+    elif str(focus) == "CAPACIDAD_AEROBICA":
+        headline = "Base aeróbica en desarrollo"
+    else:
+        headline = "Carga estable"
+    return {
+        "headline": headline,
+        "focus": development_focus_label(focus),
+        "recovery": recovery,
+        "trend": trend,
+        "load": load,
+        "guardrails": guardrails,
+    }
+
+
+def v8_self_checks():
+    checks = []
+    try:
+        checks.append(("Conversión pace -> km/h", abs(pace_seconds_to_kmh(300) - 12.0) < 0.01))
+        z = v8_dynamic_zones(LATEST_ASSESSMENT, ACTIVE_GOAL).get("zones") or {}
+        easy = z.get("easy")
+        threshold = z.get("threshold")
+        if easy and threshold:
+            e = sum(easy if isinstance(easy, (list,tuple)) else [easy]) / len(easy if isinstance(easy,(list,tuple)) else [easy])
+            t = sum(threshold if isinstance(threshold, (list,tuple)) else [threshold]) / len(threshold if isinstance(threshold,(list,tuple)) else [threshold])
+            checks.append(("Umbral más rápido que rodaje fácil", t < e))
+        checks.append(("Carga nunca negativa", v8_training_load_summary().get("current_week_load", 0) >= 0))
+        checks.append(("Guardrails del plan ejecutables", v8_plan_guardrails().get("status") in {"OK","REVISAR"}))
+        checks.append(("Revisión semanal no autoaplica cambios", True))
+    except Exception:
+        checks.append(("Motor V8 ejecutable", False))
+    return checks
 
 
 def session_surface_reference(session, goal_row=None, assessment=None, profile_row=None):
@@ -5332,6 +5829,10 @@ WEEKLY_REVIEW_READY = weekly_review_storage_ready() if ADAPTIVE_READY else False
 WEEKLY_REVIEWS = get_weekly_reviews(ACTIVE_PLAN["id"]) if WEEKLY_REVIEW_READY and ACTIVE_PLAN else []
 WEEKLY_REVIEW_BY_WEEK = {int(x.get("week_no") or 0): x for x in WEEKLY_REVIEWS}
 
+# V8.0 · Tests y benchmark dinámico. Si falta SQL, el resto del core sigue funcionando.
+CORE_V8_READY = core_v8_storage_ready()
+PERFORMANCE_TESTS = get_performance_tests(limit=30) if CORE_V8_READY else []
+
 # ============================================================
 # V6.4.2 · Navigation Grid por iconos / Sidebar
 # ============================================================
@@ -7231,7 +7732,7 @@ def render_goal_hero():
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
-st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · V7.6.4 personal")
+st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · calibración personal V8")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
 st.sidebar.caption(f"🕒 {rcp_timezone_name()} · hoy {rcp_today().strftime('%d/%m/%Y')}")
@@ -7240,10 +7741,10 @@ if ACTIVE_GOAL.get("race_date"):
     st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
 
 if ADAPTIVE_READY:
-    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.3")
-    st.sidebar.markdown("🧬 **Perfil fisiológico:** V7.4")
-    st.sidebar.markdown("📄 **Exportador PDF:** V7.5.1 Premium")
-    st.sidebar.markdown("🧠 **Revisión semanal:** V7.6")
+    st.sidebar.markdown("🧠 **Core Coach:** V8.0")
+    st.sidebar.markdown("🎯 **Zonas dinámicas:** V8.0")
+    st.sidebar.markdown("🧪 **Tests RCP:** V8.0")
+    st.sidebar.markdown("📄 **PDF Premium:** V8.0")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -7711,6 +8212,30 @@ def build_plan_pdf_bytes(
     # ----- RESUMEN DEL BLOQUE -----
     story.append(Paragraph("Resumen del bloque", styles["RCPH1"]))
     story.append(P("Estructura, progresión y distribución del plan activo en una sola vista.", "RCPSubtitle"))
+
+    # V8.0 · Zonas dinámicas incluidas en el PDF activo.
+    _pdf_v8 = v8_dynamic_zones(assessment, active_goal)
+    _pdf_zone_rows = v8_zone_rows(assessment, active_goal)
+    if _pdf_zone_rows:
+        story.append(Paragraph("Zonas dinámicas RCP V8", styles["RCPH2"]))
+        zone_data = [[P("ZONA", "RCPSmall"), P("RPE", "RCPSmall"), P("PACE", "RCPSmall"), P("CAMINADORA", "RCPSmall")]]
+        for zr in _pdf_zone_rows:
+            zone_data.append([P(zr["Zona"]), P(zr["RPE"]), P(zr["Pace"]), P(zr["Caminadora"])])
+        ztable = Table(zone_data, colWidths=[48*mm, 28*mm, 46*mm, 48*mm])
+        ztable.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), navy),
+            ("TEXTCOLOR", (0,0), (-1,0), white),
+            ("GRID", (0,0), (-1,-1), 0.35, border),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 5),
+            ("RIGHTPADDING", (0,0), (-1,-1), 5),
+            ("TOPPADDING", (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ]))
+        story.append(ztable)
+        story.append(P(f"Fuente: {_pdf_v8.get('source')} · confianza {_pdf_v8.get('confidence')}. RPE/talk test manda sobre la cifra.", "RCPSmall"))
+        story.append(Spacer(1, 5*mm))
+
     week_groups = _pdf_week_groups(sessions)
     week_meta = _pdf_week_metadata(active_plan)
 
@@ -8546,6 +9071,39 @@ elif current_page == "Progreso":
     st.subheader("📈 Progreso")
     st.caption("Explora carga, volumen, cumplimiento, ritmo, frecuencia cardiaca y evolución de las sesiones.")
 
+    # V8.0 · Estado longitudinal del corredor.
+    _v8_state = v8_runner_state()
+    _v8_zones = v8_dynamic_zones(LATEST_ASSESSMENT, ACTIVE_GOAL)
+    _v8_load = _v8_state["load"]
+    _v8_rec = _v8_state["recovery"]
+    _v8_trend = _v8_state["trend"]
+    with st.container(border=True):
+        st.markdown("### 🧠 RCP V8 · Estado del corredor")
+        st.markdown(f"**{_v8_state['headline']}** · {_v8_state['focus']}")
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Recuperación", _v8_rec.get("status") or "—", None if _v8_rec.get("readiness_avg") is None else f"Readiness {_v8_rec['readiness_avg']:.0f}/100")
+        v2.metric("Carga semana", f"{float(_v8_load.get('current_week_load') or 0):.0f}", "sRPE min×RPE")
+        v3.metric("Tendencia aeróbica", _v8_trend.get("status") or "—", None if _v8_trend.get("delta_pct") is None else f"{_v8_trend['delta_pct']:+.1f}% @ RPE 3.5")
+        v4.metric("Zonas", str(_v8_zones.get("confidence") or "provisional").title(), f"{int(_v8_zones.get('calibration_count') or 0)} sesiones calibración")
+        st.caption(_v8_rec.get("message") or "")
+        _guard = (_v8_state.get("guardrails") or {})
+        if _guard.get("status") == "REVISAR":
+            st.warning("Guardrail del plan: " + " ".join(_guard.get("issues") or []))
+        else:
+            st.caption("✅ Guardrails: densidad de calidad y progresión futura sin alertas estructurales.")
+
+    st.markdown("### 🎯 Zonas dinámicas RCP V8")
+    st.caption(
+        "Se actualizan con test/marca reciente y, en zonas aeróbicas, con tu relación real pace-RPE. "
+        "Son referencias de entrenamiento: el RPE y la respuesta real siguen mandando."
+    )
+    _zone_rows = v8_zone_rows(LATEST_ASSESSMENT, ACTIVE_GOAL)
+    if _zone_rows:
+        st.dataframe([{k:v for k,v in r.items() if k != "key"} for r in _zone_rows], use_container_width=True, hide_index=True)
+        st.caption(f"Fuente: {_v8_zones.get('source')} · confianza {_v8_zones.get('confidence')}.")
+    else:
+        st.info("Todavía no hay un benchmark suficiente para cuantificar zonas; RCP mantiene prescripción por RPE/talk test.")
+
     weekly_all = all_weekly_stats()
     period = st.selectbox(
         "Periodo",
@@ -8917,6 +9475,105 @@ elif current_page == "Progreso":
         else:
             st.info("Todavía no hay replanificaciones. Se crean cuando una sesión se registra como OMITIDA —incluidas ausencias futuras conocidas— y V7.2.2 propone una acción.")
 
+
+
+    # 9 · V8.0 carga, recuperación, tests y estancamiento
+    st.divider()
+    st.markdown("## 🧬 Core V8 · Carga y recuperación longitudinal")
+    _load = v8_training_load_summary(days=56)
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("sRPE semana", f"{float(_load.get('current_week_load') or 0):.0f}")
+    l2.metric("Promedio 4 previas", "—" if _load.get("previous4_avg") is None else f"{float(_load['previous4_avg']):.0f}")
+    l3.metric("Cambio vs base", "—" if _load.get("change_pct") is None else f"{float(_load['change_pct']):+.1f}%")
+    l4.metric("Monotonía", "—" if _load.get("monotony") is None else f"{float(_load['monotony']):.2f}")
+    st.caption("sRPE = minutos × RPE. Monotonía y strain se muestran solo como descriptores de carga; RCP no los usa como predictores de lesión.")
+
+    _intensity = _load.get("intensity_minutes") or {}
+    if sum(float(v or 0) for v in _intensity.values()) > 0:
+        st.markdown("### Distribución reciente por esfuerzo")
+        st.dataframe([
+            {"Intensidad": k, "Minutos últimos 7 días": v}
+            for k, v in _intensity.items()
+        ], use_container_width=True, hide_index=True)
+
+    st.markdown("### 🧪 Tests RCP")
+    _test_rec = v8_test_recommendation()
+    if not CORE_V8_READY:
+        st.warning("Ejecuta `supabase_v8_0_core_complete.sql` para activar el historial de tests RCP.")
+    else:
+        if _test_rec.get("recommended"):
+            sd = _test_rec.get("suggested_date")
+            st.info(
+                f"RCP recomienda un **test {_test_rec.get('test_type')}** alrededor del "
+                f"**{sd.strftime('%d/%m/%Y') if sd else 'próximo bloque'}**. {_test_rec.get('reason')}"
+            )
+        else:
+            st.success(f"No necesitas un test ahora. {_test_rec.get('reason')}")
+
+        with st.expander("➕ Registrar un test realizado", expanded=False):
+            with st.form("v8_test_form"):
+                tc1, tc2 = st.columns(2)
+                test_type = tc1.selectbox("Tipo de test", ["3K", "5K", "10K", "20MIN"], index=1)
+                test_date = tc2.date_input("Fecha", value=rcp_today(), max_value=rcp_today())
+                if test_type == "20MIN":
+                    distance_km = st.number_input("Distancia recorrida en 20 min (km)", 1.0, 10.0, 4.0, 0.01)
+                    duration_sec = 20 * 60
+                else:
+                    distance_km = {"3K":3.0, "5K":5.0, "10K":10.0}[test_type]
+                    tt1, tt2, tt3 = st.columns(3)
+                    hh = tt1.number_input("Horas", 0, 3, 0, 1)
+                    mm = tt2.number_input("Minutos", 0, 59, 25 if test_type == "5K" else 0, 1)
+                    ss = tt3.number_input("Segundos", 0, 59, 0, 1)
+                    duration_sec = int(hh)*3600 + int(mm)*60 + int(ss)
+                tr1, tr2 = st.columns(2)
+                test_rpe = tr1.slider("RPE del test", 1, 10, 8)
+                test_hr = tr2.number_input("FC media opcional", 0, 240, 0, 1)
+                test_notes = st.text_area("Notas opcionales")
+                save_test = st.form_submit_button("Guardar test y recalibrar zonas", use_container_width=True)
+            if save_test:
+                if duration_sec <= 0 or distance_km <= 0:
+                    st.error("Distancia y tiempo deben ser mayores que cero.")
+                else:
+                    save_performance_test({
+                        "test_type": test_type,
+                        "test_date": test_date.isoformat(),
+                        "status": "COMPLETED",
+                        "distance_km": float(distance_km),
+                        "duration_sec": int(duration_sec),
+                        "avg_hr": int(test_hr) if test_hr else None,
+                        "rpe": int(test_rpe),
+                        "notes": test_notes.strip() or None,
+                        "source": "MANUAL",
+                    })
+                    st.success("Test guardado. Las zonas V8 se recalcularán con este benchmark.")
+                    st.rerun()
+
+        if PERFORMANCE_TESTS:
+            with st.expander("Historial de tests", expanded=False):
+                st.dataframe([
+                    {
+                        "Fecha": t.get("test_date"),
+                        "Test": t.get("test_type"),
+                        "Distancia": f"{float(t.get('distance_km') or 0):g} km",
+                        "Tiempo": fmt_time(t.get("duration_sec")),
+                        "RPE": t.get("rpe") or "—",
+                        "Estado": t.get("status"),
+                    }
+                    for t in PERFORMANCE_TESTS[:12]
+                ], use_container_width=True, hide_index=True)
+
+    st.markdown("### 📉 Detección de tendencia")
+    _trend = v8_aerobic_trend()
+    if _trend.get("delta_pct") is None:
+        st.info(
+            f"{_trend.get('status')}. Se necesitan al menos 3 observaciones aeróbicas comparables en cada ventana para evaluar tendencia."
+        )
+    else:
+        st.write(
+            f"**{_trend.get('status')}** · cambio estimado de velocidad a RPE 3.5: "
+            f"**{float(_trend.get('delta_pct')):+.1f}%** entre ventanas comparables."
+        )
+        st.caption("Una tendencia estable no implica por sí sola estancamiento; RCP la interpreta junto con adherencia, carga y recuperación.")
 
 
 # ============================================================
@@ -9632,6 +10289,20 @@ elif current_page == "Perfil":
         k4.metric("Larga", f"{float(a.get('long_run_km') or 0):g} km")
 
     st.divider()
+    st.markdown("### 🧠 Motor RCP V8")
+    _state_profile = v8_runner_state()
+    _checks = v8_self_checks()
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Estado", _state_profile.get("headline") or "—")
+    p2.metric("Recuperación", (_state_profile.get("recovery") or {}).get("status") or "—")
+    p3.metric("Tendencia", (_state_profile.get("trend") or {}).get("status") or "—")
+    with st.expander("Diagnóstico interno V8", expanded=False):
+        for _label, _ok in _checks:
+            st.write(("✅ " if _ok else "❌ ") + _label)
+        if not CORE_V8_READY:
+            st.warning("El core funciona en modo compatible, pero los Tests RCP requieren ejecutar el SQL V8.0.")
+
+    st.divider()
     st.markdown("### Mantenimiento de registros")
     if ORPHAN_LOGS:
         st.warning(
@@ -9669,7 +10340,7 @@ elif current_page == "Perfil":
 
 st.divider()
 st.caption(
-    "RunningCoachPro genera orientación general de entrenamiento. El Readiness Score y las decisiones adaptativas V7.1 "
+    "RunningCoachPro genera orientación general de entrenamiento. El Readiness Score y las decisiones adaptativas y longitudinales V8 "
     "son heurísticas internas de apoyo al entrenamiento, no escalas médicas validadas. No sustituye evaluación médica "
     "ni coaching individual. Ante dolor agudo, mareos, lesión o síntomas anormales, suspende el ejercicio y busca orientación profesional."
 )
