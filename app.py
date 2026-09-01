@@ -3,6 +3,7 @@ import streamlit as st
 from datetime import date, datetime, timedelta, timezone
 import math
 import re
+import html
 from supabase import create_client
 
 st.set_page_config(
@@ -13,74 +14,204 @@ st.set_page_config(
 )
 
 # ============================================================
-# Diseño responsive web + celular
+# V6.4 · Diseño UI/UX responsive
 # ============================================================
 st.markdown(
     """
     <style>
-    .block-container {
-        max-width: 1180px;
-        padding-top: 1rem;
-        padding-bottom: 4rem;
+    :root {
+        --rcp-ink: #0f172a;
+        --rcp-muted: #64748b;
+        --rcp-blue: #2563eb;
+        --rcp-blue-soft: rgba(37, 99, 235, .09);
+        --rcp-green: #16a34a;
+        --rcp-orange: #ea580c;
+        --rcp-violet: #7c3aed;
+        --rcp-border: rgba(100, 116, 139, .20);
+        --rcp-surface: rgba(248, 250, 252, .78);
     }
+
+    .block-container {
+        max-width: 1220px;
+        padding-top: 1rem;
+        padding-bottom: 4.5rem;
+    }
+
+    /* Header / hero */
+    .rcp-hero {
+        border: 1px solid var(--rcp-border);
+        border-radius: 22px;
+        padding: 1.15rem 1.25rem;
+        margin: .15rem 0 1rem 0;
+        background:
+            radial-gradient(circle at 95% 10%, rgba(37,99,235,.14), transparent 32%),
+            linear-gradient(135deg, rgba(248,250,252,.96), rgba(241,245,249,.78));
+    }
+    .rcp-eyebrow {
+        color: var(--rcp-blue);
+        font-size: .78rem;
+        font-weight: 800;
+        letter-spacing: .09em;
+        text-transform: uppercase;
+        margin-bottom: .18rem;
+    }
+    .rcp-hero h2 {
+        margin: 0;
+        color: var(--rcp-ink);
+        font-size: 1.72rem;
+        line-height: 1.12;
+    }
+    .rcp-hero p {
+        margin: .38rem 0 0 0;
+        color: var(--rcp-muted);
+    }
+    .rcp-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .45rem;
+        margin-top: .8rem;
+    }
+    .rcp-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: .3rem;
+        padding: .34rem .62rem;
+        border-radius: 999px;
+        border: 1px solid var(--rcp-border);
+        background: rgba(255,255,255,.72);
+        color: var(--rcp-ink);
+        font-size: .82rem;
+        font-weight: 700;
+    }
+
+    /* KPI cards */
+    [data-testid="stMetric"] {
+        border: 1px solid var(--rcp-border);
+        border-radius: 17px;
+        padding: .82rem .9rem;
+        background: var(--rcp-surface);
+    }
+    [data-testid="stMetricLabel"] {
+        color: var(--rcp-muted);
+        font-weight: 700;
+    }
+    [data-testid="stMetricValue"] {
+        color: var(--rcp-ink);
+        font-weight: 800;
+    }
+
+    /* Containers */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: var(--rcp-border) !important;
+        border-radius: 18px !important;
+    }
+
+    /* Buttons = navigation cards / CTAs */
     .stButton > button,
     .stDownloadButton > button,
     [data-testid="stFormSubmitButton"] > button {
         min-height: 48px;
-        border-radius: 12px;
-        font-weight: 600;
+        border-radius: 14px;
+        font-weight: 750;
+        border-width: 1px;
+        transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
     }
+    .stButton > button:hover,
+    .stDownloadButton > button:hover,
+    [data-testid="stFormSubmitButton"] > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 7px 18px rgba(15,23,42,.08);
+    }
+    button[kind="primary"] {
+        min-height: 58px !important;
+        font-size: 1.02rem !important;
+    }
+
+    /* Inputs */
     div[data-baseweb="input"] input,
     textarea {
         min-height: 44px;
         font-size: 16px !important;
     }
+
+    /* Progress */
+    .stProgress > div > div > div > div {
+        border-radius: 999px;
+    }
+
+    /* Dataframes / charts */
+    [data-testid="stDataFrame"],
+    [data-testid="stVegaLiteChart"] {
+        border-radius: 14px;
+        overflow: hidden;
+    }
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {
+        border-right: 1px solid var(--rcp-border);
+    }
+
+    /* Remove unused tab-strip look if any library widget creates tabs */
     .stTabs [data-baseweb="tab-list"] {
-        gap: .25rem;
+        gap: .3rem;
         overflow-x: auto;
         white-space: nowrap;
     }
-    .stTabs [data-baseweb="tab"] {
-        min-height: 44px;
-        flex: 0 0 auto;
-    }
-    [data-testid="stDataFrame"] {
-        overflow-x: auto;
-    }
+
     @media (max-width: 768px) {
         .block-container {
-            padding-left: .85rem;
-            padding-right: .85rem;
-            padding-top: .65rem;
+            padding-left: .72rem;
+            padding-right: .72rem;
+            padding-top: .55rem;
             padding-bottom: 5rem;
         }
-        h1 { font-size: 1.9rem !important; line-height: 1.15 !important; }
-        h2 { font-size: 1.45rem !important; }
-        h3 { font-size: 1.15rem !important; }
+        .rcp-hero {
+            border-radius: 18px;
+            padding: .95rem 1rem;
+        }
+        .rcp-hero h2 {
+            font-size: 1.42rem;
+        }
+        h1 { font-size: 1.82rem !important; line-height: 1.12 !important; }
+        h2 { font-size: 1.38rem !important; }
+        h3 { font-size: 1.12rem !important; }
 
         [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
-            gap: .55rem !important;
+            gap: .48rem !important;
         }
         [data-testid="column"] {
-            flex: 1 1 100% !important;
-            width: 100% !important;
-            min-width: 100% !important;
+            flex: 1 1 46% !important;
+            width: auto !important;
+            min-width: 138px !important;
         }
         [data-testid="stMetric"] {
-            border: 1px solid rgba(128,128,128,.20);
-            border-radius: 14px;
-            padding: .75rem .85rem;
+            padding: .68rem .72rem;
         }
-        [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
-
+        [data-testid="stMetricValue"] {
+            font-size: 1.42rem !important;
+        }
         .stButton > button,
         .stDownloadButton > button,
         [data-testid="stFormSubmitButton"] > button {
             width: 100% !important;
             min-height: 50px;
         }
-        [data-testid="stVegaLiteChart"] { width: 100% !important; }
+        button[kind="primary"] {
+            min-height: 56px !important;
+        }
+        [data-testid="stVegaLiteChart"] {
+            width: 100% !important;
+        }
+    }
+
+    @media (max-width: 360px) {
+        [data-testid="column"] {
+            min-width: 132px !important;
+        }
+        .rcp-pill {
+            font-size: .76rem;
+        }
     }
     </style>
     """,
@@ -99,7 +230,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.3.2"
+APP_VERSION = "6.4.0"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -2942,29 +3073,272 @@ ORPHAN_LOGS = get_unassigned_logs() + [
 LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
 # ============================================================
-# Navegación / Sidebar
+# V6.4 · Navegación por iconos / Sidebar
 # ============================================================
+PAGE_META = {
+    "Hoy": ("🏠", "Inicio"),
+    "Semana": ("📅", "Calendario"),
+    "Progreso": ("📈", "Gráficos"),
+    "Plan": ("🗓️", "Plan completo"),
+    "Registro": ("✅", "Entrenamiento"),
+    "Objetivo": ("🎯", "Meta activa"),
+    "Evaluación": ("🧭", "Perfil RCP"),
+    "Perfil": ("⚙️", "Cuenta"),
+}
+
+
+def set_page(page, target_day=None):
+    st.session_state["rcp_page"] = page
+    if target_day is not None:
+        # Se aplica antes de crear el date_input en el siguiente rerun.
+        st.session_state["rcp_pending_day"] = target_day
+
+
+def render_icon_navigation():
+    current = st.session_state.get("rcp_page", "Hoy")
+    items = list(PAGE_META.items())
+
+    for start in (0, 4):
+        cols = st.columns(4)
+        for col, (page, (icon, subtitle)) in zip(cols, items[start:start + 4]):
+            with col:
+                is_active = current == page
+                if st.button(
+                    f"{icon}  {page}",
+                    key=f"nav_{page}",
+                    use_container_width=True,
+                    type="primary" if is_active else "secondary",
+                    help=subtitle,
+                ):
+                    set_page(page)
+                    st.rerun()
+                st.caption(subtitle)
+
+
+def parse_date_safe(value):
+    try:
+        return date.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def workout_kind(session):
+    text = (
+        f"{session.get('workout_type') or ''} "
+        f"{session.get('workout_name') or ''} "
+        f"{session.get('intensity') or ''}"
+    ).upper()
+    if "CARRERA" in text or "COMPET" in text:
+        return "Carrera"
+    if "LARGA" in text or "TIRADA" in text:
+        return "Larga"
+    if "SERIE" in text or "INTERVAL" in text:
+        return "Series"
+    if "TEMPO" in text or "UMBRAL" in text:
+        return "Tempo"
+    if "RODAJE" in text or "SUAVE" in text or "RECUP" in text:
+        return "Rodaje"
+    if "FUERZA" in text:
+        return "Fuerza"
+    return str(session.get("workout_type") or "Otro").title()
+
+
+def status_label_for_date(day_value):
+    log = LOG_BY_DATE.get(day_value.isoformat())
+    if log:
+        status = str(log.get("status") or "").upper()
+        if status == "COMPLETADO":
+            return "✅ Completado"
+        if status == "MODIFICADO":
+            return "🟡 Modificado"
+        if status == "OMITIDO":
+            return "⏭️ Omitido"
+    if day_value < date.today():
+        return "⚠️ Pendiente"
+    if day_value == date.today():
+        return "⏱️ Hoy"
+    return "○ Pendiente"
+
+
+def week_bounds(day_value):
+    monday = day_value - timedelta(days=day_value.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+def week_snapshot(day_value):
+    monday, sunday = week_bounds(day_value)
+    sessions = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date"))) and monday <= d <= sunday
+    ]
+    base_sessions = [p for p in sessions if not session_is_optional(p)]
+    planned_km = sum(float(p.get("planned_km") or 0) for p in base_sessions)
+
+    real_logs = []
+    for log in CURRENT_LOGS:
+        d = parse_date_safe(log.get("session_date"))
+        if not d or not (monday <= d <= sunday):
+            continue
+        if str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO"):
+            real_logs.append(log)
+
+    real_km = sum(float(l.get("actual_km") or 0) for l in real_logs)
+    rpes_local = [float(l["rpe"]) for l in real_logs if l.get("rpe") is not None]
+    avg_rpe_local = sum(rpes_local) / len(rpes_local) if rpes_local else None
+
+    due = [
+        p for p in base_sessions
+        if (d := parse_date_safe(p.get("session_date"))) and d <= date.today()
+    ]
+    done = [
+        p for p in due
+        if str(LOG_BY_DATE.get(str(p.get("session_date")), {}).get("status") or "").upper()
+        in ("COMPLETADO", "MODIFICADO")
+    ]
+    pct = (len(done) / len(due) * 100) if due else None
+    return {
+        "monday": monday,
+        "sunday": sunday,
+        "sessions": sessions,
+        "base_sessions": base_sessions,
+        "planned_km": planned_km,
+        "real_km": real_km,
+        "avg_rpe": avg_rpe_local,
+        "due": len(due),
+        "done": len(done),
+        "compliance": pct,
+    }
+
+
+def all_weekly_stats():
+    weekly = {}
+    for p in PLAN:
+        week = int(p.get("week_no") or 0)
+        d = parse_date_safe(p.get("session_date"))
+        if not d:
+            continue
+        item = weekly.setdefault(
+            week,
+            {
+                "week": week,
+                "start": d - timedelta(days=d.weekday()),
+                "plan": 0.0,
+                "real": 0.0,
+                "rpes": [],
+                "load": 0.0,
+                "due": 0,
+                "done": 0,
+            },
+        )
+        item["start"] = min(item["start"], d - timedelta(days=d.weekday()))
+        if not session_is_optional(p):
+            item["plan"] += float(p.get("planned_km") or 0)
+            if d <= date.today():
+                item["due"] += 1
+                status = str(LOG_BY_DATE.get(d.isoformat(), {}).get("status") or "").upper()
+                if status in ("COMPLETADO", "MODIFICADO"):
+                    item["done"] += 1
+
+    for log in CURRENT_LOGS:
+        if str(log.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
+            continue
+        p = PLAN_BY_DATE.get(str(log.get("session_date")))
+        if not p:
+            continue
+        week = int(p.get("week_no") or 0)
+        item = weekly.get(week)
+        if not item:
+            continue
+        item["real"] += float(log.get("actual_km") or 0)
+        if log.get("rpe") is not None:
+            item["rpes"].append(float(log["rpe"]))
+        duration_sec = float(log.get("actual_duration_sec") or 0)
+        if duration_sec > 0 and log.get("rpe") is not None:
+            # session-RPE: duración en minutos × RPE
+            item["load"] += (duration_sec / 60.0) * float(log["rpe"])
+
+    return [weekly[k] for k in sorted(weekly)]
+
+
+def render_goal_hero():
+    goal_name = html.escape(str(ACTIVE_GOAL.get("goal_type") or "Objetivo"))
+    race_day = parse_date_safe(ACTIVE_GOAL.get("race_date"))
+    target_sec = ACTIVE_GOAL.get("target_time_sec")
+    target_label = fmt_time(target_sec) if target_sec else "Sin marca objetivo"
+    if race_day:
+        days = (race_day - date.today()).days
+        race_label = race_day.strftime("%d/%m/%Y")
+        countdown = f"{days} días" if days >= 0 else "Finalizado"
+    else:
+        race_label = "Sin fecha"
+        countdown = "Bloque abierto"
+
+    active_week = "—"
+    if PLAN:
+        past = [
+            p for p in PLAN
+            if (d := parse_date_safe(p.get("session_date"))) and d <= date.today()
+        ]
+        future = [
+            p for p in PLAN
+            if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+        ]
+        ref = past[-1] if past else (future[0] if future else PLAN[-1])
+        active_week = str(ref.get("week_no") or "—")
+
+    display_name_safe = html.escape(str(profile.get("display_name") or "Runner"))
+    st.markdown(
+        f"""
+        <div class="rcp-hero">
+          <div class="rcp-eyebrow">RUNNINGCOACHPRO · V{APP_VERSION}</div>
+          <h2>Hola, {display_name_safe} 👋</h2>
+          <p>Tu entrenamiento de hoy, tu objetivo y tu progreso en un solo lugar.</p>
+          <div class="rcp-pills">
+            <span class="rcp-pill">🎯 {goal_name}</span>
+            <span class="rcp-pill">📅 {race_label}</span>
+            <span class="rcp-pill">⏳ {countdown}</span>
+            <span class="rcp-pill">⏱️ {target_label}</span>
+            <span class="rcp-pill">🗓️ Semana {active_week}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption(f"V{APP_VERSION} Multiusuario · Web + móvil")
+st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
-st.sidebar.markdown(f"🎯 **Objetivo:** {ACTIVE_GOAL.get('goal_type') or '—'}")
-st.sidebar.markdown(f"📅 **Días/sem:** {profile['days_per_week']}")
-st.sidebar.markdown(f"📏 **Base:** {float(profile['weekly_km']):g} km/sem")
+st.sidebar.markdown(f"🎯 **{ACTIVE_GOAL.get('goal_type') or '—'}**")
+if ACTIVE_GOAL.get("race_date"):
+    st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
+
 if LATEST_ASSESSMENT:
     _side_score = int(LATEST_ASSESSMENT.get("runner_score") or 0)
     _side_level = str(LATEST_ASSESSMENT.get("runner_level") or "—")
     _side_explanation = LATEST_ASSESSMENT.get("explanation") or {}
     _side_profile = _side_explanation.get("runner_profile") or {}
-    _side_display = (_side_profile.get("classification") or {}).get("level_display") or runner_level_display(_side_level, _side_score)
-    st.sidebar.markdown(
-        f"🧭 **Nivel RCP:** {str(_side_display).title()} · {_side_score}/100"
+    _side_display = (
+        (_side_profile.get("classification") or {}).get("level_display")
+        or runner_level_display(_side_level, _side_score)
     )
+    st.sidebar.markdown(f"🧭 **{str(_side_display).title()}** · {_side_score}/100")
+
+if "rcp_pending_day" in st.session_state:
+    st.session_state["selected_day_picker"] = st.session_state.pop("rcp_pending_day")
+elif "selected_day_picker" not in st.session_state:
+    st.session_state["selected_day_picker"] = date.today()
 
 selected_day = st.sidebar.date_input(
-    "Fecha",
-    value=date.today(),
+    "Explorar fecha",
+    key="selected_day_picker",
 )
+
+if st.sidebar.button("↩️ Volver a Hoy", use_container_width=True):
+    set_page("Hoy", date.today())
+    st.rerun()
 
 with st.sidebar.expander("📲 Añadir al celular"):
     st.markdown(
@@ -2980,11 +3354,15 @@ if st.sidebar.button("Cerrar sesión", use_container_width=True):
     clear_session()
     st.rerun()
 
+
 # ============================================================
-# Dashboard
+# V6.4 · Dashboard global
 # ============================================================
-st.title("🏃 RunningCoachPro")
-st.caption(f"Hola, {profile['display_name']} · Tu plan, tus datos, tu progreso")
+if "rcp_page" not in st.session_state:
+    st.session_state["rcp_page"] = "Hoy"
+
+if st.session_state["rcp_page"] not in PAGE_META:
+    st.session_state["rcp_page"] = "Hoy"
 
 completed = [
     l for l in CURRENT_LOGS
@@ -2995,7 +3373,8 @@ actual_km_total = sum(float(x.get("actual_km") or 0) for x in completed)
 dashboard_day = date.today()
 due_sessions = [
     p for p in PLAN
-    if date.fromisoformat(str(p["session_date"])) <= dashboard_day
+    if (d := parse_date_safe(p.get("session_date")))
+    and d <= dashboard_day
     and not session_is_optional(p)
 ]
 done_due = [
@@ -3005,219 +3384,611 @@ done_due = [
 ]
 compliance = (len(done_due) / len(due_sessions) * 100) if due_sessions else 0
 
-rpes = [
-    float(x["rpe"]) for x in completed
-    if x.get("rpe") is not None
-]
+rpes = [float(x["rpe"]) for x in completed if x.get("rpe") is not None]
 avg_rpe = sum(rpes) / len(rpes) if rpes else None
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Cumplimiento", "—" if not due_sessions else f"{compliance:.0f}%")
-m2.metric("KM reales", f"{actual_km_total:.1f}")
-m3.metric("RPE promedio", "—" if avg_rpe is None else f"{avg_rpe:.1f}/10")
-m4.metric("Sesiones del plan", len(PLAN))
+render_goal_hero()
+render_icon_navigation()
+st.divider()
 
-tabs = st.tabs([
-    "📍 Hoy",
-    "📅 Semana",
-    "📊 Progreso",
-    "🗓️ Plan",
-    "✅ Registro",
-    "🎯 Objetivo",
-    "🧭 Evaluación",
-    "⚙️ Perfil",
-])
+current_page = st.session_state.get("rcp_page", "Hoy")
+icon, subtitle = PAGE_META[current_page]
+
 
 # ============================================================
-# HOY
+# 🏠 HOY · Home real
 # ============================================================
-with tabs[0]:
-    st.subheader(f"{DAY_NAMES[selected_day.weekday()]} · {selected_day.strftime('%d/%m/%Y')}")
-    session = PLAN_BY_DATE.get(selected_day.isoformat())
-
-    if not session:
-        st.markdown("## 😴 Descanso / recuperación")
-        st.write("No hay una sesión programada para esta fecha.")
-        future = [
-            p for p in PLAN
-            if date.fromisoformat(str(p["session_date"])) > selected_day
-        ]
-        if future:
-            nxt = future[0]
-            st.info(
-                f"Próxima: {date.fromisoformat(str(nxt['session_date'])).strftime('%d/%m')} · "
-                f"{nxt['workout_name']} · {float(nxt['planned_km']):g} km"
-            )
+if current_page == "Hoy":
+    if selected_day == date.today():
+        st.subheader("🏠 Hoy")
     else:
-        st.markdown(f"## {session['workout_name']}")
-        st.caption(
-            f"{session['workout_type']} · Semana {session['week_no']} · "
-            f"{session['intensity']}"
+        st.subheader(f"📍 {DAY_NAMES[selected_day.weekday()]} · {selected_day.strftime('%d/%m/%Y')}")
+        st.caption("Estás explorando otra fecha. Usa “Volver a Hoy” para regresar al inicio.")
+
+    today_session = PLAN_BY_DATE.get(selected_day.isoformat())
+    today_log = LOG_BY_DATE.get(selected_day.isoformat())
+
+    with st.container(border=True):
+        if not today_session:
+            st.markdown("### 😴 Recuperación")
+            st.write("No hay una sesión programada para esta fecha.")
+            future = [
+                p for p in PLAN
+                if (d := parse_date_safe(p.get("session_date"))) and d > selected_day
+            ]
+            if future:
+                nxt = future[0]
+                nxt_day = parse_date_safe(nxt["session_date"])
+                st.info(
+                    f"Próxima sesión: **{nxt_day.strftime('%d/%m')} · {nxt['workout_name']} · "
+                    f"{float(nxt.get('planned_km') or 0):g} km**"
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("📅 Ver semana", use_container_width=True):
+                    set_page("Semana", nxt_day)
+                    st.rerun()
+                if c2.button("🗓️ Ver plan", use_container_width=True):
+                    set_page("Plan")
+                    st.rerun()
+        else:
+            status_label = status_label_for_date(selected_day)
+            st.caption(f"{workout_kind(today_session).upper()} · {status_label}")
+            st.markdown(f"## {today_session['workout_name']}")
+            st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
+
+            a, b, c, dcol = st.columns(4)
+            a.metric("Distancia", f"{float(today_session.get('planned_km') or 0):g} km")
+            b.metric("Semana", int(today_session.get("week_no") or 0))
+            c.metric("Intensidad", str(today_session.get("intensity") or "—").title())
+            dcol.metric("Estado", status_label.replace("✅ ", "").replace("🟡 ", "").replace("⏭️ ", "").replace("⏱️ ", "").replace("⚠️ ", ""))
+
+            with st.expander("📋 Cómo hacerlo", expanded=False):
+                st.write(today_session.get("description") or "Sin instrucciones adicionales.")
+
+            if today_log:
+                status = str(today_log.get("status") or "").upper()
+                if status in ("COMPLETADO", "MODIFICADO"):
+                    st.success(
+                        f"{status} ✅ · {float(today_log.get('actual_km') or 0):g} km · "
+                        f"{fmt_pace(today_log.get('actual_duration_sec'), today_log.get('actual_km'))} · "
+                        f"RPE {today_log.get('rpe') or '—'}"
+                    )
+                elif status == "OMITIDO":
+                    st.warning("Sesión marcada como omitida.")
+
+            q1, q2, q3 = st.columns(3)
+            if q1.button("✅ Registrar", use_container_width=True, type="primary"):
+                set_page("Registro", selected_day)
+                st.rerun()
+            if q2.button("📅 Mi semana", use_container_width=True):
+                set_page("Semana", selected_day)
+                st.rerun()
+            if q3.button("📈 Ver progreso", use_container_width=True):
+                set_page("Progreso")
+                st.rerun()
+
+    # Resumen semanal
+    st.markdown("### Esta semana")
+    snap = week_snapshot(date.today())
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Plan", f"{snap['planned_km']:.1f} km")
+    s2.metric("Real", f"{snap['real_km']:.1f} km")
+    s3.metric(
+        "Cumplimiento",
+        "—" if snap["compliance"] is None else f"{snap['compliance']:.0f}%",
+    )
+    s4.metric(
+        "RPE medio",
+        "—" if snap["avg_rpe"] is None else f"{snap['avg_rpe']:.1f}/10",
+    )
+
+    if snap["compliance"] is not None:
+        st.progress(min(1.0, max(0.0, snap["compliance"] / 100)))
+        st.caption(f"{snap['done']} de {snap['due']} sesiones base vencidas completadas.")
+
+    # Vista rápida de 4 semanas
+    weekly_all = all_weekly_stats()
+    if weekly_all:
+        today_monday, _ = week_bounds(date.today())
+        eligible = [w for w in weekly_all if w["start"] <= today_monday]
+        preview = (eligible[-4:] if eligible else weekly_all[:4])
+        quick_values = []
+        for w in preview:
+            quick_values.extend([
+                {"Semana": f"S{w['week']}", "Serie": "Plan", "KM": round(w["plan"], 1)},
+                {"Semana": f"S{w['week']}", "Serie": "Real", "KM": round(w["real"], 1)},
+            ])
+        st.markdown("### 📊 Últimas semanas")
+        st.vega_lite_chart(
+            {
+                "data": {"values": quick_values},
+                "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4, "tooltip": True},
+                "encoding": {
+                    "x": {"field": "Semana", "type": "ordinal", "title": None},
+                    "xOffset": {"field": "Serie"},
+                    "y": {"field": "KM", "type": "quantitative", "title": "KM"},
+                    "color": {"field": "Serie", "type": "nominal"},
+                    "tooltip": [
+                        {"field": "Semana", "type": "ordinal"},
+                        {"field": "Serie", "type": "nominal"},
+                        {"field": "KM", "type": "quantitative"},
+                    ],
+                },
+                "height": 220,
+            },
+            use_container_width=True,
         )
 
-        a, b, c = st.columns(3)
-        a.metric("Distancia", f"{float(session['planned_km']):g} km")
-        b.metric("Objetivo", session["target"])
-        b.caption("Ritmo / esfuerzo")
-        c.metric("Semana", session["week_no"])
+    st.markdown("### Próximos entrenamientos")
+    upcoming = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+    ][:4]
+    if not upcoming:
+        st.info("No quedan sesiones futuras en el plan activo.")
+    else:
+        for p in upcoming:
+            d = parse_date_safe(p["session_date"])
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([1.05, 2.6, 1])
+                c1.markdown(f"**{DAY_NAMES[d.weekday()]}**")
+                c1.caption(d.strftime("%d/%m"))
+                c2.markdown(f"**{p['workout_name']}**")
+                c2.caption(f"{workout_kind(p)} · {p.get('target') or 'Por esfuerzo'}")
+                c3.markdown(f"**{float(p.get('planned_km') or 0):g} km**")
+                if c3.button("Abrir", key=f"home_open_{p['id']}", use_container_width=True):
+                    set_page("Registro", d)
+                    st.rerun()
 
-        st.markdown("### 📋 Cómo hacerlo")
-        st.write(session["description"])
-
-        log = LOG_BY_DATE.get(selected_day.isoformat())
-        if log:
-            status = str(log.get("status") or "").upper()
-            if status in ("COMPLETADO", "MODIFICADO"):
-                st.success(
-                    f"{status} ✅ · {float(log.get('actual_km') or 0):g} km · "
-                    f"{fmt_pace(log.get('actual_duration_sec'), log.get('actual_km'))} · "
-                    f"RPE {log.get('rpe') or '—'}"
-                )
-            elif status == "OMITIDO":
-                st.warning("Sesión marcada como omitida.")
 
 # ============================================================
-# SEMANA
+# 📅 SEMANA
 # ============================================================
-with tabs[1]:
-    monday = selected_day - timedelta(days=selected_day.weekday())
-    sunday = monday + timedelta(days=6)
-    st.subheader(f"{monday.strftime('%d/%m')} – {sunday.strftime('%d/%m/%Y')}")
+elif current_page == "Semana":
+    monday, sunday = week_bounds(selected_day)
+    title_col, prev_col, next_col = st.columns([3.5, 1, 1])
+    title_col.subheader(f"📅 Semana · {monday.strftime('%d/%m')} – {sunday.strftime('%d/%m/%Y')}")
+    if prev_col.button("← Anterior", use_container_width=True):
+        set_page("Semana", selected_day - timedelta(days=7))
+        st.rerun()
+    if next_col.button("Siguiente →", use_container_width=True):
+        set_page("Semana", selected_day + timedelta(days=7))
+        st.rerun()
+
+    snap = week_snapshot(selected_day)
+    w1, w2, w3, w4 = st.columns(4)
+    w1.metric("Plan base", f"{snap['planned_km']:.1f} km")
+    w2.metric("Real", f"{snap['real_km']:.1f} km")
+    w3.metric("Sesiones", len(snap["sessions"]))
+    w4.metric(
+        "Cumplimiento",
+        "—" if snap["compliance"] is None else f"{snap['compliance']:.0f}%",
+    )
 
     for i in range(7):
         d = monday + timedelta(days=i)
         s = PLAN_BY_DATE.get(d.isoformat())
-
         with st.container(border=True):
-            c1, c2, c3 = st.columns([1, 2.8, 1.2])
+            c1, c2, c3, c4 = st.columns([1, 2.7, 1, 1])
             c1.markdown(f"**{DAY_NAMES[d.weekday()]}**")
             c1.caption(d.strftime("%d/%m"))
-
             if s:
                 c2.markdown(f"**{s['workout_name']}**")
-                c2.caption(f"{s['workout_type']} · {s['target']}")
-                c3.markdown(f"**{float(s['planned_km']):g} km**")
-
-                log = LOG_BY_DATE.get(d.isoformat())
-                if log:
-                    c3.caption(str(log.get("status") or "").title())
-                else:
-                    c3.caption("Pendiente")
+                c2.caption(f"{workout_kind(s)} · {s.get('target') or 'Por esfuerzo'}")
+                c3.markdown(f"**{float(s.get('planned_km') or 0):g} km**")
+                c3.caption(status_label_for_date(d))
+                if c4.button("Abrir", key=f"week_open_{s['id']}", use_container_width=True):
+                    set_page("Registro", d)
+                    st.rerun()
             else:
-                c2.markdown("**😴 Descanso**")
-                c2.caption("Recuperación")
+                c2.markdown("**😴 Descanso / recuperación**")
+                c2.caption("Sin sesión planificada")
+                c3.caption("—")
+
 
 # ============================================================
-# PROGRESO
+# 📈 PROGRESO · Dashboard analítico
 # ============================================================
-with tabs[2]:
-    st.subheader("PLAN vs REAL")
+elif current_page == "Progreso":
+    st.subheader("📈 Progreso")
+    st.caption("Explora carga, volumen, cumplimiento, ritmo, frecuencia cardiaca y evolución de las sesiones.")
 
-    weekly = {}
-    for p in PLAN:
-        week = int(p["week_no"])
-        weekly.setdefault(week, {"plan": 0.0, "real": 0.0, "rpes": []})
-        # PLAN vs REAL usa la carga base; los rodajes opcionales no inflan el plan.
-        if not session_is_optional(p):
-            weekly[week]["plan"] += float(p["planned_km"] or 0)
-
-    for l in CURRENT_LOGS:
-        if str(l.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
-            continue
-        p = PLAN_BY_DATE.get(str(l["session_date"]))
-        if not p:
-            continue
-        week = int(p["week_no"])
-        weekly.setdefault(week, {"plan": 0.0, "real": 0.0, "rpes": []})
-        weekly[week]["real"] += float(l.get("actual_km") or 0)
-        if l.get("rpe") is not None:
-            weekly[week]["rpes"].append(float(l["rpe"]))
-
-    values = []
-    for week in sorted(weekly):
-        values.append({"Semana": str(week), "Serie": "Plan base", "KM": round(weekly[week]["plan"], 1)})
-        values.append({"Semana": str(week), "Serie": "Real", "KM": round(weekly[week]["real"], 1)})
-
-    st.vega_lite_chart(
-        {
-            "data": {"values": values},
-            "mark": {"type": "bar", "tooltip": True},
-            "encoding": {
-                "x": {"field": "Semana", "type": "ordinal"},
-                "xOffset": {"field": "Serie"},
-                "y": {"field": "KM", "type": "quantitative", "title": "KM"},
-                "color": {"field": "Serie", "type": "nominal"},
-                "tooltip": [
-                    {"field": "Semana", "type": "ordinal"},
-                    {"field": "Serie", "type": "nominal"},
-                    {"field": "KM", "type": "quantitative"},
-                ],
-            },
-        },
-        use_container_width=True,
+    weekly_all = all_weekly_stats()
+    period = st.selectbox(
+        "Periodo",
+        ["Hasta hoy", "Últimas 4 semanas", "Últimas 8 semanas", "Plan completo"],
+        index=1,
     )
 
-    rpe_values = [
-        {
-            "Semana": str(week),
-            "RPE": round(sum(data["rpes"]) / len(data["rpes"]), 1),
-        }
-        for week, data in weekly.items()
-        if data["rpes"]
-    ]
+    current_monday, _ = week_bounds(date.today())
+    past_current = [w for w in weekly_all if w["start"] <= current_monday]
+    if period == "Últimas 4 semanas":
+        weekly_view = past_current[-4:] if past_current else weekly_all[:4]
+    elif period == "Últimas 8 semanas":
+        weekly_view = past_current[-8:] if past_current else weekly_all[:8]
+    elif period == "Hasta hoy":
+        weekly_view = past_current
+    else:
+        weekly_view = weekly_all
 
-    st.markdown("### RPE semanal")
-    if rpe_values:
+    view_weeks = {w["week"] for w in weekly_view}
+    plan_km_view = sum(w["plan"] for w in weekly_view)
+    real_km_view = sum(w["real"] for w in weekly_view)
+    due_view = sum(w["due"] for w in weekly_view)
+    done_view = sum(w["done"] for w in weekly_view)
+    compliance_view = (done_view / due_view * 100) if due_view else None
+    load_view = sum(w["load"] for w in weekly_view)
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("KM plan", f"{plan_km_view:.1f}")
+    p2.metric("KM real", f"{real_km_view:.1f}")
+    p3.metric("Cumplimiento", "—" if compliance_view is None else f"{compliance_view:.0f}%")
+    p4.metric("Carga sRPE", "—" if load_view <= 0 else f"{load_view:.0f}")
+
+    # 1 · Plan vs real
+    st.markdown("### Plan vs real")
+    values = []
+    for w in weekly_view:
+        values.extend([
+            {"Semana": f"S{w['week']}", "Serie": "Plan base", "KM": round(w["plan"], 1)},
+            {"Semana": f"S{w['week']}", "Serie": "Real", "KM": round(w["real"], 1)},
+        ])
+    if values:
         st.vega_lite_chart(
             {
-                "data": {"values": rpe_values},
-                "mark": {"type": "line", "point": True, "tooltip": True},
+                "data": {"values": values},
+                "mark": {"type": "bar", "tooltip": True, "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
                 "encoding": {
-                    "x": {"field": "Semana", "type": "ordinal"},
-                    "y": {
-                        "field": "RPE",
-                        "type": "quantitative",
-                        "scale": {"domain": [1, 10]},
-                    },
+                    "x": {"field": "Semana", "type": "ordinal", "title": None},
+                    "xOffset": {"field": "Serie"},
+                    "y": {"field": "KM", "type": "quantitative", "title": "KM"},
+                    "color": {"field": "Serie", "type": "nominal"},
+                    "tooltip": [
+                        {"field": "Semana", "type": "ordinal"},
+                        {"field": "Serie", "type": "nominal"},
+                        {"field": "KM", "type": "quantitative"},
+                    ],
                 },
+                "height": 290,
             },
             use_container_width=True,
         )
     else:
-        st.info("Todavía no hay suficientes RPE registrados.")
+        st.info("No hay semanas disponibles para este periodo.")
+
+    # 2 · Cumplimiento + RPE
+    c_left, c_right = st.columns(2)
+    with c_left:
+        st.markdown("### Cumplimiento semanal")
+        compliance_values = [
+            {
+                "Semana": f"S{w['week']}",
+                "Cumplimiento": round(w["done"] / w["due"] * 100, 1),
+                "Completadas": w["done"],
+                "Vencidas": w["due"],
+            }
+            for w in weekly_view if w["due"] > 0
+        ]
+        if compliance_values:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": compliance_values},
+                    "mark": {"type": "bar", "tooltip": True, "cornerRadiusTopLeft": 5, "cornerRadiusTopRight": 5},
+                    "encoding": {
+                        "x": {"field": "Semana", "type": "ordinal", "title": None},
+                        "y": {
+                            "field": "Cumplimiento",
+                            "type": "quantitative",
+                            "scale": {"domain": [0, 100]},
+                            "title": "%",
+                        },
+                        "tooltip": [
+                            {"field": "Semana"},
+                            {"field": "Cumplimiento"},
+                            {"field": "Completadas"},
+                            {"field": "Vencidas"},
+                        ],
+                    },
+                    "height": 250,
+                },
+                use_container_width=True,
+            )
+        else:
+            st.info("Todavía no hay sesiones base vencidas.")
+
+    with c_right:
+        st.markdown("### RPE semanal")
+        rpe_values = [
+            {
+                "Semana": f"S{w['week']}",
+                "RPE": round(sum(w["rpes"]) / len(w["rpes"]), 1),
+            }
+            for w in weekly_view if w["rpes"]
+        ]
+        if rpe_values:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": rpe_values},
+                    "mark": {"type": "line", "point": True, "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Semana", "type": "ordinal", "title": None},
+                        "y": {
+                            "field": "RPE",
+                            "type": "quantitative",
+                            "scale": {"domain": [1, 10]},
+                            "title": "RPE",
+                        },
+                        "tooltip": [{"field": "Semana"}, {"field": "RPE"}],
+                    },
+                    "height": 250,
+                },
+                use_container_width=True,
+            )
+        else:
+            st.info("Todavía no hay RPE registrados.")
+
+    # 3 · Carga sRPE
+    st.markdown("### Carga interna semanal · session-RPE")
+    load_values = [
+        {"Semana": f"S{w['week']}", "Carga": round(w["load"], 0)}
+        for w in weekly_view if w["load"] > 0
+    ]
+    if load_values:
+        st.vega_lite_chart(
+            {
+                "data": {"values": load_values},
+                "mark": {"type": "area", "line": True, "point": True, "tooltip": True, "opacity": 0.28},
+                "encoding": {
+                    "x": {"field": "Semana", "type": "ordinal", "title": None},
+                    "y": {"field": "Carga", "type": "quantitative", "title": "min × RPE"},
+                    "tooltip": [{"field": "Semana"}, {"field": "Carga"}],
+                },
+                "height": 250,
+            },
+            use_container_width=True,
+        )
+        st.caption("Carga sRPE = duración real de la sesión en minutos × RPE. Solo usa registros con duración y RPE.")
+    else:
+        st.info("Registra duración y RPE para calcular carga interna.")
+
+    # 4 · Tirada larga
+    st.markdown("### Evolución de tirada larga")
+    long_values = []
+    for p in PLAN:
+        week = int(p.get("week_no") or 0)
+        if week not in view_weeks or workout_kind(p) != "Larga":
+            continue
+        d = parse_date_safe(p.get("session_date"))
+        log = LOG_BY_DATE.get(str(p.get("session_date"))) or {}
+        long_values.append({
+            "Fecha": d.isoformat() if d else str(p.get("session_date")),
+            "Serie": "Plan",
+            "KM": round(float(p.get("planned_km") or 0), 1),
+        })
+        if str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO"):
+            long_values.append({
+                "Fecha": d.isoformat() if d else str(p.get("session_date")),
+                "Serie": "Real",
+                "KM": round(float(log.get("actual_km") or 0), 1),
+            })
+    if long_values:
+        st.vega_lite_chart(
+            {
+                "data": {"values": long_values},
+                "mark": {"type": "line", "point": True, "tooltip": True},
+                "encoding": {
+                    "x": {"field": "Fecha", "type": "temporal", "title": None},
+                    "y": {"field": "KM", "type": "quantitative", "title": "KM"},
+                    "color": {"field": "Serie", "type": "nominal"},
+                    "tooltip": [{"field": "Fecha", "type": "temporal"}, {"field": "Serie"}, {"field": "KM"}],
+                },
+                "height": 260,
+            },
+            use_container_width=True,
+        )
+    else:
+        st.info("No hay tiradas largas en el periodo seleccionado.")
+
+    # 5 · Ritmo + FC
+    pace_values = []
+    hr_values = []
+    type_km = {}
+    for log in completed:
+        p = PLAN_BY_DATE.get(str(log.get("session_date")))
+        if not p or int(p.get("week_no") or 0) not in view_weeks:
+            continue
+        d = parse_date_safe(log.get("session_date"))
+        km = float(log.get("actual_km") or 0)
+        sec = float(log.get("actual_duration_sec") or 0)
+        if km > 0 and sec > 0:
+            pace_values.append({
+                "Fecha": d.isoformat() if d else str(log.get("session_date")),
+                "Ritmo": round((sec / km) / 60.0, 3),
+                "Sesión": str(p.get("workout_name") or ""),
+            })
+        if log.get("avg_hr") is not None and float(log.get("avg_hr") or 0) > 0:
+            hr_values.append({
+                "Fecha": d.isoformat() if d else str(log.get("session_date")),
+                "FC": int(log.get("avg_hr")),
+                "Sesión": str(p.get("workout_name") or ""),
+            })
+        kind = workout_kind(p)
+        type_km[kind] = type_km.get(kind, 0.0) + km
+
+    trend_left, trend_right = st.columns(2)
+    with trend_left:
+        st.markdown("### Ritmo real")
+        if pace_values:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": pace_values},
+                    "mark": {"type": "line", "point": True, "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Fecha", "type": "temporal", "title": None},
+                        "y": {
+                            "field": "Ritmo",
+                            "type": "quantitative",
+                            "title": "min/km",
+                            "scale": {"reverse": True},
+                        },
+                        "tooltip": [
+                            {"field": "Fecha", "type": "temporal"},
+                            {"field": "Ritmo", "type": "quantitative", "format": ".2f"},
+                            {"field": "Sesión"},
+                        ],
+                    },
+                    "height": 250,
+                },
+                use_container_width=True,
+            )
+        else:
+            st.info("Registra distancia y duración para ver tu tendencia de ritmo.")
+
+    with trend_right:
+        st.markdown("### FC media")
+        if hr_values:
+            st.vega_lite_chart(
+                {
+                    "data": {"values": hr_values},
+                    "mark": {"type": "line", "point": True, "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Fecha", "type": "temporal", "title": None},
+                        "y": {"field": "FC", "type": "quantitative", "title": "lpm", "scale": {"zero": False}},
+                        "tooltip": [{"field": "Fecha", "type": "temporal"}, {"field": "FC"}, {"field": "Sesión"}],
+                    },
+                    "height": 250,
+                },
+                use_container_width=True,
+            )
+        else:
+            st.info("Registra FC media para activar este gráfico.")
+
+    # 6 · Distribución
+    st.markdown("### Distribución de kilómetros realizados")
+    distribution_values = [
+        {"Tipo": kind, "KM": round(km, 1)}
+        for kind, km in sorted(type_km.items(), key=lambda x: x[1], reverse=True)
+        if km > 0
+    ]
+    if distribution_values:
+        st.vega_lite_chart(
+            {
+                "data": {"values": distribution_values},
+                "mark": {"type": "arc", "innerRadius": 55, "tooltip": True},
+                "encoding": {
+                    "theta": {"field": "KM", "type": "quantitative"},
+                    "color": {"field": "Tipo", "type": "nominal"},
+                    "tooltip": [{"field": "Tipo"}, {"field": "KM"}],
+                },
+                "height": 300,
+            },
+            use_container_width=True,
+        )
+    else:
+        st.info("Completa entrenamientos para ver la distribución por tipo.")
+
 
 # ============================================================
-# PLAN COMPLETO
+# 🗓️ PLAN
 # ============================================================
-with tabs[3]:
-    st.subheader("Mi plan")
+elif current_page == "Plan":
+    st.subheader("🗓️ Mi plan")
+    st.caption("Filtra el ciclo y abre una sesión para revisar su detalle.")
+
+    types = sorted({workout_kind(p) for p in PLAN})
+    f1, f2, f3 = st.columns(3)
+    type_filter = f1.selectbox("Tipo", ["Todos"] + types)
+    status_filter = f2.selectbox("Estado", ["Todos", "Pendiente", "Completado", "Modificado", "Omitido"])
+    weeks = sorted({int(p.get("week_no") or 0) for p in PLAN})
+    week_filter = f3.selectbox("Semana", ["Todas"] + [str(w) for w in weeks])
+
     table = []
+    filtered_plan = []
     for p in PLAN:
-        log = LOG_BY_DATE.get(str(p["session_date"]))
+        d = parse_date_safe(p.get("session_date"))
+        log = LOG_BY_DATE.get(str(p.get("session_date")))
+        status = str(log.get("status") or "PENDIENTE").title() if log else "Pendiente"
+        kind = workout_kind(p)
+        if type_filter != "Todos" and kind != type_filter:
+            continue
+        if status_filter != "Todos" and status.lower() != status_filter.lower():
+            continue
+        if week_filter != "Todas" and int(p.get("week_no") or 0) != int(week_filter):
+            continue
+        filtered_plan.append(p)
         table.append({
-            "Fecha": date.fromisoformat(str(p["session_date"])).strftime("%d/%m/%Y"),
-            "Semana": p["week_no"],
-            "Tipo": p["workout_type"],
-            "Entrenamiento": p["workout_name"],
-            "KM": float(p["planned_km"]),
-            "Objetivo": p["target"],
-            "Opcional": "SÍ" if session_is_optional(p) else "NO",
-            "Estado": str(log.get("status") or "PENDIENTE") if log else "PENDIENTE",
+            "Fecha": d.strftime("%d/%m/%Y") if d else str(p.get("session_date")),
+            "Semana": p.get("week_no"),
+            "Tipo": kind,
+            "Entrenamiento": p.get("workout_name"),
+            "KM": float(p.get("planned_km") or 0),
+            "Objetivo": p.get("target"),
+            "Opcional": "Sí" if session_is_optional(p) else "No",
+            "Estado": status,
         })
+
     st.dataframe(table, use_container_width=True, hide_index=True)
 
-# ============================================================
-# REGISTRO
-# ============================================================
-with tabs[4]:
-    st.subheader("Registrar entrenamiento")
-    session = PLAN_BY_DATE.get(selected_day.isoformat())
+    if filtered_plan:
+        labels = {
+            f"{parse_date_safe(p['session_date']).strftime('%d/%m')} · {p['workout_name']}": p
+            for p in filtered_plan
+        }
+        chosen = st.selectbox("Abrir detalle de una sesión", list(labels.keys()))
+        p = labels[chosen]
+        with st.container(border=True):
+            st.markdown(f"### {p['workout_name']}")
+            st.caption(
+                f"{workout_kind(p)} · Semana {p.get('week_no')} · "
+                f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
+            )
+            st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
+            st.write(p.get("description") or "Sin instrucciones adicionales.")
+            d = parse_date_safe(p.get("session_date"))
+            if st.button("✅ Ir a registrar esta sesión", use_container_width=True, type="primary"):
+                set_page("Registro", d)
+                st.rerun()
 
+
+# ============================================================
+# ✅ REGISTRO
+# ============================================================
+elif current_page == "Registro":
+    st.subheader("✅ Registrar entrenamiento")
+    st.caption(f"Fecha seleccionada: {selected_day.strftime('%d/%m/%Y')}")
+
+    session = PLAN_BY_DATE.get(selected_day.isoformat())
     if not session:
-        st.info("Selecciona una fecha que tenga entrenamiento programado.")
+        st.info("Selecciona en la barra lateral una fecha que tenga entrenamiento programado.")
+        nearby = [
+            p for p in PLAN
+            if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+        ][:5]
+        if nearby:
+            st.markdown("### Próximas sesiones")
+            for p in nearby:
+                d = parse_date_safe(p["session_date"])
+                if st.button(
+                    f"{d.strftime('%d/%m')} · {p['workout_name']} · {float(p.get('planned_km') or 0):g} km",
+                    key=f"reg_pick_{p['id']}",
+                    use_container_width=True,
+                ):
+                    set_page("Registro", d)
+                    st.rerun()
     else:
         existing = LOG_BY_DATE.get(selected_day.isoformat(), {})
+        with st.container(border=True):
+            st.caption(f"{workout_kind(session).upper()} · SEMANA {session.get('week_no')}")
+            st.markdown(f"## {session['workout_name']}")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Plan", f"{float(session.get('planned_km') or 0):g} km")
+            r2.metric("Objetivo", str(session.get("target") or "Por esfuerzo"))
+            r3.metric("Estado", status_label_for_date(selected_day).split(" ", 1)[-1])
+            with st.expander("📋 Instrucciones"):
+                st.write(session.get("description") or "Sin instrucciones adicionales.")
+
         with st.form("log_form"):
+            st.markdown("### ¿Cómo salió?")
             r1, r2, r3 = st.columns(3)
             km = r1.number_input(
                 "KM reales",
@@ -3233,31 +4004,18 @@ with tabs[4]:
             rpe = r3.slider("RPE", 1, 10, int(existing.get("rpe") or 5))
 
             h1, h2 = st.columns(2)
-            avg_hr = h1.number_input(
-                "FC media (opcional)",
-                0, 230,
-                int(existing.get("avg_hr") or 0),
-            )
-            max_hr = h2.number_input(
-                "FC máxima (opcional)",
-                0, 240,
-                int(existing.get("max_hr") or 0),
-            )
+            avg_hr = h1.number_input("FC media (opcional)", 0, 230, int(existing.get("avg_hr") or 0))
+            max_hr = h2.number_input("FC máxima (opcional)", 0, 240, int(existing.get("max_hr") or 0))
 
             status_options = ["COMPLETADO", "MODIFICADO", "OMITIDO"]
             current_status = str(existing.get("status") or "COMPLETADO").upper()
             status = st.selectbox(
                 "Estado",
                 status_options,
-                index=status_options.index(current_status)
-                if current_status in status_options else 0,
+                index=status_options.index(current_status) if current_status in status_options else 0,
             )
-            notes = st.text_area(
-                "Observaciones",
-                value=str(existing.get("notes") or ""),
-            )
-
-            submit = st.form_submit_button("💾 Guardar", use_container_width=True)
+            notes = st.text_area("Observaciones", value=str(existing.get("notes") or ""))
+            submit = st.form_submit_button("💾 Guardar entrenamiento", use_container_width=True)
 
         if submit:
             seconds = parse_hms(duration_text) if duration_text else 0
@@ -3281,15 +4039,13 @@ with tabs[4]:
                     "status": status,
                     "notes": notes.strip(),
                 })
-                st.success("Guardado permanentemente ✅")
+                st.success("Entrenamiento guardado ✅")
+                set_page("Hoy", selected_day)
                 st.rerun()
 
         if existing:
             st.divider()
-            st.caption(
-                "Si este registro fue una prueba o quedó mal guardado, puedes eliminarlo "
-                "sin modificar la sesión planificada."
-            )
+            st.caption("Puedes eliminar un registro erróneo sin modificar la sesión planificada.")
             if st.button(
                 "🗑️ Eliminar registro de esta fecha",
                 key=f"delete_log_{selected_day.isoformat()}",
@@ -3299,17 +4055,20 @@ with tabs[4]:
                 st.success("Registro eliminado.")
                 st.rerun()
 
-# ============================================================
-# OBJETIVO / PLANES HISTÓRICOS
-# ============================================================
-with tabs[5]:
-    goal_management_ui(ACTIVE_GOAL, ACTIVE_PLAN, profile, LATEST_ASSESSMENT)
 
 # ============================================================
-# EVALUACIÓN RCP
+# 🎯 OBJETIVO
 # ============================================================
-with tabs[6]:
-    st.subheader("Evaluación del corredor")
+elif current_page == "Objetivo":
+    st.subheader("🎯 Objetivo")
+    goal_management_ui(ACTIVE_GOAL, ACTIVE_PLAN, profile, LATEST_ASSESSMENT)
+
+
+# ============================================================
+# 🧭 EVALUACIÓN
+# ============================================================
+elif current_page == "Evaluación":
+    st.subheader("🧭 Evaluación del corredor")
     if not ASSESSMENT_READY:
         st.error(
             "Falta instalar el módulo V6.2 en Supabase. Ejecuta el archivo "
@@ -3318,8 +4077,8 @@ with tabs[6]:
     elif LATEST_ASSESSMENT:
         show_assessment_result(LATEST_ASSESSMENT)
         st.caption(
-            "Reevaluarte NO modifica tu objetivo oficial ni tu plan activo. El resultado queda guardado como historial "
-            "y servirá como snapshot actualizado del corredor."
+            "Reevaluarte NO modifica tu objetivo oficial ni tu plan activo. "
+            "El resultado queda guardado como historial y sirve como snapshot actualizado del corredor."
         )
         with st.expander("🔄 Hacer una nueva evaluación"):
             assessment_form(existing_assessment=LATEST_ASSESSMENT)
@@ -3340,7 +4099,10 @@ with tabs[6]:
                 a_level = str(a.get("runner_level") or "")
                 a_score = int(a.get("runner_score") or 0)
                 a_profile = a_explanation.get("runner_profile") or {}
-                a_display = (a_profile.get("classification") or {}).get("level_display") or runner_level_display(a_level, a_score)
+                a_display = (
+                    (a_profile.get("classification") or {}).get("level_display")
+                    or runner_level_display(a_level, a_score)
+                )
                 a_base = (a_profile.get("readiness") or {}).get("base")
                 if not a_base:
                     a_base, _ = base_goal_readiness(a_answers, str(a.get("safety_status") or ""))
@@ -3349,21 +4111,23 @@ with tabs[6]:
                     "Versión": a.get("assessment_version"),
                     "Nivel": str(a_display).title(),
                     "Score": a_score,
-                    "Objetivo": a.get("goal"),
-                    "Base objetivo": a_base,
+                    "Objetivo evaluado": a.get("goal"),
+                    "Base": a_base,
                 })
             st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
         st.info("Aún no has realizado tu evaluación RCP.")
         assessment_form(onboarding=True)
 
+
 # ============================================================
-# PERFIL
+# ⚙️ PERFIL
 # ============================================================
-with tabs[7]:
-    st.subheader("Mi perfil")
+elif current_page == "Perfil":
+    st.subheader("⚙️ Mi perfil")
     st.caption(
-        "El objetivo deportivo se gestiona ahora en 🎯 Objetivo. Cambiar nombre o consultar tu perfil ya no regenera ni borra el plan."
+        "El objetivo deportivo se gestiona en 🎯 Objetivo. "
+        "Editar tu identidad no regenera ni elimina el plan."
     )
 
     with st.form("profile_identity_form"):
@@ -3379,23 +4143,21 @@ with tabs[7]:
 
     if LATEST_ASSESSMENT:
         st.markdown("### Perfil RCP vigente")
-        st.write(
-            f"**Nivel:** {str(LATEST_ASSESSMENT.get('runner_level') or '—').title()} · "
-            f"**Score:** {int(LATEST_ASSESSMENT.get('runner_score') or 0)}/100"
-        )
         a = LATEST_ASSESSMENT.get("answers") or {}
-        st.caption(
-            f"Base declarada: {float(a.get('weekly_km') or 0):g} km/sem · "
-            f"{int(a.get('current_days') or 0)} días/sem · "
-            f"larga {float(a.get('long_run_km') or 0):g} km"
-        )
+        score = int(LATEST_ASSESSMENT.get("runner_score") or 0)
+        level = str(LATEST_ASSESSMENT.get("runner_level") or "—").title()
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Nivel", level)
+        k2.metric("Score", f"{score}/100")
+        k3.metric("Base", f"{float(a.get('weekly_km') or 0):g} km/sem")
+        k4.metric("Larga", f"{float(a.get('long_run_km') or 0):g} km")
 
     st.divider()
     st.markdown("### Mantenimiento de registros")
     if ORPHAN_LOGS:
         st.warning(
             f"Hay {len(ORPHAN_LOGS)} registro(s) que no pertenecen al plan vigente. "
-            "Ya no se incluyen en los KPI ni en los gráficos."
+            "No se incluyen en KPI ni gráficos."
         )
         orphan_rows = [
             {
@@ -3418,14 +4180,13 @@ with tabs[7]:
             st.success("Registros fuera del plan eliminados.")
             st.rerun()
     else:
-        st.success("No hay registros huérfanos o de planes anteriores.")
+        st.success("No hay registros huérfanos o fuera del plan activo.")
 
     st.divider()
     st.markdown("### Cuenta")
     st.write(f"Correo: **{USER_EMAIL}**")
-    st.caption(
-        "Cada cuenta accede únicamente a sus propias filas gracias a las políticas RLS."
-    )
+    st.caption("Cada cuenta accede únicamente a sus propias filas mediante las políticas RLS.")
+
 
 st.divider()
 st.caption(
