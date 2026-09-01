@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V6.4 · Diseño UI/UX responsive
+# V6.4.1 · Diseño UI/UX responsive · Mobile polish
 # ============================================================
 st.markdown(
     """
@@ -176,29 +176,42 @@ st.markdown(
         h2 { font-size: 1.38rem !important; }
         h3 { font-size: 1.12rem !important; }
 
+        /* En móvil, cualquier fila de columnas se reorganiza realmente a 2 columnas.
+           El selector hijo directo vence el apilado 100% que Streamlit aplica por defecto. */
         [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
             gap: .48rem !important;
+            align-items: stretch !important;
         }
-        [data-testid="column"] {
-            flex: 1 1 46% !important;
-            width: auto !important;
-            min-width: 138px !important;
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            flex: 0 0 calc(50% - .24rem) !important;
+            width: calc(50% - .24rem) !important;
+            max-width: calc(50% - .24rem) !important;
+            min-width: 0 !important;
         }
         [data-testid="stMetric"] {
-            padding: .68rem .72rem;
+            min-height: 94px;
+            padding: .58rem .66rem;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: .82rem !important;
         }
         [data-testid="stMetricValue"] {
-            font-size: 1.42rem !important;
+            font-size: 1.32rem !important;
+            line-height: 1.12 !important;
         }
         .stButton > button,
         .stDownloadButton > button,
         [data-testid="stFormSubmitButton"] > button {
             width: 100% !important;
-            min-height: 50px;
+            min-height: 46px !important;
+            padding: .48rem .62rem !important;
+            font-size: .94rem !important;
+            line-height: 1.15 !important;
         }
         button[kind="primary"] {
-            min-height: 56px !important;
+            min-height: 48px !important;
+            font-size: .96rem !important;
         }
         [data-testid="stVegaLiteChart"] {
             width: 100% !important;
@@ -206,8 +219,18 @@ st.markdown(
     }
 
     @media (max-width: 360px) {
-        [data-testid="column"] {
-            min-width: 132px !important;
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            flex-basis: calc(50% - .2rem) !important;
+            width: calc(50% - .2rem) !important;
+            max-width: calc(50% - .2rem) !important;
+            min-width: 0 !important;
+        }
+        [data-testid="stHorizontalBlock"] {
+            gap: .4rem !important;
+        }
+        [data-testid="stMetric"] {
+            min-height: 88px;
+            padding: .5rem .58rem;
         }
         .rcp-pill {
             font-size: .76rem;
@@ -230,7 +253,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.4.0"
+APP_VERSION = "6.4.1"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -3073,17 +3096,17 @@ ORPHAN_LOGS = get_unassigned_logs() + [
 LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
 # ============================================================
-# V6.4 · Navegación por iconos / Sidebar
+# V6.4.1 · Navegación compacta por iconos / Sidebar
 # ============================================================
 PAGE_META = {
-    "Hoy": ("🏠", "Inicio"),
-    "Semana": ("📅", "Calendario"),
-    "Progreso": ("📈", "Gráficos"),
+    "Hoy": ("🏠", "Pantalla de inicio"),
+    "Semana": ("📅", "Ver la semana"),
+    "Progreso": ("📈", "Gráficos y tendencias"),
     "Plan": ("🗓️", "Plan completo"),
-    "Registro": ("✅", "Entrenamiento"),
-    "Objetivo": ("🎯", "Meta activa"),
-    "Evaluación": ("🧭", "Perfil RCP"),
-    "Perfil": ("⚙️", "Cuenta"),
+    "Registro": ("✅", "Registrar entrenamiento"),
+    "Objetivo": ("🎯", "Objetivo activo"),
+    "Evaluación": ("🧭", "Evaluación RCP"),
+    "Perfil": ("⚙️", "Cuenta y perfil"),
 }
 
 
@@ -3112,7 +3135,6 @@ def render_icon_navigation():
                 ):
                     set_page(page)
                     st.rerun()
-                st.caption(subtitle)
 
 
 def parse_date_safe(value):
@@ -3457,7 +3479,13 @@ if current_page == "Hoy":
                     st.warning("Sesión marcada como omitida.")
 
             q1, q2, q3 = st.columns(3)
-            if q1.button("✅ Registrar", use_container_width=True, type="primary"):
+            _saved_status = str((today_log or {}).get("status") or "").upper()
+            _register_label = (
+                "✏️ Ver / editar"
+                if _saved_status in ("COMPLETADO", "MODIFICADO", "OMITIDO")
+                else "✅ Registrar"
+            )
+            if q1.button(_register_label, use_container_width=True, type="primary"):
                 set_page("Registro", selected_day)
                 st.rerun()
             if q2.button("📅 Mi semana", use_container_width=True):
