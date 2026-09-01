@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V6.4.1 · Diseño UI/UX responsive · Mobile polish
+# V6.4.2 · Diseño UI/UX responsive · Navigation Grid
 # ============================================================
 st.markdown(
     """
@@ -158,6 +158,37 @@ st.markdown(
         white-space: nowrap;
     }
 
+    /* V6.4.2 · Navigation Grid real sobre el bloque de columnas de Streamlit.
+       El selector correcto en Streamlit actual es stColumn. */
+    .st-key-rcp_nav_grid [data-testid="stHorizontalBlock"] {
+        display: grid !important;
+        grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+        gap: .62rem !important;
+        align-items: stretch !important;
+    }
+    .st-key-rcp_nav_grid [data-testid="stColumn"] {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: none !important;
+        flex: none !important;
+    }
+    .st-key-rcp_nav_grid .stButton > button {
+        min-height: 76px !important;
+        padding: .55rem .42rem !important;
+        border-radius: 16px !important;
+        font-size: .95rem !important;
+        line-height: 1.15 !important;
+        white-space: pre-line !important;
+    }
+    .st-key-rcp_nav_grid .stButton > button p {
+        white-space: pre-line !important;
+        line-height: 1.25 !important;
+        margin: 0 !important;
+    }
+    .st-key-rcp_nav_grid {
+        margin-bottom: .15rem !important;
+    }
+
     @media (max-width: 768px) {
         .block-container {
             padding-left: .72rem;
@@ -176,18 +207,35 @@ st.markdown(
         h2 { font-size: 1.38rem !important; }
         h3 { font-size: 1.12rem !important; }
 
-        /* En móvil, cualquier fila de columnas se reorganiza realmente a 2 columnas.
-           El selector hijo directo vence el apilado 100% que Streamlit aplica por defecto. */
+        /* Métricas y bloques generales: dos columnas reales en móvil. */
         [data-testid="stHorizontalBlock"] {
             flex-wrap: wrap !important;
             gap: .48rem !important;
             align-items: stretch !important;
         }
-        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
             flex: 0 0 calc(50% - .24rem) !important;
             width: calc(50% - .24rem) !important;
             max-width: calc(50% - .24rem) !important;
             min-width: 0 !important;
+        }
+
+        /* Navigation Grid: 2 × 4 en móvil, sin depender del breakpoint nativo. */
+        .st-key-rcp_nav_grid [data-testid="stHorizontalBlock"] {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: .52rem !important;
+        }
+        .st-key-rcp_nav_grid [data-testid="stColumn"] {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: none !important;
+            flex: none !important;
+        }
+        .st-key-rcp_nav_grid .stButton > button {
+            min-height: 70px !important;
+            padding: .42rem .28rem !important;
+            font-size: .92rem !important;
         }
         [data-testid="stMetric"] {
             min-height: 94px;
@@ -219,7 +267,7 @@ st.markdown(
     }
 
     @media (max-width: 360px) {
-        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+        [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
             flex-basis: calc(50% - .2rem) !important;
             width: calc(50% - .2rem) !important;
             max-width: calc(50% - .2rem) !important;
@@ -253,7 +301,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.4.1"
+APP_VERSION = "6.4.2"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -3096,7 +3144,7 @@ ORPHAN_LOGS = get_unassigned_logs() + [
 LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
 # ============================================================
-# V6.4.1 · Navegación compacta por iconos / Sidebar
+# V6.4.2 · Navigation Grid por iconos / Sidebar
 # ============================================================
 PAGE_META = {
     "Hoy": ("🏠", "Pantalla de inicio"),
@@ -3118,16 +3166,17 @@ def set_page(page, target_day=None):
 
 
 def render_icon_navigation():
+    """Launcher responsive: 4×2 escritorio y 2×4 móvil mediante CSS Grid real."""
     current = st.session_state.get("rcp_page", "Hoy")
     items = list(PAGE_META.items())
 
-    for start in (0, 4):
-        cols = st.columns(4)
-        for col, (page, (icon, subtitle)) in zip(cols, items[start:start + 4]):
+    with st.container(key="rcp_nav_grid"):
+        cols = st.columns(len(items))
+        for col, (page, (icon, subtitle)) in zip(cols, items):
             with col:
                 is_active = current == page
                 if st.button(
-                    f"{icon}  {page}",
+                    f"{icon}\n{page}",
                     key=f"nav_{page}",
                     use_container_width=True,
                     type="primary" if is_active else "secondary",
