@@ -97,6 +97,46 @@ st.markdown(
     .rcp-readiness-yellow { border-left: 5px solid #ca8a04; }
     .rcp-readiness-orange { border-left: 5px solid #ea580c; }
     .rcp-readiness-red { border-left: 5px solid #dc2626; }
+    .rcp-readiness-title {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: .65rem;
+        flex-wrap: wrap;
+        margin-bottom: .35rem;
+    }
+    .rcp-readiness-title strong {
+        font-size: 1.05rem;
+    }
+    .rcp-readiness-score {
+        font-size: 1.25rem;
+        font-weight: 800;
+        color: var(--rcp-ink);
+    }
+    .rcp-readiness-facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .38rem;
+        margin: .55rem 0 .35rem 0;
+    }
+    .rcp-ready-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: .28rem .52rem;
+        border-radius: 999px;
+        border: 1px solid var(--rcp-border);
+        background: rgba(248,250,252,.88);
+        font-size: .78rem;
+        font-weight: 650;
+        color: var(--rcp-ink);
+    }
+    .rcp-session-guidance {
+        margin-top: .48rem;
+        padding-top: .48rem;
+        border-top: 1px solid var(--rcp-border);
+        font-size: .9rem;
+        color: var(--rcp-muted);
+    }
     .rcp-coach-note {
         border: 1px solid var(--rcp-border);
         border-radius: 16px;
@@ -322,7 +362,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.1.0"
+APP_VERSION = "7.1.1"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -4226,6 +4266,51 @@ def readiness_status_label(status):
     }.get(str(status or "").upper(), "—")
 
 
+def readiness_session_guidance(readiness_row, session):
+    """Conecta el check-in con la sesión del día sin emitir diagnóstico."""
+    status = str((readiness_row or {}).get("readiness_status") or "").upper()
+    kind = workout_kind(session) if session else "Descanso"
+    if not session:
+        if status == "RED":
+            return "Hoy no hay sesión programada. Prioriza recuperación y reevalúa síntomas/dolor antes de volver a intensidad."
+        return "Hoy no hay sesión programada. Usa el día para recuperar y mantener hábitos de sueño, hidratación y movilidad suave si te sienta bien."
+    if status == "GREEN":
+        return f"Sesión de hoy: {kind}. El check-in es compatible con mantener la prescripción prevista y controlar el esfuerzo."
+    if status == "YELLOW":
+        if kind in ("Series", "Tempo", "Carrera"):
+            return f"Sesión de hoy: {kind}. Hazla de forma conservadora, evita perseguir ritmos si el esfuerzo se eleva y reevalúa durante el calentamiento."
+        return f"Sesión de hoy: {kind}. Mantén intensidad cómoda y evita añadir volumen extra."
+    if status == "ORANGE":
+        return f"Sesión de hoy: {kind}. El estado actual favorece reducir carga; el Coach RCP puede proponer un ajuste temporal de los próximos días."
+    if status == "RED":
+        return f"Sesión de hoy: {kind}. No se recomienda ejecutar intensidad con este check-in. Si hay enfermedad aguda o dolor que altera la zancada, prioriza recuperación y valoración profesional cuando corresponda."
+    return f"Sesión de hoy: {kind}. Completa el check-in para obtener una recomendación contextual."
+
+
+def readiness_summary_html(readiness_row, session):
+    status = str((readiness_row or {}).get("readiness_status") or "GREEN").upper()
+    score = int((readiness_row or {}).get("readiness_score") or 0)
+    css_status = status.lower() if status.lower() in ("green", "yellow", "orange", "red") else "green"
+    sleep = int((readiness_row or {}).get("sleep_quality") or 0)
+    fatigue = int((readiness_row or {}).get("fatigue") or 0)
+    soreness = int((readiness_row or {}).get("soreness") or 0)
+    pain = int((readiness_row or {}).get("pain") or 0)
+    message = html.escape(str((readiness_row or {}).get("readiness_message") or ""))
+    guidance = html.escape(readiness_session_guidance(readiness_row, session))
+    return (
+        f'<div class="rcp-readiness rcp-readiness-{css_status}">'
+        f'<div class="rcp-readiness-title"><strong>{readiness_status_label(status)}</strong>'
+        f'<span class="rcp-readiness-score">{score}/100</span></div>'
+        f'<div>{message}</div>'
+        f'<div class="rcp-readiness-facts">'
+        f'<span class="rcp-ready-chip">🌙 Sueño {sleep}/5</span>'
+        f'<span class="rcp-ready-chip">⚡ Fatiga {fatigue}/5</span>'
+        f'<span class="rcp-ready-chip">🦵 Agujetas {soreness}/10</span>'
+        f'<span class="rcp-ready-chip">📍 Dolor {pain}/10</span>'
+        f'</div><div class="rcp-session-guidance"><b>Impacto en hoy:</b> {guidance}</div></div>'
+    )
+
+
 def expected_rpe_range(session):
     kind = workout_kind(session)
     if kind == "Carrera":
@@ -4872,23 +4957,29 @@ if current_page == "Hoy":
     today_session = PLAN_BY_DATE.get(selected_day.isoformat())
     today_log = LOG_BY_DATE.get(selected_day.isoformat())
 
-    # V7.1 · Check-in de recuperación. Solo hoy se usa para decisiones inmediatas.
+    # V7.1.1 · Readiness compacto. El formulario permanece cerrado por defecto.
+    coach = None
     if ADAPTIVE_READY and selected_day == date.today():
         existing_ready = READINESS_BY_DATE.get(selected_day.isoformat(), {})
         st.markdown("### 🧠 Estado de hoy")
         if existing_ready:
-            _rs = int(existing_ready.get("readiness_score") or 0)
-            _rst = str(existing_ready.get("readiness_status") or "")
-            _class = _rst.lower() if _rst.lower() in ("green", "yellow", "orange", "red") else "green"
             st.markdown(
-                f'<div class="rcp-readiness rcp-readiness-{_class}"><b>{readiness_status_label(_rst)} · {_rs}/100</b><br>'
-                f'<span>{html.escape(str(existing_ready.get("readiness_message") or ""))}</span></div>',
+                readiness_summary_html(existing_ready, today_session),
                 unsafe_allow_html=True,
             )
+            checkin_label = "✏️ Actualizar check-in"
         else:
-            st.info("Haz un check-in breve antes de entrenar. Sirve para ajustar la semana, no para diagnosticar enfermedad.")
+            st.markdown(
+                '<div class="rcp-readiness"><div class="rcp-readiness-title"><strong>⚪ Sin check-in de hoy</strong>'
+                '<span class="rcp-readiness-score">—/100</span></div>'
+                '<div>Completa un check-in breve para contextualizar la sesión y alimentar el motor adaptativo.</div>'
+                '<div class="rcp-session-guidance"><b>Impacto en hoy:</b> hasta completar el check-in, RunningCoachPro mantiene la prescripción sin inferir tu estado de recuperación.</div></div>',
+                unsafe_allow_html=True,
+            )
+            checkin_label = "📝 Hacer check-in"
 
-        with st.expander("📝 Hacer / actualizar check-in", expanded=not bool(existing_ready)):
+        with st.expander(checkin_label, expanded=False):
+            st.caption("Tarda menos de un minuto. No diagnostica enfermedad; se usa para modular la carga de entrenamiento.")
             with st.form("daily_readiness_form"):
                 c1, c2 = st.columns(2)
                 sleep_quality = c1.slider("Sueño", 1, 5, int(existing_ready.get("sleep_quality") or 4), help="1 = muy malo · 5 = excelente")
@@ -4922,48 +5013,11 @@ if current_page == "Hoy":
                     "readiness_status": rst,
                     "readiness_message": rmsg,
                 })
-                st.success("Check-in guardado.")
+                st.success(f"Check-in guardado · {readiness_status_label(rst)} · {rs}/100")
                 st.rerun()
 
-        # Recomendación adaptativa auditable. Nunca cambia el plan sin acción explícita.
+        # Se calcula aquí, pero el Coach se presenta DESPUÉS de la sesión del día.
         coach = adaptation_snapshot(date.today())
-        decision = coach.get("decision")
-        reasons = coach.get("reasons") or []
-        metrics = coach.get("metrics") or {}
-        st.markdown("### 🤖 Coach RCP")
-        if decision == "PROTECT":
-            st.error("Protección de carga recomendada: retirar intensidad y reducir temporalmente el volumen de los próximos 7 días.")
-        elif decision == "REDUCE":
-            st.warning("Descarga adaptativa recomendada para los próximos 7 días.")
-        elif decision == "RESTORE":
-            st.success("Los indicadores permiten restaurar las sesiones adaptadas hacia el plan original.")
-        elif decision == "MAINTAIN":
-            st.success("Mantener el plan previsto. No hay señales suficientes para modificar la próxima semana.")
-        else:
-            st.info("Recolectando datos para personalizar la adaptación.")
-        if reasons:
-            st.caption(" ".join(reasons))
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Adherencia 14 d", "—" if metrics.get("adherence_pct") is None else f"{metrics['adherence_pct']:.0f}%")
-        m2.metric("Readiness 7 d", "—" if metrics.get("readiness_avg_7d") is None else f"{metrics['readiness_avg_7d']:.0f}/100")
-        m3.metric("Exceso RPE", f"+{float(metrics.get('avg_rpe_excess') or 0):.1f}")
-        m4.metric("Dolor post máx.", f"{int(metrics.get('max_post_pain') or 0)}/10")
-
-        latest_applied = next((a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"), None)
-        already_today = bool(
-            latest_applied
-            and str(latest_applied.get("trigger_date")) == date.today().isoformat()
-            and str(latest_applied.get("decision") or "") == str(decision or "")
-        )
-        if decision in ("PROTECT", "REDUCE", "RESTORE"):
-            if already_today:
-                st.caption("Esta recomendación ya fue aplicada hoy. Los cambios quedan registrados en la auditoría V7.1.")
-            else:
-                if st.button("🧠 Aplicar adaptación a los próximos 7 días", type="primary", use_container_width=True):
-                    ok, msg = apply_adaptation(coach, date.today())
-                    (st.success if ok else st.error)(msg)
-                    if ok:
-                        st.rerun()
 
     elif not ADAPTIVE_READY:
         st.warning("Motor adaptativo V7.1 pendiente: ejecuta supabase_v7_1_adaptive.sql para activar check-in y ajustes dinámicos.")
@@ -5043,6 +5097,48 @@ if current_page == "Hoy":
             if q3.button("📈 Ver progreso", use_container_width=True):
                 set_page("Progreso")
                 st.rerun()
+
+    # V7.1.1 · Coach después de la sesión: Home prioriza readiness → entrenamiento → adaptación.
+    if ADAPTIVE_READY and selected_day == date.today() and coach is not None:
+        decision = coach.get("decision")
+        reasons = coach.get("reasons") or []
+        metrics = coach.get("metrics") or {}
+        st.markdown("### 🤖 Coach RCP")
+        if decision == "PROTECT":
+            st.error("Protección de carga recomendada: retirar intensidad y reducir temporalmente el volumen de los próximos 7 días.")
+        elif decision == "REDUCE":
+            st.warning("Descarga adaptativa recomendada para los próximos 7 días.")
+        elif decision == "RESTORE":
+            st.success("Los indicadores permiten restaurar las sesiones adaptadas hacia el plan original.")
+        elif decision == "MAINTAIN":
+            st.success("Mantener el plan previsto. No hay señales suficientes para modificar la próxima semana.")
+        else:
+            st.info("Recolectando datos para personalizar la adaptación.")
+        if reasons:
+            st.caption(" ".join(reasons))
+
+        with st.expander("Ver indicadores del Coach", expanded=False):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Adherencia 14 d", "—" if metrics.get("adherence_pct") is None else f"{metrics['adherence_pct']:.0f}%")
+            m2.metric("Readiness 7 d", "—" if metrics.get("readiness_avg_7d") is None else f"{metrics['readiness_avg_7d']:.0f}/100")
+            m3.metric("Exceso RPE", f"+{float(metrics.get('avg_rpe_excess') or 0):.1f}")
+            m4.metric("Dolor post máx.", f"{int(metrics.get('max_post_pain') or 0)}/10")
+
+        latest_applied = next((a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"), None)
+        already_today = bool(
+            latest_applied
+            and str(latest_applied.get("trigger_date")) == date.today().isoformat()
+            and str(latest_applied.get("decision") or "") == str(decision or "")
+        )
+        if decision in ("PROTECT", "REDUCE", "RESTORE"):
+            if already_today:
+                st.caption("Esta recomendación ya fue aplicada hoy. Los cambios quedan registrados en la auditoría V7.1.")
+            else:
+                if st.button("🧠 Aplicar adaptación a los próximos 7 días", type="primary", use_container_width=True):
+                    ok, msg = apply_adaptation(coach, date.today())
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
 
     # Resumen semanal
     st.markdown("### Esta semana")
