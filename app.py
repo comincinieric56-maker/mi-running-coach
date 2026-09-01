@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.6.2"
+APP_VERSION = "7.6.3"
 
 
 # ============================================================
@@ -690,6 +690,37 @@ def profile_v74_storage_ready():
         return False
 
 
+def profile_v763_storage_ready():
+    """Comprueba que el perfil ya puede guardar la preferencia de superficie."""
+    try:
+        (
+            client.table("rc_profiles")
+            .select("user_id,training_surface_preference")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def training_surface_preference(profile_row=None):
+    """EXTERIOR / CAMINADORA / AMBOS. Los perfiles antiguos se comportan como AMBOS."""
+    value = str((profile_row or {}).get("training_surface_preference") or "AMBOS").upper().strip()
+    if value not in {"EXTERIOR", "CAMINADORA", "AMBOS"}:
+        return "AMBOS"
+    return value
+
+
+def training_surface_label(profile_row=None):
+    return {
+        "EXTERIOR": "Exterior",
+        "CAMINADORA": "Caminadora",
+        "AMBOS": "Ambos",
+    }.get(training_surface_preference(profile_row), "Ambos")
+
+
 def _profile_date(value):
     if not value:
         return None
@@ -731,6 +762,7 @@ def physiological_profile_snapshot(profile_row=None):
         "device_brand": row.get("device_brand") or None,
         "work_context": row.get("work_context") or None,
         "habitual_sleep_hours": float(row.get("habitual_sleep_hours")) if row.get("habitual_sleep_hours") else None,
+        "training_surface_preference": training_surface_preference(row),
         "updated_at": row.get("physiology_updated_at") or None,
         "prescription_policy": "CONTEXT_ONLY_V7_4",
     }
@@ -1558,7 +1590,7 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
     """
     session = session or {}
     goal_row = goal_row or globals().get("ACTIVE_GOAL") or {}
-    assessment = assessment or globals().get("ASSESSMENT") or globals().get("assessment") or {}
+    assessment = assessment or globals().get("LATEST_ASSESSMENT") or globals().get("assessment") or {}
 
     explicit_paces = _target_pace_seconds(session.get("target"))
     if explicit_paces:
@@ -1606,6 +1638,22 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
         "repeats": [],
         "source": "RPE",
         "note": "No hay una marca o meta temporal suficiente para asignar una velocidad responsable; usa el RPE/talk test.",
+    }
+
+
+def session_surface_reference(session, goal_row=None, assessment=None, profile_row=None):
+    """Referencia de entrenamiento respetando la preferencia guardada en Perfil."""
+    pref = training_surface_preference(profile_row or globals().get("profile") or {})
+    guide = treadmill_guidance(session, goal_row, assessment) or {}
+    return {
+        "preference": pref,
+        "show_pace": pref in {"EXTERIOR", "AMBOS"},
+        "show_speed": pref in {"CAMINADORA", "AMBOS"},
+        "pace": guide.get("pace"),
+        "speed": guide.get("speed"),
+        "repeats": guide.get("repeats") or [],
+        "source": guide.get("source"),
+        "note": guide.get("note"),
     }
 
 
@@ -7587,13 +7635,20 @@ def build_plan_pdf_bytes(
         for p in sessions:
             d = parse_date_safe(p.get("session_date"))
             status = _pdf_session_status(p, log_by_date) if include_progress else "-"
+            _surface_pdf_compact = session_surface_reference(p, active_goal, assessment, profile_row)
+            _surface_pdf_bits = []
+            if _surface_pdf_compact.get("show_pace") and _surface_pdf_compact.get("pace"):
+                _surface_pdf_bits.append(f"Ext {_surface_pdf_compact['pace']}")
+            if _surface_pdf_compact.get("show_speed") and _surface_pdf_compact.get("speed"):
+                _surface_pdf_bits.append(f"Cinta {_surface_pdf_compact['speed']}")
+            _surface_pdf_suffix = (" | " + " | ".join(_surface_pdf_bits)) if _surface_pdf_bits else ""
             compact.append([
                 P(d.strftime("%d/%m/%Y") if d else p.get("session_date")),
                 P(str(p.get("week_no") or "—")),
                 P(workout_kind(p)),
                 P(session_display_name(p)),
                 P(f"{float(p.get('planned_km') or 0):g}"),
-                P((p.get("target") or "Por esfuerzo") + (f" | Cinta {(treadmill_guidance(p, active_goal, assessment) or {}).get('speed')}" if (treadmill_guidance(p, active_goal, assessment) or {}).get("speed") else "")),
+                P((p.get("target") or "Por esfuerzo") + _surface_pdf_suffix),
                 P(status),
             ])
         ct = Table(compact, colWidths=[22*mm, 12*mm, 20*mm, 42*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
@@ -7667,12 +7722,14 @@ def build_plan_pdf_bytes(
                     f'<font color="{status_hex}"><b>{_pdf_esc(status)}</b></font></font>',
                     styles["RCPBody"],
                 )
-                _tm_pdf = treadmill_guidance(p, active_goal, assessment)
+                _surface_pdf = session_surface_reference(p, active_goal, assessment, profile_row)
                 _tm_pdf_line = ""
-                if _tm_pdf and _tm_pdf.get('speed'):
-                    _tm_pdf_line = f'<br/><font size="8" color="#475569"><b>Caminadora:</b> {_pdf_esc(_tm_pdf["speed"])}</font>'
-                    if _tm_pdf.get("repeats"):
-                        _tm_pdf_line += f'<br/><font size="7.5" color="#64748B">{_pdf_esc(" · ".join(_tm_pdf["repeats"]))}</font>'
+                if _surface_pdf.get("show_pace") and _surface_pdf.get("pace"):
+                    _tm_pdf_line += f'<br/><font size="8" color="#475569"><b>Exterior:</b> {_pdf_esc(_surface_pdf["pace"])}</font>'
+                if _surface_pdf.get("show_speed") and _surface_pdf.get("speed"):
+                    _tm_pdf_line += f'<br/><font size="8" color="#475569"><b>Caminadora:</b> {_pdf_esc(_surface_pdf["speed"])}</font>'
+                    if _surface_pdf.get("repeats"):
+                        _tm_pdf_line += f'<br/><font size="7.5" color="#64748B">{_pdf_esc(" · ".join(_surface_pdf["repeats"]))}</font>'
                 target_box = Table([[Paragraph(f'<b>Objetivo</b><br/>{_pdf_esc(p.get("target") or "Por esfuerzo")}{_tm_pdf_line}', styles["RCPBody"]) ]], colWidths=[130*mm])
                 target_box.setStyle(TableStyle([
                     ("BACKGROUND", (0,0), (-1,-1), ksoft if visual else surface),
@@ -7872,12 +7929,16 @@ if current_page == "Hoy":
             )
             st.markdown(f"## {today_session['workout_name']}")
             st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
-            _treadmill_today = treadmill_guidance(today_session, ACTIVE_GOAL, ASSESSMENT)
-            if _treadmill_today and _treadmill_today.get('speed'):
-                _tm_extra = ""
-                if _treadmill_today.get("repeats"):
-                    _tm_extra = " · " + " · ".join(_treadmill_today["repeats"])
-                st.info(f"🏃‍♂️ **Caminadora:** {_treadmill_today['speed']} · {_treadmill_today.get('pace') or 'por esfuerzo'}{_tm_extra}\n\n{_treadmill_today.get('note') or ''}")
+            _surface_today = session_surface_reference(today_session, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
+            _surface_parts = []
+            if _surface_today.get("show_pace") and _surface_today.get("pace"):
+                _surface_parts.append(f"🌳 **Exterior:** {_surface_today['pace']}")
+            if _surface_today.get("show_speed") and _surface_today.get("speed"):
+                _surface_parts.append(f"🏃‍♂️ **Caminadora:** {_surface_today['speed']}")
+            if _surface_today.get("repeats") and _surface_today.get("show_speed"):
+                _surface_parts.append(" · ".join(_surface_today["repeats"]))
+            if _surface_parts:
+                st.info(" · ".join(_surface_parts) + f"\n\n{_surface_today.get('note') or ''}")
 
             a, b, c, dcol = st.columns(4)
             a.metric("Distancia", f"{float(today_session.get('planned_km') or 0):g} km")
@@ -8227,8 +8288,13 @@ elif current_page == "Semana":
             c1.caption(d.strftime("%d/%m"))
             if s:
                 c2.markdown(f"**{s['workout_name']}**")
-                _tm_week = treadmill_guidance(s, ACTIVE_GOAL, ASSESSMENT)
-                _tm_week_text = f" · Cinta {_tm_week['speed']}" if (_tm_week and _tm_week.get('speed')) else ""
+                _surface_week = session_surface_reference(s, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
+                _surface_week_bits = []
+                if _surface_week.get("show_pace") and _surface_week.get("pace"):
+                    _surface_week_bits.append(f"Exterior {_surface_week['pace']}")
+                if _surface_week.get("show_speed") and _surface_week.get("speed"):
+                    _surface_week_bits.append(f"Cinta {_surface_week['speed']}")
+                _tm_week_text = (" · " + " · ".join(_surface_week_bits)) if _surface_week_bits else ""
                 c2.caption(f"{workout_kind(s)} · {s.get('target') or 'Por esfuerzo'}{_tm_week_text}")
                 c3.markdown(f"**{float(s.get('planned_km') or 0):g} km**")
                 c3.caption(status_label_for_date(d))
@@ -8727,6 +8793,7 @@ elif current_page == "Plan":
         if week_filter != "Todas" and int(p.get("week_no") or 0) != int(week_filter):
             continue
         filtered_plan.append(p)
+        _surface_plan_row = session_surface_reference(p, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
         table.append({
             "Fecha": d.strftime("%d/%m/%Y") if d else str(p.get("session_date")),
             "Semana": p.get("week_no"),
@@ -8737,7 +8804,8 @@ elif current_page == "Plan":
             "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
             "Replanificación": str(p.get("replan_status") or "BASELINE").replace("_", " ").title() if REPLAN_READY else "—",
             "Objetivo": p.get("target"),
-            "Caminadora": (treadmill_guidance(p, ACTIVE_GOAL, ASSESSMENT) or {}).get("speed") or "—",
+            "Exterior": _surface_plan_row.get("pace") if _surface_plan_row.get("show_pace") and _surface_plan_row.get("pace") else "—",
+            "Caminadora": _surface_plan_row.get("speed") if _surface_plan_row.get("show_speed") and _surface_plan_row.get("speed") else "—",
             "Opcional": "Sí" if session_is_optional(p) else "No",
             "Estado": status,
         })
@@ -8758,12 +8826,16 @@ elif current_page == "Plan":
                 f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
             )
             st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
-            _tm_plan = treadmill_guidance(p, ACTIVE_GOAL, ASSESSMENT)
-            if _tm_plan and _tm_plan.get('speed'):
-                _tm_plan_extra = ""
-                if _tm_plan.get("repeats"):
-                    _tm_plan_extra = " · " + " · ".join(_tm_plan["repeats"])
-                st.info(f"🏃‍♂️ **Caminadora:** {_tm_plan['speed']} · {_tm_plan.get('pace') or 'por esfuerzo'}{_tm_plan_extra}\n\n{_tm_plan.get('note') or ''}")
+            _surface_plan = session_surface_reference(p, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
+            _surface_plan_parts = []
+            if _surface_plan.get("show_pace") and _surface_plan.get("pace"):
+                _surface_plan_parts.append(f"🌳 **Exterior:** {_surface_plan['pace']}")
+            if _surface_plan.get("show_speed") and _surface_plan.get("speed"):
+                _surface_plan_parts.append(f"🏃‍♂️ **Caminadora:** {_surface_plan['speed']}")
+            if _surface_plan.get("repeats") and _surface_plan.get("show_speed"):
+                _surface_plan_parts.append(" · ".join(_surface_plan["repeats"]))
+            if _surface_plan_parts:
+                st.info(" · ".join(_surface_plan_parts) + f"\n\n{_surface_plan.get('note') or ''}")
             if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
                 st.info(f"🔄 Replanificada V7.2 · {str(p.get('replan_status') or '').replace('_', ' ').title()}")
             st.write(p.get("description") or "Sin instrucciones adicionales.")
@@ -8807,12 +8879,16 @@ elif current_page == "Registro":
             r1.metric("Plan", f"{float(session.get('planned_km') or 0):g} km")
             r2.metric("Objetivo", str(session.get("target") or "Por esfuerzo"))
             r3.metric("Estado", status_label_for_date(selected_day).split(" ", 1)[-1])
-            _tm_reg = treadmill_guidance(session, ACTIVE_GOAL, ASSESSMENT)
-            if _tm_reg and _tm_reg.get('speed'):
-                _tm_reg_extra = ""
-                if _tm_reg.get("repeats"):
-                    _tm_reg_extra = " · " + " · ".join(_tm_reg["repeats"])
-                st.caption(f"🏃‍♂️ Caminadora: **{_tm_reg['speed']}** · {_tm_reg.get('pace') or 'por esfuerzo'}{_tm_reg_extra} · {_tm_reg.get('source') or 'RPE'}")
+            _surface_reg = session_surface_reference(session, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
+            _surface_reg_parts = []
+            if _surface_reg.get("show_pace") and _surface_reg.get("pace"):
+                _surface_reg_parts.append(f"🌳 Exterior **{_surface_reg['pace']}**")
+            if _surface_reg.get("show_speed") and _surface_reg.get("speed"):
+                _surface_reg_parts.append(f"🏃‍♂️ Caminadora **{_surface_reg['speed']}**")
+            if _surface_reg.get("repeats") and _surface_reg.get("show_speed"):
+                _surface_reg_parts.append(" · ".join(_surface_reg["repeats"]))
+            if _surface_reg_parts:
+                st.caption(" · ".join(_surface_reg_parts) + f" · {_surface_reg.get('source') or 'RPE'}")
             with st.expander("📋 Instrucciones"):
                 st.write(session.get("description") or "Sin instrucciones adicionales.")
 
@@ -9127,6 +9203,21 @@ elif current_page == "Perfil":
                 index=_work_contexts.index(_current_work) if _current_work in _work_contexts else 0,
             )
 
+            _surface_options = ["Exterior", "Caminadora", "Ambos"]
+            _surface_current = training_surface_label(profile)
+            training_surface = st.selectbox(
+                "Superficie habitual de entrenamiento",
+                _surface_options,
+                index=_surface_options.index(_surface_current) if _surface_current in _surface_options else 2,
+                help=(
+                    "Exterior prioriza pace; Caminadora prioriza km/h; Ambos muestra las dos referencias "
+                    "cuando RCP dispone de una equivalencia responsable."
+                ),
+                disabled=not profile_v763_storage_ready(),
+            )
+            if not profile_v763_storage_ready():
+                st.caption("Activa V7.6.3 en Supabase para guardar esta preferencia.")
+
             save_phys = st.form_submit_button("💾 Guardar perfil fisiológico", use_container_width=True)
 
         if save_phys:
@@ -9163,7 +9254,7 @@ elif current_page == "Perfil":
                 else:
                     previous_weight = float(profile.get("weight_kg") or 0)
                     previous_resting = int(profile.get("resting_hr") or 0)
-                    update_profile_fields({
+                    _profile_update = {
                         "date_of_birth": _dob.isoformat() if _dob else None,
                         "weight_kg": float(weight_kg) if weight_kg else None,
                         "height_cm": float(height_cm) if height_cm else None,
@@ -9174,7 +9265,14 @@ elif current_page == "Perfil":
                         "work_context": None if work_context == "No informado" else work_context,
                         "habitual_sleep_hours": float(sleep_hours) if sleep_hours else None,
                         "physiology_updated_at": datetime.now(timezone.utc).isoformat(),
-                    })
+                    }
+                    if profile_v763_storage_ready():
+                        _profile_update["training_surface_preference"] = {
+                            "Exterior": "EXTERIOR",
+                            "Caminadora": "CAMINADORA",
+                            "Ambos": "AMBOS",
+                        }.get(training_surface, "AMBOS")
+                    update_profile_fields(_profile_update)
                     if (
                         (weight_kg and abs(float(weight_kg) - previous_weight) >= 0.05)
                         or (resting_hr and int(resting_hr) != previous_resting)
@@ -9198,6 +9296,7 @@ elif current_page == "Perfil":
                 st.caption(
                     f"IMC descriptivo: {_phys['bmi']}. En V7.4 no se usa como regla automática para prescribir entrenamiento."
                 )
+            st.caption(f"Superficie habitual: **{training_surface_label(profile)}**")
 
         _metric_history = get_profile_metrics(limit=12)
         if _metric_history:
