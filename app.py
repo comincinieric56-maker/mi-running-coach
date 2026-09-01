@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.0"
+APP_VERSION = "8.1.1"
 
 
 # ============================================================
@@ -746,10 +746,10 @@ def render_qa_sandbox():
         st.caption("Límite de seguridad: la progresión de esta muestra se mantiene por debajo del 12% y no apila más de dos estímulos exigentes en 7 días.")
 
     with tabs[4]:
-        st.subheader("✅ Batería automática V8.1"); st.caption("Ejecuta todos los escenarios sintéticos y compara la decisión obtenida con la esperada."); matrix = _qa_automated_matrix(); passes = sum(1 for r in matrix if r["Resultado"] == "CORRECTO"); st.metric("Pruebas superadas", f"{passes}/{len(matrix)}"); st.dataframe(matrix, use_container_width=True, hide_index=True)
+        st.subheader("✅ Batería automática de pruebas"); st.caption("Ejecuta todos los escenarios sintéticos y compara la decisión obtenida con la esperada."); matrix = _qa_automated_matrix(); passes = sum(1 for r in matrix if r["Resultado"] == "CORRECTO"); st.metric("Pruebas superadas", f"{passes}/{len(matrix)}"); st.dataframe(matrix, use_container_width=True, hide_index=True)
         if passes == len(matrix): st.success("Batería interna de pruebas superada. Esto valida coherencia de reglas; no sustituye la validación longitudinal con entrenamientos reales.")
         else: st.error("Hay pruebas fallidas. No conviene promover esta lógica a estable hasta corregirlas.")
-    st.divider(); st.caption("Modo de pruebas V8.1: datos sintéticos en memoria. No representa consejo médico ni una prescripción individual real.")
+    st.divider(); st.caption("Modo de pruebas: datos sintéticos en memoria. No representa consejo médico ni una prescripción individual real.")
 
 def authenticated_client():
     client = new_client()
@@ -854,7 +854,7 @@ def show_auth():
 
     st.divider()
     st.markdown("### 🧪 Probar sin cuenta")
-    st.caption("Abre un corredor ficticio en memoria para probar V8 sin crear usuario y sin escribir datos en Supabase.")
+    st.caption("Abre un corredor ficticio en memoria para probar la aplicación sin crear usuario y sin escribir datos en Supabase.")
     if st.button("🧪 Entrar al Modo de pruebas", use_container_width=True, key="enter_qa_sandbox_auth"):
         st.session_state["rcp_qa_mode"] = True
         st.rerun()
@@ -6936,11 +6936,11 @@ def adaptation_snapshot(trigger_day=None):
                 stat_decision = str((stat_prediction or {}).get("decision") or "")
                 if stat_decision == "PROTEGER":
                     decision, severity = "PROTECT", "high"
-                    reasons.append("El modelo multivariable V8.1 coincide en que hoy debe priorizarse recuperación.")
+                    reasons.append("Tus datos recientes indican que hoy conviene priorizar la recuperación.")
                 elif stat_decision in {"REDUCIR","SUSTITUIR_POR_SUAVE","REDUCIR_LARGA"} and decision not in {"PROTECT"}:
                     if decision in {"COLLECTING","MAINTAIN","RESTORE"}:
                         decision, severity = "REDUCE", "moderate"
-                    reasons.append("El modelo multivariable V8.1 prevé mayor dificultad o menor tolerancia para la demanda de la sesión actual.")
+                    reasons.append("Tus datos recientes sugieren que la sesión de hoy podría costarte más de lo habitual.")
             except Exception:
                 stat_prediction = None
 
@@ -8493,7 +8493,7 @@ def render_goal_hero():
     st.markdown(
         f"""
         <div class="rcp-hero">
-          <div class="rcp-eyebrow">RUNNINGCOACHPRO · V{APP_VERSION}</div>
+          <div class="rcp-eyebrow">RUNNINGCOACHPRO</div>
           <h2>Hola, {display_name_safe} 👋</h2>
           <p>Tu entrenamiento de hoy, tu objetivo y tu progreso en un solo lugar.</p>
           <div class="rcp-pills">
@@ -8510,33 +8510,20 @@ def render_goal_hero():
     )
 
 
-# Sidebar: contexto y utilidades, no navegación principal.
+# Sidebar: información útil para el corredor. La tecnología funciona en segundo plano.
 st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption(f"V{APP_VERSION} · motor estadístico adaptativo")
-if st.sidebar.button("🧪 Modo de pruebas", use_container_width=True, key="enter_qa_sandbox_sidebar"):
-    st.session_state["rcp_qa_mode"] = True
-    st.rerun()
-st.sidebar.caption("🏃‍♂️ Ritmo ↔ caminadora · aprendizaje personal")
 st.sidebar.markdown(f"**{profile['display_name']}**")
-st.sidebar.caption(USER_EMAIL)
 st.sidebar.caption(f"🕒 {rcp_timezone_name()} · hoy {rcp_today().strftime('%d/%m/%Y')}")
-with st.sidebar.expander("📘 ¿Qué significan estos términos?", expanded=False):
-    st.markdown("**RPE:** esfuerzo percibido de 1 a 10. 1 = muy fácil; 10 = esfuerzo máximo.")
-    st.markdown("**Estado para entrenar:** resumen diario de sueño, fatiga, dolor, estrés y motivación.")
-    st.markdown("**Carga por esfuerzo:** duración del entrenamiento × RPE. Sirve para comparar cuánto te exigió cada semana.")
-    st.markdown("**Ritmo:** minutos que tardas en recorrer 1 km. En caminadora también se muestra en km/h.")
-    st.markdown("**Reorganización del plan:** mover, reducir o sustituir sesiones cuando una ausencia o la recuperación lo hacen necesario.")
 st.sidebar.markdown(f"🎯 **{ACTIVE_GOAL.get('goal_type') or '—'}**")
 if ACTIVE_GOAL.get("race_date"):
-    st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
+    try:
+        _side_race_date = date.fromisoformat(str(ACTIVE_GOAL.get("race_date")))
+        st.sidebar.caption(f"Objetivo · {_side_race_date.strftime('%d/%m/%Y')}")
+    except Exception:
+        st.sidebar.caption(f"Objetivo · {ACTIVE_GOAL.get('race_date')}")
 
-if ADAPTIVE_READY:
-    st.sidebar.markdown("🧠 **Entrenador adaptativo:** V8")
-    st.sidebar.markdown("🎯 **Ritmos de entrenamiento:** V8")
-    st.sidebar.markdown("🧪 **Pruebas RCP:** V8")
-    st.sidebar.markdown("📄 **PDF del plan:** V8")
-else:
-    st.sidebar.warning("V7.1 pendiente de migración SQL")
+if not ADAPTIVE_READY:
+    st.sidebar.warning("Hay una actualización pendiente de configuración.")
 
 if LATEST_ASSESSMENT:
     _side_score = int(LATEST_ASSESSMENT.get("runner_score") or 0)
@@ -8547,7 +8534,7 @@ if LATEST_ASSESSMENT:
         (_side_profile.get("classification") or {}).get("level_display")
         or runner_level_display(_side_level, _side_score)
     )
-    st.sidebar.markdown(f"🧭 **{str(_side_display).title()}** · {_side_score}/100")
+    st.sidebar.markdown(f"🧭 **Nivel: {str(_side_display).title()}**")
 
 if "rcp_pending_day" in st.session_state:
     st.session_state["selected_day_picker"] = st.session_state.pop("rcp_pending_day")
@@ -8895,7 +8882,7 @@ def build_plan_pdf_bytes(
         canvas.line(15 * mm, 12 * mm, page_w - 15 * mm, 12 * mm)
         canvas.setFont("Helvetica", 7.2)
         canvas.setFillColor(slate)
-        canvas.drawString(15 * mm, 7.5 * mm, f"RunningCoachPro V{APP_VERSION} | documento dinámico del plan")
+        canvas.drawString(15 * mm, 7.5 * mm, "RunningCoachPro | documento dinámico del plan")
         canvas.drawRightString(page_w - 15 * mm, 7.5 * mm, f"Página {_doc.page}")
         if APP_URL:
             canvas.linkURL(APP_URL, (15 * mm, 5.5 * mm, 86 * mm, 10 * mm), relative=0)
@@ -9010,7 +8997,7 @@ def build_plan_pdf_bytes(
     _pdf_v8 = v8_dynamic_zones(assessment, active_goal)
     _pdf_zone_rows = v8_zone_rows(assessment, active_goal)
     if _pdf_zone_rows:
-        story.append(Paragraph("Zonas dinámicas RCP V8", styles["RCPH2"]))
+        story.append(Paragraph("Tus ritmos de entrenamiento", styles["RCPH2"]))
         zone_data = [[P("ZONA", "RCPSmall"), P("RPE", "RCPSmall"), P("RITMO", "RCPSmall"), P("CAMINADORA", "RCPSmall")]]
         for zr in _pdf_zone_rows:
             zone_data.append([P(zr["Zona"]), P(zr["RPE"]), P(zr["Ritmo"]), P(zr["Caminadora"])])
@@ -9421,7 +9408,7 @@ if current_page == "Hoy":
                     strength_feeling = l2.slider("Sensación de fuerza", 1, 5, int(existing_ready.get("strength_feeling") or 4), help="1 = muy baja · 5 = muy buena")
                 else:
                     sleep_hours, sleepiness, energy, mental_fatigue, legs_heaviness, strength_feeling = None, 2, 4, 2, 2, 4
-                    st.caption("Ejecuta la migración V8.1 para activar somnolencia, energía, fatiga mental, piernas y fuerza.")
+                    st.caption("Hay una actualización pendiente para activar todas las variables de recuperación.")
                 c3, c4 = st.columns(2)
                 soreness = c3.slider("Dolor muscular / agujetas", 0, 10, int(existing_ready.get("soreness") or 0))
                 stress = c4.slider("Estrés", 1, 5, int(existing_ready.get("stress") or 2))
@@ -9610,7 +9597,7 @@ if current_page == "Hoy":
         _stat = v81_statistical_prediction(today_session, READINESS_BY_DATE.get(selected_day.isoformat()))
         if _stat:
             _out = _stat.get("outputs") or {}
-            st.markdown("### 📊 Análisis estadístico RCP")
+            st.markdown("### 🎯 Recomendación personalizada de hoy")
             with st.container(border=True):
                 st.markdown(f"**{v81_decision_label(_stat.get('decision'))}**")
                 st.write(_stat.get("summary") or "")
@@ -9628,8 +9615,8 @@ if current_page == "Hoy":
                 elif _spd.get("display"):
                     st.caption(f"Referencia de velocidad disponible: {_spd.get('display')} · fuente: {_spd.get('source')}.")
                 with st.expander("¿Cómo llegó RCP a esta conclusión?", expanded=False):
-                    st.caption("V8.1 usa regresión multivariable regularizada con priors conservadores. Seguridad > modelo estadístico > ajustes del plan.")
-                    st.write(f"Observaciones históricas utilizables: **{int(_out.get('data_rows') or 0)}** · con contexto ampliado V8.1: **{int(_out.get('extended_context_rows') or 0)}**.")
+                    st.caption("RCP combina tu estado actual, el tipo de sesión y tu respuesta a entrenamientos recientes. Las reglas de seguridad siempre tienen prioridad.")
+                    st.write(f"Datos personales utilizados para esta estimación: **{int(_out.get('data_rows') or 0)}** sesiones · **{int(_out.get('extended_context_rows') or 0)}** con información completa de recuperación.")
                     if _out.get("risk_factors"):
                         st.write("Factores que más elevan la dificultad prevista: " + ", ".join(_out.get("risk_factors") or []))
                     if _out.get("favorable_factors"):
@@ -10333,9 +10320,9 @@ elif current_page == "Progreso":
 
     # 9 · V8.1 · Aprendizaje estadístico personal
     st.divider()
-    st.markdown("## 🧠 Aprendizaje estadístico personal")
+    st.markdown("## 🧠 Cómo se adapta RCP a ti")
     if not V81_READY:
-        st.warning("Ejecuta `supabase_v8_1_statistical_engine.sql` para activar el motor multivariable V8.1. El resto de V8 continúa funcionando.")
+        st.warning("Hay una actualización pendiente de configuración para activar la personalización avanzada.")
     else:
         _ms = v81_statistical_summary()
         m1,m2,m3,m4 = st.columns(4)
@@ -10343,7 +10330,7 @@ elif current_page == "Progreso":
         m2.metric("Contexto completo", int(_ms.get("extended_context_rows") or 0))
         m3.metric("Pares recuperación", int(_ms.get("recovery_pairs") or 0))
         m4.metric("Confianza", str(_ms.get("confidence") or "inicial").title())
-        st.caption("El modelo usa tus propios entrenamientos para actualizar gradualmente coeficientes multivariables. Al principio predominan priors conservadores RCP; con más datos pesa más tu respuesta individual.")
+        st.caption("RCP utiliza tus propios entrenamientos y tu recuperación para conocerte mejor. Al principio es conservador; con más datos personales, las recomendaciones se ajustan progresivamente a tu respuesta real.")
         if _ms.get("extended_context_rows",0) < 3:
             st.info("Fase inicial: todavía hay pocos registros con somnolencia, energía, fatiga mental, piernas y fuerza. Las predicciones son deliberadamente conservadoras.")
         if V81_PREDICTIONS:
@@ -11195,7 +11182,7 @@ elif current_page == "Perfil":
         for _label, _ok in _checks:
             st.write(("✅ " if _ok else "❌ ") + _label)
         if not CORE_V8_READY:
-            st.warning("El motor funciona en modo compatible, pero los Pruebas RCP requieren ejecutar el SQL V8.0.")
+            st.warning("Las pruebas RCP aún no están disponibles porque falta completar una actualización de configuración.")
 
     st.divider()
     st.markdown("### Mantenimiento de registros")
@@ -11235,7 +11222,7 @@ elif current_page == "Perfil":
 
 st.divider()
 st.caption(
-    "RunningCoachPro genera orientación general de entrenamiento. La puntuación de estado para entrenar y las decisiones adaptativas y longitudinales V8 "
+    "RunningCoachPro genera orientación general de entrenamiento. La puntuación de estado para entrenar y las decisiones adaptativas "
     "son reglas internas de apoyo al entrenamiento, no escalas médicas validadas. No sustituye evaluación médica "
     "ni asesoría individual de un entrenador. Ante dolor agudo, mareos, lesión o síntomas anormales, suspende el ejercicio y busca orientación profesional."
 )
