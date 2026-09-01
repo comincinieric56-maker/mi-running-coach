@@ -363,7 +363,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.2.2"
+APP_VERSION = "7.2.3"
 
 
 # ============================================================
@@ -5470,6 +5470,56 @@ def timezone_plan_gap():
     return None
 
 
+def render_timezone_plan_repair(location_key="home"):
+    """Muestra y ejecuta la reparación del plan si el ciclo activo saltó el próximo día elegible local."""
+    gap = timezone_plan_gap()
+    if not gap:
+        return False
+
+    st.warning(
+        f"⚠️ El plan activo tiene un hueco al inicio: según tu zona horaria ({rcp_timezone_name()}), "
+        f"el próximo día elegible es {gap['expected'].strftime('%d/%m/%Y')}, pero la primera sesión guardada "
+        f"es {gap['first'].strftime('%d/%m/%Y')}."
+    )
+    st.caption(
+        "Esto ocurre cuando el ciclo fue generado antes de corregir la zona horaria. La reparación crea primero "
+        "un nuevo ciclo desde la fecha correcta y archiva el ciclo defectuoso; no borra el historial."
+    )
+
+    if st.button(
+        f"🛠️ Reparar plan desde {gap['expected'].strftime('%d/%m')}",
+        type="primary",
+        use_container_width=True,
+        key=f"repair_timezone_plan_{location_key}",
+    ):
+        completed_active = [
+            l for l in CURRENT_LOGS
+            if str(l.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")
+        ]
+        if completed_active:
+            st.error(
+                "El plan activo ya tiene entrenamientos realizados. No lo regenero automáticamente para no reescribir historia."
+            )
+            return True
+
+        new_plan, err = replace_active_plan_with_v7(
+            ACTIVE_GOAL,
+            profile,
+            LATEST_ASSESSMENT,
+            start_date_value=gap["expected"],
+        )
+        if new_plan:
+            st.session_state["rcp_saved_notice"] = (
+                f"Plan reparado ✅. El nuevo ciclo comienza el {gap['expected'].strftime('%d/%m/%Y')} "
+                f"según {rcp_timezone_name()}."
+            )
+            st.rerun()
+        else:
+            st.error(err or "No fue posible reparar el inicio del plan.")
+        return True
+    return True
+
+
 def replan_decision_label(decision):
     return {
         "SKIP": "Continuar sin recuperar",
@@ -5648,7 +5698,7 @@ if ACTIVE_GOAL.get("race_date"):
     st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
 
 if ADAPTIVE_READY:
-    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.2.2")
+    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.2.3")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -5756,24 +5806,8 @@ if current_page == "Hoy":
     if _saved_notice:
         st.success(_saved_notice)
 
-    _tz_gap = timezone_plan_gap() if selected_day == rcp_today() else None
-    if _tz_gap:
-        st.warning(
-            f"Detecté un desfase horario: según tu navegador hoy es {rcp_today().strftime('%d/%m/%Y')} y "
-            f"tu próximo día elegible es {_tz_gap['expected'].strftime('%d/%m')}, pero el plan activo comienza en "
-            f"{_tz_gap['first'].strftime('%d/%m')}."
-        )
-        if st.button(f"🛠️ Reparar plan desde {_tz_gap['expected'].strftime('%d/%m')}", type="primary", use_container_width=True, key="repair_timezone_plan"):
-            completed_active = [l for l in CURRENT_LOGS if str(l.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")]
-            if completed_active:
-                st.error("El plan activo ya tiene entrenamientos realizados; no lo regenero automáticamente para no reescribir historia.")
-            else:
-                new_plan, err = replace_active_plan_with_v7(ACTIVE_GOAL, profile, LATEST_ASSESSMENT, start_date_value=_tz_gap["expected"])
-                if new_plan:
-                    st.session_state["rcp_saved_notice"] = f"Plan reparado con tu fecha local ({rcp_timezone_name()}); vuelve a iniciar el {_tz_gap['expected'].strftime('%d/%m')}."
-                    st.rerun()
-                else:
-                    st.error(err or "No fue posible reparar el inicio del plan.")
+    if selected_day == rcp_today():
+        render_timezone_plan_repair("home")
 
     today_session = PLAN_BY_DATE.get(selected_day.isoformat())
     today_log = LOG_BY_DATE.get(selected_day.isoformat())
@@ -6540,6 +6574,9 @@ elif current_page == "Plan":
         f"abre una sesión para revisar su detalle."
     )
 
+    # V7.2.3 · La reparación del hueco inicial también es visible directamente en Mi plan.
+    render_timezone_plan_repair("plan")
+
     types = sorted({workout_kind(p) for p in PLAN})
     f1, f2, f3 = st.columns(3)
     type_filter = f1.selectbox("Tipo", ["Todos"] + types)
@@ -6565,7 +6602,7 @@ elif current_page == "Plan":
             "Fecha": d.strftime("%d/%m/%Y") if d else str(p.get("session_date")),
             "Semana": p.get("week_no"),
             "Tipo": kind,
-            "Entrenamiento": p.get("workout_name"),
+            "Entrenamiento": session_display_name(p),
             "KM": float(p.get("planned_km") or 0),
             "KM base": float(p.get("baseline_planned_km") or p.get("planned_km") or 0) if ADAPTIVE_READY else float(p.get("planned_km") or 0),
             "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
