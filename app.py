@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V7.0 · Plan Engine RCP + UI/UX responsive
+# V7.1 · Plan Engine RCP + Motor Adaptativo + UI/UX responsive
 # ============================================================
 st.markdown(
     """
@@ -83,6 +83,26 @@ st.markdown(
         color: var(--rcp-ink);
         font-size: .82rem;
         font-weight: 700;
+    }
+
+    /* V7.1 · Readiness / Coach */
+    .rcp-readiness {
+        border: 1px solid var(--rcp-border);
+        border-radius: 18px;
+        padding: .9rem 1rem;
+        margin: .25rem 0 .7rem 0;
+        background: var(--rcp-surface);
+    }
+    .rcp-readiness-green { border-left: 5px solid #16a34a; }
+    .rcp-readiness-yellow { border-left: 5px solid #ca8a04; }
+    .rcp-readiness-orange { border-left: 5px solid #ea580c; }
+    .rcp-readiness-red { border-left: 5px solid #dc2626; }
+    .rcp-coach-note {
+        border: 1px solid var(--rcp-border);
+        border-radius: 16px;
+        padding: .78rem .9rem;
+        background: rgba(248,250,252,.82);
+        margin: .25rem 0 .75rem 0;
     }
 
     /* KPI cards */
@@ -302,7 +322,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.0.0"
+APP_VERSION = "7.1.0"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -685,6 +705,102 @@ def delete_log_by_id(log_id):
     if log_id is None:
         return
     client.table("rc_workout_logs").delete().eq("user_id", USER_ID).eq("id", int(log_id)).execute()
+
+
+# ============================================================
+# V7.1 · Persistencia del Motor Adaptativo
+# ============================================================
+def adaptive_storage_ready():
+    """Comprueba la migración V7.1 sin modificar datos."""
+    try:
+        client.table("rc_daily_readiness").select("id,readiness_score,readiness_status").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_plan_adjustments").select("id,decision,status").eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_plan_sessions").select(
+            "id,baseline_planned_km,baseline_workout_type,baseline_workout_name,"
+            "baseline_target,baseline_intensity,baseline_description,adaptation_status,adaptation_id"
+        ).eq("user_id", USER_ID).limit(1).execute()
+        client.table("rc_workout_logs").select(
+            "id,post_pain,post_fatigue,perceived_difficulty,missed_reason"
+        ).eq("user_id", USER_ID).limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def get_readiness_rows(plan_id=None, start_date=None, end_date=None, limit=180):
+    if not plan_id:
+        active = get_active_plan_record()
+        plan_id = (active or {}).get("id")
+    if not plan_id:
+        return []
+    q = (
+        client.table("rc_daily_readiness")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_id))
+    )
+    if start_date is not None:
+        q = q.gte("checkin_date", str(start_date))
+    if end_date is not None:
+        q = q.lte("checkin_date", str(end_date))
+    return q.order("checkin_date", desc=True).limit(limit).execute().data or []
+
+
+def get_readiness_for_date(day_value, plan_id=None):
+    rows = get_readiness_rows(plan_id=plan_id, start_date=day_value, end_date=day_value, limit=1)
+    return rows[0] if rows else None
+
+
+def save_readiness(payload, plan_id=None):
+    active = get_active_plan_record()
+    pid = plan_id or (active or {}).get("id")
+    if not pid:
+        raise RuntimeError("No existe un plan activo para asociar el check-in.")
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    row["plan_id"] = int(pid)
+    row["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return client.table("rc_daily_readiness").upsert(
+        row, on_conflict="user_id,plan_id,checkin_date"
+    ).execute()
+
+
+def get_adjustments(plan_id=None, limit=50):
+    if not plan_id:
+        active = get_active_plan_record()
+        plan_id = (active or {}).get("id")
+    if not plan_id:
+        return []
+    return (
+        client.table("rc_plan_adjustments")
+        .select("*")
+        .eq("user_id", USER_ID)
+        .eq("plan_id", int(plan_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+
+def create_adjustment_record(payload):
+    row = dict(payload)
+    row["user_id"] = USER_ID
+    result = client.table("rc_plan_adjustments").insert(row).execute().data or []
+    return result[0] if result else None
+
+
+def update_adjustment_record(adjustment_id, **fields):
+    if not adjustment_id:
+        return
+    client.table("rc_plan_adjustments").update(fields).eq("user_id", USER_ID).eq("id", int(adjustment_id)).execute()
+
+
+def update_plan_session_fields(session_id, **fields):
+    if not session_id:
+        return
+    client.table("rc_plan_sessions").update(fields).eq("user_id", USER_ID).eq("id", int(session_id)).execute()
 
 
 def insert_plan_sessions(plan_id, rows):
@@ -2498,7 +2614,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         return [], {}, "El motor V7 no produjo sesiones en el intervalo disponible."
 
     metadata = {
-        "engine": "RCP-V7.0",
+        "engine": "RCP-V7.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -2534,7 +2650,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V7.0",
+        "engine_version": "RCP-V7.1",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -2620,7 +2736,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V7.0",
+        "engine_version": "RCP-V7.1",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -3669,7 +3785,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
     elif active_plan:
         with st.expander("🧠 Actualizar mi plan al motor RCP V7", expanded=True):
             st.write(
-                "V7 utiliza tu Evaluación RCP, días realmente disponibles, base actual, experiencia, tirada larga, "
+                "V7.1 utiliza tu Evaluación RCP, días realmente disponibles, base actual, experiencia, tirada larga, "
                 "objetivo, calendario y rendimiento reciente. El plan actual no se borra: queda ARCHIVADO como historial."
             )
             preview_rows, preview_meta, preview_reason = build_v7_plan(
@@ -3984,6 +4100,12 @@ ORPHAN_LOGS = get_unassigned_logs() + [
 ]
 LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
+# V7.1 · Datos adaptativos del plan activo.
+ADAPTIVE_READY = adaptive_storage_ready()
+READINESS_ROWS = get_readiness_rows(ACTIVE_PLAN["id"]) if ADAPTIVE_READY and ACTIVE_PLAN else []
+READINESS_BY_DATE = {str(x.get("checkin_date")): x for x in READINESS_ROWS}
+ADJUSTMENTS = get_adjustments(ACTIVE_PLAN["id"]) if ADAPTIVE_READY and ACTIVE_PLAN else []
+
 # ============================================================
 # V6.4.2 · Navigation Grid por iconos / Sidebar
 # ============================================================
@@ -4053,6 +4175,423 @@ def workout_kind(session):
     if "FUERZA" in text:
         return "Fuerza"
     return str(session.get("workout_type") or "Otro").title()
+
+
+# ============================================================
+# V7.1 · Motor Adaptativo RCP
+# ============================================================
+def readiness_score_from_inputs(sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait):
+    """Índice heurístico RCP 0–100. No es una escala médica validada."""
+    sleep_quality = int(sleep_quality)
+    fatigue = int(fatigue)
+    soreness = int(soreness)
+    stress = int(stress)
+    motivation = int(motivation)
+    pain = int(pain)
+
+    score = 100
+    score -= {1: 30, 2: 20, 3: 8, 4: 2, 5: 0}.get(sleep_quality, 8)
+    score -= {1: 0, 2: 4, 3: 10, 4: 20, 5: 30}.get(fatigue, 10)
+    score -= 0 if soreness == 0 else (4 if soreness <= 3 else 10 if soreness <= 6 else 20)
+    score -= {1: 0, 2: 2, 3: 5, 4: 9, 5: 15}.get(stress, 5)
+    score -= {1: 10, 2: 6, 3: 3, 4: 1, 5: 0}.get(motivation, 3)
+    score -= 0 if pain == 0 else (8 if pain <= 3 else 25 if pain <= 6 else 40)
+    if illness:
+        score -= 35
+    if pain_changes_gait:
+        score -= 40
+    score = int(max(0, min(100, score)))
+
+    if illness or pain_changes_gait or pain >= 7:
+        status = "RED"
+        message = "No se recomienda ejecutar intensidad con este check-in. Prioriza recuperación y valoración si los síntomas o el dolor lo requieren."
+    elif score < 55 or pain >= 5 or fatigue >= 5:
+        status = "ORANGE"
+        message = "La disponibilidad para entrenar está reducida. Conviene disminuir carga e intensidad."
+    elif score < 75 or sleep_quality <= 2 or fatigue >= 4 or soreness >= 6:
+        status = "YELLOW"
+        message = "Hay señales de recuperación incompleta. Mantén una sesión conservadora y reevalúa sensaciones."
+    else:
+        status = "GREEN"
+        message = "Disponibilidad compatible con seguir el plan previsto, manteniendo control del esfuerzo."
+    return score, status, message
+
+
+def readiness_status_label(status):
+    return {
+        "GREEN": "🟢 Normal",
+        "YELLOW": "🟡 Cautela",
+        "ORANGE": "🟠 Reducir",
+        "RED": "🔴 No intensidad",
+    }.get(str(status or "").upper(), "—")
+
+
+def expected_rpe_range(session):
+    kind = workout_kind(session)
+    if kind == "Carrera":
+        return (7, 10)
+    if kind == "Series":
+        return (7, 8)
+    if kind == "Tempo":
+        return (6, 7)
+    if kind == "Larga":
+        return (3, 5)
+    if kind == "Rodaje":
+        text = f"{session.get('workout_name') or ''} {session.get('intensity') or ''}".upper()
+        if "RECUP" in text:
+            return (2, 3)
+        return (3, 4)
+    return (3, 5)
+
+
+def _session_baseline(session):
+    return {
+        "planned_km": float(session.get("baseline_planned_km") if session.get("baseline_planned_km") is not None else session.get("planned_km") or 0),
+        "workout_type": session.get("baseline_workout_type") or session.get("workout_type"),
+        "workout_name": session.get("baseline_workout_name") or session.get("workout_name"),
+        "target": session.get("baseline_target") or session.get("target"),
+        "intensity": session.get("baseline_intensity") or session.get("intensity"),
+        "description": session.get("baseline_description") or session.get("description"),
+    }
+
+
+def adaptation_snapshot(trigger_day=None):
+    """Resume 14 días recientes y propone una acción conservadora sobre el plan futuro."""
+    trigger_day = trigger_day or date.today()
+    start14 = trigger_day - timedelta(days=13)
+    start7 = trigger_day - timedelta(days=6)
+
+    recent_sessions = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date")))
+        and start14 <= d <= trigger_day
+        and not session_is_optional(p)
+    ]
+    recent_logs = [
+        l for l in CURRENT_LOGS
+        if (d := parse_date_safe(l.get("session_date"))) and start14 <= d <= trigger_day
+    ]
+    log_map = {str(l.get("session_date")): l for l in recent_logs}
+
+    due = [p for p in recent_sessions if parse_date_safe(p.get("session_date")) <= trigger_day]
+    completed_local = [
+        p for p in due
+        if str(log_map.get(str(p.get("session_date")), {}).get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")
+    ]
+    omitted_local = [
+        log_map.get(str(p.get("session_date")))
+        for p in due
+        if str(log_map.get(str(p.get("session_date")), {}).get("status") or "").upper() == "OMITIDO"
+    ]
+    omitted_local = [x for x in omitted_local if x]
+
+    planned_due_km = sum(float(p.get("planned_km") or 0) for p in due)
+    actual_due_km = sum(
+        float(log_map.get(str(p.get("session_date")), {}).get("actual_km") or 0)
+        for p in completed_local
+    )
+    adherence = (len(completed_local) / len(due) * 100) if due else None
+    km_ratio = (actual_due_km / planned_due_km) if planned_due_km > 0 else None
+
+    rpe_excess = []
+    post_pains = []
+    post_fatigues = []
+    for p in completed_local:
+        log = log_map.get(str(p.get("session_date"))) or {}
+        if log.get("rpe") is not None:
+            _, upper = expected_rpe_range(p)
+            rpe_excess.append(max(0.0, float(log.get("rpe")) - float(upper)))
+        if log.get("post_pain") is not None:
+            post_pains.append(int(log.get("post_pain")))
+        if log.get("post_fatigue") is not None:
+            post_fatigues.append(int(log.get("post_fatigue")))
+
+    readiness_recent = [
+        r for r in READINESS_ROWS
+        if (d := parse_date_safe(r.get("checkin_date"))) and start7 <= d <= trigger_day
+    ]
+    readiness_scores = [int(r.get("readiness_score") or 0) for r in readiness_recent]
+    readiness_avg = (sum(readiness_scores) / len(readiness_scores)) if readiness_scores else None
+    readiness_statuses = [str(r.get("readiness_status") or "").upper() for r in readiness_recent]
+    today_readiness = READINESS_BY_DATE.get(trigger_day.isoformat())
+    today_status = str((today_readiness or {}).get("readiness_status") or "").upper()
+
+    avg_rpe_excess = (sum(rpe_excess) / len(rpe_excess)) if rpe_excess else 0.0
+    max_post_pain = max(post_pains) if post_pains else 0
+    avg_post_fatigue = (sum(post_fatigues) / len(post_fatigues)) if post_fatigues else None
+
+    missed_recovery = sum(
+        1 for x in omitted_local
+        if str(x.get("missed_reason") or "").lower() in ("fatiga", "dolor/molestia", "enfermedad")
+    )
+    missed_schedule = sum(
+        1 for x in omitted_local
+        if str(x.get("missed_reason") or "").lower() in ("falta de tiempo", "viaje")
+    )
+
+    adapted_future = [
+        p for p in PLAN
+        if (d := parse_date_safe(p.get("session_date")))
+        and d >= trigger_day
+        and str(p.get("adaptation_status") or "BASELINE").upper() != "BASELINE"
+        and str(LOG_BY_DATE.get(str(p.get("session_date")), {}).get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO", "OMITIDO")
+    ]
+
+    evidence_count = len(completed_local) + len(readiness_recent)
+    reasons = []
+    decision = "COLLECTING"
+    severity = "none"
+
+    hard_flag = (
+        today_status == "RED"
+        or "RED" in readiness_statuses
+        or max_post_pain >= 7
+    )
+    if hard_flag:
+        decision = "PROTECT"
+        severity = "high"
+        reasons.append("Existe una señal roja reciente de readiness o dolor post-entrenamiento alto.")
+    elif (
+        today_status == "ORANGE"
+        or (readiness_avg is not None and readiness_avg < 58)
+        or max_post_pain >= 5
+        or missed_recovery >= 2
+        or avg_rpe_excess >= 2.0
+    ):
+        decision = "REDUCE"
+        severity = "major"
+        reasons.append("La recuperación reciente sugiere una reducción importante de carga durante los próximos días.")
+    elif (
+        today_status == "YELLOW"
+        or (readiness_avg is not None and readiness_avg < 72)
+        or (adherence is not None and adherence < 70 and missed_recovery > 0)
+        or avg_rpe_excess >= 1.0
+        or (avg_post_fatigue is not None and avg_post_fatigue >= 4)
+    ):
+        decision = "REDUCE"
+        severity = "moderate"
+        reasons.append("Hay señales de fatiga o esfuerzo mayor de lo previsto; conviene descargar parcialmente.")
+    elif evidence_count >= 2:
+        if adapted_future and (
+            today_status in ("", "GREEN")
+            and (readiness_avg is None or readiness_avg >= 75)
+            and max_post_pain <= 2
+            and avg_rpe_excess <= 0.5
+            and (adherence is None or adherence >= 80)
+        ):
+            decision = "RESTORE"
+            severity = "recovery"
+            reasons.append("Los indicadores se han normalizado; puede restaurarse el plan hacia su baseline original.")
+        else:
+            decision = "MAINTAIN"
+            severity = "normal"
+            reasons.append("Los datos recientes no justifican cambiar la progresión prevista.")
+    else:
+        reasons.append("Aún faltan datos suficientes. Completa check-ins y entrenamientos para personalizar la adaptación.")
+
+    if missed_schedule >= 2:
+        reasons.append("Se observan omisiones por tiempo/viaje; conviene revisar disponibilidad, no aumentar carga para compensarlas.")
+
+    return {
+        "trigger_date": trigger_day.isoformat(),
+        "decision": decision,
+        "severity": severity,
+        "reasons": reasons,
+        "metrics": {
+            "window_days": 14,
+            "due_sessions": len(due),
+            "completed_sessions": len(completed_local),
+            "omitted_sessions": len(omitted_local),
+            "adherence_pct": round(adherence, 1) if adherence is not None else None,
+            "planned_due_km": round(planned_due_km, 1),
+            "actual_due_km": round(actual_due_km, 1),
+            "actual_plan_ratio": round(km_ratio, 3) if km_ratio is not None else None,
+            "avg_rpe_excess": round(avg_rpe_excess, 2),
+            "max_post_pain": max_post_pain,
+            "avg_post_fatigue": round(avg_post_fatigue, 2) if avg_post_fatigue is not None else None,
+            "readiness_avg_7d": round(readiness_avg, 1) if readiness_avg is not None else None,
+            "today_readiness": today_status or None,
+            "recovery_related_omissions": missed_recovery,
+            "schedule_related_omissions": missed_schedule,
+            "adapted_future_sessions": len(adapted_future),
+        },
+    }
+
+
+def _adapt_session_fields(session, decision, severity, quality_index=0):
+    base = _session_baseline(session)
+    kind = workout_kind({**session, **base})
+    if kind == "Carrera":
+        return None
+
+    if decision == "RESTORE":
+        return {
+            **base,
+            "adaptation_status": "BASELINE",
+            "adapted_at": datetime.now(timezone.utc).isoformat(),
+            "adaptation_id": None,
+        }
+
+    if decision == "PROTECT":
+        factor = 0.65 if kind != "Larga" else 0.70
+        new_km = max(2.0, round(base["planned_km"] * factor, 1))
+        if kind in ("Series", "Tempo"):
+            return {
+                "planned_km": new_km,
+                "workout_type": "RODAJE",
+                "workout_name": "Rodaje de recuperación · adaptación RCP",
+                "target": "RPE 2–3 · conversación completa",
+                "intensity": "BAJA",
+                "description": "ADAPTADO V7.1: se retira la intensidad prevista por señales recientes de recuperación. Mantén esfuerzo muy cómodo. Si persisten síntomas o dolor relevante, no entrenes y busca orientación apropiada.",
+                "adaptation_status": "PROTECTED",
+                "adapted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        return {
+            "planned_km": new_km,
+            "target": "RPE 2–3 · muy cómodo",
+            "intensity": "BAJA",
+            "description": "ADAPTADO V7.1: volumen reducido temporalmente. Prioriza recuperación y técnica relajada.",
+            "adaptation_status": "PROTECTED",
+            "adapted_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if decision == "REDUCE":
+        major = severity == "major"
+        factor = 0.75 if major else 0.85
+        if kind == "Larga":
+            factor = 0.75 if major else 0.82
+        new_km = max(2.0, round(base["planned_km"] * factor, 1))
+        if major and kind in ("Series", "Tempo"):
+            return {
+                "planned_km": new_km,
+                "workout_type": "RODAJE",
+                "workout_name": "Rodaje suave · descarga adaptativa",
+                "target": "RPE 3 · conversación cómoda",
+                "intensity": "BAJA",
+                "description": "ADAPTADO V7.1: la sesión de calidad se reemplaza por rodaje suave durante la descarga adaptativa.",
+                "adaptation_status": "REDUCED",
+                "adapted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        desc = str(base.get("description") or "")
+        return {
+            "planned_km": new_km,
+            "description": f"ADAPTADO V7.1: volumen reducido temporalmente. {desc}",
+            "adaptation_status": "REDUCED",
+            "adapted_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return None
+
+
+def apply_adaptation(recommendation, trigger_day=None):
+    if not ADAPTIVE_READY or not ACTIVE_PLAN:
+        return False, "El módulo adaptativo V7.1 no está disponible."
+    trigger_day = trigger_day or date.today()
+    decision = str(recommendation.get("decision") or "")
+    severity = str(recommendation.get("severity") or "")
+    if decision not in ("PROTECT", "REDUCE", "RESTORE"):
+        return False, "La recomendación actual no requiere modificar sesiones."
+
+    scope_start = trigger_day
+    scope_end = trigger_day + timedelta(days=6)
+    targets = []
+    for p in PLAN:
+        d = parse_date_safe(p.get("session_date"))
+        if not d or not (scope_start <= d <= scope_end):
+            continue
+        if str(LOG_BY_DATE.get(str(p.get("session_date")), {}).get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+            continue
+        if workout_kind(p) == "Carrera":
+            continue
+        if decision == "RESTORE" and str(p.get("adaptation_status") or "BASELINE").upper() == "BASELINE":
+            continue
+        targets.append(p)
+
+    if not targets:
+        return False, "No hay sesiones futuras elegibles para modificar en los próximos 7 días."
+
+    record = create_adjustment_record({
+        "plan_id": int(ACTIVE_PLAN["id"]),
+        "trigger_date": trigger_day.isoformat(),
+        "scope_start": scope_start.isoformat(),
+        "scope_end": scope_end.isoformat(),
+        "decision": decision,
+        "severity": severity,
+        "reason": " ".join(recommendation.get("reasons") or []),
+        "metrics": recommendation.get("metrics") or {},
+        "changes": [],
+        "status": "PENDING",
+    })
+    if not record:
+        return False, "No fue posible crear la auditoría del ajuste."
+
+    changes = []
+    touched = []
+    quality_index = 0
+    try:
+        for p in sorted(targets, key=lambda x: str(x.get("session_date"))):
+            before = {
+                "planned_km": float(p.get("planned_km") or 0),
+                "workout_type": p.get("workout_type"),
+                "workout_name": p.get("workout_name"),
+                "target": p.get("target"),
+                "intensity": p.get("intensity"),
+                "description": p.get("description"),
+                "adaptation_status": p.get("adaptation_status") or "BASELINE",
+                "adaptation_id": p.get("adaptation_id"),
+            }
+            if workout_kind(p) in ("Series", "Tempo"):
+                quality_index += 1
+            after = _adapt_session_fields(p, decision, severity, quality_index)
+            if not after:
+                continue
+            if decision != "RESTORE":
+                after["adaptation_id"] = int(record["id"])
+            update_plan_session_fields(p["id"], **after)
+            touched.append((p, before))
+            changes.append({
+                "session_id": p.get("id"),
+                "session_date": str(p.get("session_date")),
+                "before": before,
+                "after": after,
+            })
+
+        update_adjustment_record(record["id"], changes=changes, status="APPLIED")
+        return True, f"Adaptación aplicada a {len(changes)} sesión(es) entre {scope_start.strftime('%d/%m')} y {scope_end.strftime('%d/%m')}."
+    except Exception as exc:
+        for p, before in reversed(touched):
+            try:
+                update_plan_session_fields(p["id"], **before)
+            except Exception:
+                pass
+        update_adjustment_record(record["id"], changes=changes, status="FAILED")
+        return False, f"No fue posible completar el ajuste; se intentó revertir los cambios parciales: {exc}"
+
+
+def revert_last_adaptation():
+    rows = [a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"]
+    if not rows:
+        return False, "No hay una adaptación aplicada para revertir."
+    adj = rows[0]
+    changes = adj.get("changes") or []
+    if not isinstance(changes, list) or not changes:
+        return False, "La última adaptación no contiene cambios auditables."
+    try:
+        for item in reversed(changes):
+            before = dict(item.get("before") or {})
+            sid = item.get("session_id")
+            # No alterar una sesión que ya fue registrada después del ajuste.
+            session_date = str(item.get("session_date") or "")
+            if str(LOG_BY_DATE.get(session_date, {}).get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+                continue
+            update_plan_session_fields(sid, **before)
+        update_adjustment_record(
+            adj["id"],
+            status="REVERTED",
+            reverted_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return True, "Última adaptación revertida en las sesiones aún no realizadas."
+    except Exception as exc:
+        return False, f"No fue posible revertir la adaptación: {exc}"
 
 
 def status_label_for_date(day_value):
@@ -4235,6 +4774,11 @@ st.sidebar.markdown(f"🎯 **{ACTIVE_GOAL.get('goal_type') or '—'}**")
 if ACTIVE_GOAL.get("race_date"):
     st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
 
+if ADAPTIVE_READY:
+    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.1")
+else:
+    st.sidebar.warning("V7.1 pendiente de migración SQL")
+
 if LATEST_ASSESSMENT:
     _side_score = int(LATEST_ASSESSMENT.get("runner_score") or 0)
     _side_level = str(LATEST_ASSESSMENT.get("runner_level") or "—")
@@ -4328,6 +4872,102 @@ if current_page == "Hoy":
     today_session = PLAN_BY_DATE.get(selected_day.isoformat())
     today_log = LOG_BY_DATE.get(selected_day.isoformat())
 
+    # V7.1 · Check-in de recuperación. Solo hoy se usa para decisiones inmediatas.
+    if ADAPTIVE_READY and selected_day == date.today():
+        existing_ready = READINESS_BY_DATE.get(selected_day.isoformat(), {})
+        st.markdown("### 🧠 Estado de hoy")
+        if existing_ready:
+            _rs = int(existing_ready.get("readiness_score") or 0)
+            _rst = str(existing_ready.get("readiness_status") or "")
+            _class = _rst.lower() if _rst.lower() in ("green", "yellow", "orange", "red") else "green"
+            st.markdown(
+                f'<div class="rcp-readiness rcp-readiness-{_class}"><b>{readiness_status_label(_rst)} · {_rs}/100</b><br>'
+                f'<span>{html.escape(str(existing_ready.get("readiness_message") or ""))}</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("Haz un check-in breve antes de entrenar. Sirve para ajustar la semana, no para diagnosticar enfermedad.")
+
+        with st.expander("📝 Hacer / actualizar check-in", expanded=not bool(existing_ready)):
+            with st.form("daily_readiness_form"):
+                c1, c2 = st.columns(2)
+                sleep_quality = c1.slider("Sueño", 1, 5, int(existing_ready.get("sleep_quality") or 4), help="1 = muy malo · 5 = excelente")
+                fatigue = c2.slider("Fatiga", 1, 5, int(existing_ready.get("fatigue") or 2), help="1 = mínima · 5 = muy alta")
+                c3, c4 = st.columns(2)
+                soreness = c3.slider("Dolor muscular / agujetas", 0, 10, int(existing_ready.get("soreness") or 0))
+                stress = c4.slider("Estrés", 1, 5, int(existing_ready.get("stress") or 2))
+                c5, c6 = st.columns(2)
+                motivation = c5.slider("Motivación", 1, 5, int(existing_ready.get("motivation") or 4))
+                pain = c6.slider("Dolor localizado", 0, 10, int(existing_ready.get("pain") or 0))
+                illness = st.checkbox("Tengo fiebre o síntomas agudos de enfermedad", value=bool(existing_ready.get("illness")))
+                pain_changes_gait = st.checkbox("El dolor modifica mi forma de caminar o correr", value=bool(existing_ready.get("pain_changes_gait")))
+                ready_notes = st.text_area("Nota opcional", value=str(existing_ready.get("notes") or ""))
+                save_ready = st.form_submit_button("Guardar check-in", use_container_width=True)
+            if save_ready:
+                rs, rst, rmsg = readiness_score_from_inputs(
+                    sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait
+                )
+                save_readiness({
+                    "checkin_date": selected_day.isoformat(),
+                    "sleep_quality": int(sleep_quality),
+                    "fatigue": int(fatigue),
+                    "soreness": int(soreness),
+                    "stress": int(stress),
+                    "motivation": int(motivation),
+                    "pain": int(pain),
+                    "illness": bool(illness),
+                    "pain_changes_gait": bool(pain_changes_gait),
+                    "notes": ready_notes.strip(),
+                    "readiness_score": int(rs),
+                    "readiness_status": rst,
+                    "readiness_message": rmsg,
+                })
+                st.success("Check-in guardado.")
+                st.rerun()
+
+        # Recomendación adaptativa auditable. Nunca cambia el plan sin acción explícita.
+        coach = adaptation_snapshot(date.today())
+        decision = coach.get("decision")
+        reasons = coach.get("reasons") or []
+        metrics = coach.get("metrics") or {}
+        st.markdown("### 🤖 Coach RCP")
+        if decision == "PROTECT":
+            st.error("Protección de carga recomendada: retirar intensidad y reducir temporalmente el volumen de los próximos 7 días.")
+        elif decision == "REDUCE":
+            st.warning("Descarga adaptativa recomendada para los próximos 7 días.")
+        elif decision == "RESTORE":
+            st.success("Los indicadores permiten restaurar las sesiones adaptadas hacia el plan original.")
+        elif decision == "MAINTAIN":
+            st.success("Mantener el plan previsto. No hay señales suficientes para modificar la próxima semana.")
+        else:
+            st.info("Recolectando datos para personalizar la adaptación.")
+        if reasons:
+            st.caption(" ".join(reasons))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Adherencia 14 d", "—" if metrics.get("adherence_pct") is None else f"{metrics['adherence_pct']:.0f}%")
+        m2.metric("Readiness 7 d", "—" if metrics.get("readiness_avg_7d") is None else f"{metrics['readiness_avg_7d']:.0f}/100")
+        m3.metric("Exceso RPE", f"+{float(metrics.get('avg_rpe_excess') or 0):.1f}")
+        m4.metric("Dolor post máx.", f"{int(metrics.get('max_post_pain') or 0)}/10")
+
+        latest_applied = next((a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"), None)
+        already_today = bool(
+            latest_applied
+            and str(latest_applied.get("trigger_date")) == date.today().isoformat()
+            and str(latest_applied.get("decision") or "") == str(decision or "")
+        )
+        if decision in ("PROTECT", "REDUCE", "RESTORE"):
+            if already_today:
+                st.caption("Esta recomendación ya fue aplicada hoy. Los cambios quedan registrados en la auditoría V7.1.")
+            else:
+                if st.button("🧠 Aplicar adaptación a los próximos 7 días", type="primary", use_container_width=True):
+                    ok, msg = apply_adaptation(coach, date.today())
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+
+    elif not ADAPTIVE_READY:
+        st.warning("Motor adaptativo V7.1 pendiente: ejecuta supabase_v7_1_adaptive.sql para activar check-in y ajustes dinámicos.")
+
     with st.container(border=True):
         if not today_session:
             st.markdown("### 😴 Recuperación")
@@ -4366,6 +5006,12 @@ if current_page == "Hoy":
             b.metric("Semana", int(today_session.get("week_no") or 0))
             c.metric("Intensidad", str(today_session.get("intensity") or "—").title())
             dcol.metric("Estado", status_label.replace("✅ ", "").replace("🟡 ", "").replace("⏭️ ", "").replace("⏱️ ", "").replace("⚠️ ", ""))
+
+            if str(today_session.get("adaptation_status") or "BASELINE").upper() != "BASELINE":
+                base_km = float(today_session.get("baseline_planned_km") or today_session.get("planned_km") or 0)
+                st.warning(
+                    f"🧠 Sesión adaptada V7.1 · plan original {base_km:g} km → actual {float(today_session.get('planned_km') or 0):g} km."
+                )
 
             with st.expander("📋 Cómo hacerlo", expanded=False):
                 st.write(today_session.get("description") or "Sin instrucciones adicionales.")
@@ -4826,6 +5472,57 @@ elif current_page == "Progreso":
     else:
         st.info("Completa entrenamientos para ver la distribución por tipo.")
 
+    # 7 · V7.1 Readiness + historial de adaptaciones
+    if ADAPTIVE_READY:
+        st.divider()
+        st.markdown("## 🧠 Adaptación V7.1")
+        readiness_values = []
+        for r in sorted(READINESS_ROWS, key=lambda x: str(x.get("checkin_date"))):
+            readiness_values.append({
+                "Fecha": str(r.get("checkin_date")),
+                "Readiness": int(r.get("readiness_score") or 0),
+                "Estado": str(r.get("readiness_status") or ""),
+            })
+        if readiness_values:
+            st.markdown("### Readiness diario")
+            st.vega_lite_chart(
+                {
+                    "data": {"values": readiness_values},
+                    "mark": {"type": "line", "point": True, "tooltip": True},
+                    "encoding": {
+                        "x": {"field": "Fecha", "type": "temporal", "title": None},
+                        "y": {"field": "Readiness", "type": "quantitative", "scale": {"domain": [0, 100]}, "title": "0–100"},
+                        "color": {"field": "Estado", "type": "nominal"},
+                        "tooltip": [{"field": "Fecha", "type": "temporal"}, {"field": "Readiness"}, {"field": "Estado"}],
+                    },
+                    "height": 250,
+                },
+                use_container_width=True,
+            )
+        else:
+            st.info("Haz check-ins desde 🏠 Hoy para activar la tendencia de readiness.")
+
+        if ADJUSTMENTS:
+            st.markdown("### Historial de ajustes")
+            adj_rows = []
+            for a in ADJUSTMENTS[:15]:
+                changes = a.get("changes") or []
+                adj_rows.append({
+                    "Fecha": a.get("trigger_date"),
+                    "Decisión": a.get("decision"),
+                    "Severidad": a.get("severity") or "—",
+                    "Sesiones": len(changes) if isinstance(changes, list) else 0,
+                    "Estado": a.get("status"),
+                })
+            st.dataframe(adj_rows, use_container_width=True, hide_index=True)
+            latest_applied = next((a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"), None)
+            if latest_applied:
+                if st.button("↩️ Revertir última adaptación aplicada", use_container_width=True):
+                    ok, msg = revert_last_adaptation()
+                    (st.success if ok else st.error)(msg)
+                    if ok:
+                        st.rerun()
+
 
 # ============================================================
 # 🗓️ PLAN
@@ -4864,10 +5561,11 @@ elif current_page == "Plan":
         table.append({
             "Fecha": d.strftime("%d/%m/%Y") if d else str(p.get("session_date")),
             "Semana": p.get("week_no"),
-            "Fase": active_plan_week_info(p.get("week_no")).get("phase") or "—",
             "Tipo": kind,
             "Entrenamiento": p.get("workout_name"),
             "KM": float(p.get("planned_km") or 0),
+            "KM base": float(p.get("baseline_planned_km") or p.get("planned_km") or 0) if ADAPTIVE_READY else float(p.get("planned_km") or 0),
+            "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
             "Objetivo": p.get("target"),
             "Opcional": "Sí" if session_is_optional(p) else "No",
             "Estado": status,
@@ -4953,6 +5651,23 @@ elif current_page == "Registro":
             avg_hr = h1.number_input("FC media (opcional)", 0, 230, int(existing.get("avg_hr") or 0))
             max_hr = h2.number_input("FC máxima (opcional)", 0, 240, int(existing.get("max_hr") or 0))
 
+            if ADAPTIVE_READY:
+                st.markdown("#### Recuperación post-sesión")
+                a1, a2 = st.columns(2)
+                post_pain = a1.slider("Dolor después de entrenar", 0, 10, int(existing.get("post_pain") or 0))
+                post_fatigue = a2.slider("Fatiga después de entrenar", 1, 5, int(existing.get("post_fatigue") or 2))
+                difficulty_options = ["Mucho más fácil", "Más fácil", "Como esperaba", "Más difícil", "Mucho más difícil"]
+                current_difficulty = str(existing.get("perceived_difficulty") or "Como esperaba")
+                perceived_difficulty = st.selectbox(
+                    "La sesión se sintió…",
+                    difficulty_options,
+                    index=difficulty_options.index(current_difficulty) if current_difficulty in difficulty_options else 2,
+                )
+            else:
+                post_pain = None
+                post_fatigue = None
+                perceived_difficulty = None
+
             status_options = ["COMPLETADO", "MODIFICADO", "OMITIDO"]
             current_status = str(existing.get("status") or "COMPLETADO").upper()
             status = st.selectbox(
@@ -4960,6 +5675,16 @@ elif current_page == "Registro":
                 status_options,
                 index=status_options.index(current_status) if current_status in status_options else 0,
             )
+            if ADAPTIVE_READY:
+                missed_options = ["—", "Falta de tiempo", "Fatiga", "Dolor/molestia", "Enfermedad", "Viaje", "Otro"]
+                current_missed = str(existing.get("missed_reason") or "—")
+                missed_reason = st.selectbox(
+                    "Si la omitiste, motivo",
+                    missed_options,
+                    index=missed_options.index(current_missed) if current_missed in missed_options else 0,
+                )
+            else:
+                missed_reason = "—"
             notes = st.text_area("Observaciones", value=str(existing.get("notes") or ""))
             submit = st.form_submit_button("💾 Guardar entrenamiento", use_container_width=True)
 
@@ -4983,6 +5708,10 @@ elif current_page == "Registro":
                     "avg_hr": int(avg_hr) if avg_hr else None,
                     "max_hr": int(max_hr) if max_hr else None,
                     "status": status,
+                    "post_pain": int(post_pain) if ADAPTIVE_READY and status != "OMITIDO" else None,
+                    "post_fatigue": int(post_fatigue) if ADAPTIVE_READY and status != "OMITIDO" else None,
+                    "perceived_difficulty": perceived_difficulty if ADAPTIVE_READY and status != "OMITIDO" else None,
+                    "missed_reason": (missed_reason if ADAPTIVE_READY and status == "OMITIDO" and missed_reason != "—" else None),
                     "notes": notes.strip(),
                 })
                 st.success("Entrenamiento guardado ✅")
@@ -5136,7 +5865,7 @@ elif current_page == "Perfil":
 
 st.divider()
 st.caption(
-    "RunningCoachPro genera orientación general de entrenamiento. "
-    "No sustituye evaluación médica ni coaching individual. Ante dolor agudo, "
-    "mareos, lesión o síntomas anormales, suspende el ejercicio y busca orientación profesional."
+    "RunningCoachPro genera orientación general de entrenamiento. El Readiness Score y las decisiones adaptativas V7.1 "
+    "son heurísticas internas de apoyo al entrenamiento, no escalas médicas validadas. No sustituye evaluación médica "
+    "ni coaching individual. Ante dolor agudo, mareos, lesión o síntomas anormales, suspende el ejercicio y busca orientación profesional."
 )
