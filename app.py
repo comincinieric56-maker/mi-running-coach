@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.1"
+APP_VERSION = "8.1.2"
 
 
 # ============================================================
@@ -3075,6 +3075,101 @@ def v81_decision_label(decision):
         "MANTENER":"Mantener la sesión", "REDUCIR":"Reducir la sesión", "SUSTITUIR_POR_SUAVE":"Sustituir intensidad por trabajo suave",
         "REDUCIR_LARGA":"Reducir o mover la tirada larga", "PROTEGER":"Proteger la recuperación",
     }.get(str(decision or ""),str(decision or "—"))
+
+
+def v81_actionable_guidance(session, readiness_row, prediction):
+    """Convierte la decisión estadística en una instrucción concreta y comprensible para hoy."""
+    sess = session or {}
+    rr = readiness_row or {}
+    pred = prediction or {}
+    out = pred.get("outputs") or {}
+    decision = str(pred.get("decision") or "MANTENER")
+    kind = workout_kind(sess)
+    planned = float(sess.get("planned_km") or 0)
+    pain = int(rr.get("pain") or 0)
+    illness = bool(rr.get("illness"))
+    gait = bool(rr.get("pain_changes_gait"))
+    fatigue = int(rr.get("fatigue") or 0)
+    sleepiness = int(rr.get("sleepiness") or 0)
+    energy = int(rr.get("energy") or 0)
+    legs = int(rr.get("legs_heaviness") or 0)
+    prob = float(out.get("completion_probability") or 0)
+    delta = float(out.get("expected_delta_rpe") or 0)
+    rec = out.get("recovery_cost") or {}
+    rec_score = int(rec.get("score") or 0)
+
+    # Seguridad determinista: no convertir una señal roja en una simple reducción.
+    if illness:
+        return {
+            "title": "Hoy: no correr",
+            "text": "No hagas trote, series ni tirada larga hoy. Prioriza recuperación y vuelve a completar tu estado antes de la próxima sesión.",
+            "tone": "error",
+        }
+    if gait or pain >= 7:
+        return {
+            "title": "Hoy: no correr",
+            "text": "No hagas trote ni trabajo de intensidad hoy. El dolor actual activa una regla de protección. Si altera la marcha o persiste, conviene valoración profesional antes de retomar carrera.",
+            "tone": "error",
+        }
+
+    if decision == "PROTEGER":
+        return {
+            "title": "Hoy: descanso o recuperación sin carrera",
+            "text": "No hagas la sesión de running prevista. Mantén el día como recuperación y vuelve a valorar tu estado mañana.",
+            "tone": "error",
+        }
+
+    if decision == "SUSTITUIR_POR_SUAVE":
+        target = round(max(3.0, planned * 0.60), 1) if planned else None
+        amount = f"~{target:.1f} km" if target else "20–40 min"
+        return {
+            "title": "Hoy: cambia la sesión por rodaje suave",
+            "text": f"No hagas {kind.lower()} de intensidad. Haz {amount} muy suaves a RPE 2–3/10. Si durante los primeros 10–15 min el esfuerzo sigue subiendo o las sensaciones empeoran, termina la sesión.",
+            "tone": "warning",
+        }
+
+    if decision == "REDUCIR_LARGA":
+        factor = 0.70 if (rec_score >= 70 or fatigue >= 5 or sleepiness >= 5 or energy <= 1) else 0.78
+        target = round(max(5.0, planned * factor), 1) if planned else None
+        amount = f"~{target:.1f} km" if target else "aprox. 70–80% de la larga prevista"
+        return {
+            "title": "Hoy: acorta la tirada larga",
+            "text": f"Haz como máximo {amount}, todo a RPE 2–3/10 y sin final rápido. Si después del calentamiento sigues muy fatigado, es preferible mover la larga y hacer solo 20–30 min suaves o descansar.",
+            "tone": "warning",
+        }
+
+    if decision == "REDUCIR":
+        if kind in {"Series", "Tempo", "Carrera"}:
+            target = round(max(3.0, planned * 0.72), 1) if planned else None
+            amount = f"~{target:.1f} km totales" if target else "aprox. 70% del volumen previsto"
+            return {
+                "title": "Hoy: haz una versión reducida",
+                "text": f"Reduce la sesión a {amount}. Recorta aproximadamente un tercio de las repeticiones o del bloque intenso y no intentes compensarlo corriendo más rápido. Si el RPE supera en >1 punto lo previsto, conviértela en rodaje suave.",
+                "tone": "warning",
+            }
+        if kind == "Larga":
+            target = round(max(5.0, planned * 0.78), 1) if planned else None
+            return {
+                "title": "Hoy: larga reducida",
+                "text": f"Haz " + (f"~{target:.1f} km" if target else "70–80% de lo previsto") + " a RPE 2–3/10, sin progresivos ni kilómetros extra.",
+                "tone": "warning",
+            }
+        target = round(max(3.0, planned * 0.70), 1) if planned else None
+        amount = f"~{target:.1f} km" if target else "20–40 min"
+        return {
+            "title": "Hoy: rodaje reducido",
+            "text": f"Haz {amount} suaves a RPE 2–3/10. No añadas intensidad. Si después de 10–15 min sigues claramente peor de lo habitual, termina y toma el día como recuperación.",
+            "tone": "warning",
+        }
+
+    # MANTENER: también decir exactamente qué hacer.
+    rlo, rhi = expected_rpe_range(sess)
+    km_txt = f"{planned:.1f} km" if planned else "la sesión completa"
+    return {
+        "title": "Hoy: sigue el entrenamiento previsto",
+        "text": f"Haz {km_txt} de {kind.lower()} y mantén el esfuerzo alrededor de RPE {rlo}–{rhi}/10. No añadas kilómetros ni intensidad extra aunque te sientas bien.",
+        "tone": "success",
+    }
 
 
 def v81_statistical_summary():
@@ -6709,24 +6804,56 @@ def readiness_status_label(status):
 
 
 def readiness_session_guidance(readiness_row, session):
-    """Conecta el registro diario con la sesión del día sin emitir diagnóstico."""
-    status = str((readiness_row or {}).get("readiness_status") or "").upper()
+    """Traduce el estado diario a una instrucción práctica para la sesión del día."""
+    rr = readiness_row or {}
+    status = str(rr.get("readiness_status") or "").upper()
     kind = workout_kind(session) if session else "Descanso"
+    pain = int(rr.get("pain") or 0)
+    fatigue = int(rr.get("fatigue") or 0)
+    sleepiness = int(rr.get("sleepiness") or 0)
+    energy = int(rr.get("energy") or 0)
+    legs = int(rr.get("legs_heaviness") or 0)
+    illness = bool(rr.get("illness"))
+    gait = bool(rr.get("pain_changes_gait"))
+    planned = float((session or {}).get("planned_km") or 0)
+
     if not session:
-        if status == "RED":
-            return "Hoy no hay sesión programada. Prioriza recuperación y reevalúa síntomas/dolor antes de volver a intensidad."
-        return "Hoy no hay sesión programada. Usa el día para recuperar y mantener hábitos de sueño, hidratación y movilidad suave si te sienta bien."
+        if illness or gait or pain >= 7:
+            return "Hoy no hay entrenamiento programado. Mantén el día de recuperación y no añadas trote por tu cuenta."
+        return "Hoy no hay entrenamiento programado. Mantén el descanso previsto; movilidad o caminata suave son opcionales si te sientan bien."
+
+    if illness:
+        return "Hoy no hagas trote ni trabajo de intensidad. Prioriza recuperación y vuelve a valorar tu estado antes de la próxima sesión."
+    if gait or pain >= 7:
+        return "Hoy no corras. Evita trote, series y tirada larga. Si el dolor altera la marcha o persiste, conviene valoración profesional antes de retomar carrera."
+
     if status == "GREEN":
-        return f"Sesión de hoy: {kind}. El registro diario es compatible con mantener la prescripción prevista y controlar el esfuerzo."
+        rlo, rhi = expected_rpe_range(session)
+        km_txt = f" {planned:.1f} km" if planned > 0 else ""
+        return f"Haz la sesión prevista:{km_txt} de {kind.lower()}, manteniendo el esfuerzo alrededor de RPE {rlo}–{rhi}/10 y sin añadir volumen extra."
+
     if status == "YELLOW":
         if kind in ("Series", "Tempo", "Carrera"):
-            return f"Sesión de hoy: {kind}. Hazla de forma conservadora, evita perseguir ritmos si el esfuerzo se eleva y reevalúa durante el calentamiento."
-        return f"Sesión de hoy: {kind}. Mantén intensidad cómoda y evita añadir volumen extra."
+            reduced = round(max(3.0, planned * 0.8), 1) if planned else None
+            amt = f" y limita el total a ~{reduced:.1f} km" if reduced else ""
+            return f"Calienta 10–15 min muy suave. Si las sensaciones mejoran, haz una versión reducida de la sesión{amt}; si no mejoran, conviértela en rodaje suave a RPE 2–3/10."
+        if kind == "Larga":
+            reduced = round(max(5.0, planned * 0.85), 1) if planned else None
+            return f"Haz la tirada de forma conservadora" + (f" y no superes ~{reduced:.1f} km" if reduced else "") + ", a RPE 2–3/10 y sin final progresivo."
+        reduced = round(max(3.0, planned * 0.85), 1) if planned else None
+        return f"Puedes correr suave" + (f" ~{reduced:.1f} km" if reduced else "") + ", a RPE 2–3/10. No añadas cambios de ritmo."
+
     if status == "ORANGE":
-        return f"Sesión de hoy: {kind}. El estado actual favorece reducir carga; el Entrenador RCP puede proponer un ajuste temporal de los próximos días."
+        # Con somnolencia extrema, energía mínima o fatiga máxima, el descanso es una opción explícita.
+        if sleepiness >= 5 or energy <= 1 or fatigue >= 5:
+            return "Hoy la mejor opción es no hacer la sesión prevista. Si tras descansar varias horas te sientes claramente mejor y no hay dolor ni enfermedad, como máximo haz 20–30 min muy suaves a RPE 1–2/10."
+        reduced = round(max(3.0, planned * 0.6), 1) if planned else None
+        return f"No hagas la intensidad prevista. Sustituye la sesión por un rodaje muy suave" + (f" de ~{reduced:.1f} km" if reduced else " de 20–40 min") + ", a RPE 2–3/10, o descansa si las sensaciones empeoran."
+
     if status == "RED":
-        return f"Sesión de hoy: {kind}. No se recomienda ejecutar intensidad con este registro diario. Si hay enfermedad aguda o dolor que altera la zancada, prioriza recuperación y valoración profesional cuando corresponda."
-    return f"Sesión de hoy: {kind}. Completa el registro diario para obtener una recomendación contextual."
+        return "Hoy no hagas la sesión prevista. No realices trote ni intensidad hasta que desaparezca la señal que activó la protección y vuelvas a valorar tu estado."
+
+    return f"Sesión de hoy: {kind}. Completa el registro diario para obtener una recomendación concreta de distancia e intensidad."
 
 
 def readiness_summary_html(readiness_row, session):
@@ -9556,9 +9683,9 @@ if current_page == "Hoy":
         metrics = coach.get("metrics") or {}
         st.markdown("### 🤖 Entrenador RCP")
         if decision == "PROTECT":
-            st.error("Protección de carga recomendada: retirar intensidad y reducir temporalmente el volumen de los próximos 7 días.")
+            st.error("RCP detecta que conviene proteger la recuperación durante los próximos días. La recomendación concreta para la sesión de hoy aparece abajo en ‘Qué hacer hoy’. ")
         elif decision == "REDUCE":
-            st.warning("Descarga adaptativa recomendada para los próximos 7 días.")
+            st.warning("RCP recomienda reducir temporalmente la carga de los próximos días. Abajo verás exactamente qué hacer con la sesión de hoy.")
         elif decision == "RESTORE":
             st.success("Los indicadores permiten restaurar las sesiones adaptadas hacia el plan original.")
         elif decision == "MAINTAIN":
@@ -9601,6 +9728,17 @@ if current_page == "Hoy":
             with st.container(border=True):
                 st.markdown(f"**{v81_decision_label(_stat.get('decision'))}**")
                 st.write(_stat.get("summary") or "")
+                _action = v81_actionable_guidance(today_session, READINESS_BY_DATE.get(selected_day.isoformat()), _stat)
+                st.markdown("#### 👟 Qué hacer hoy")
+                _action_msg = f"**{_action.get('title')}**\n\n{_action.get('text')}"
+                if _action.get("tone") == "error":
+                    st.error(_action_msg)
+                elif _action.get("tone") == "warning":
+                    st.warning(_action_msg)
+                elif _action.get("tone") == "success":
+                    st.success(_action_msg)
+                else:
+                    st.info(_action_msg)
                 q1,q2,q3,q4 = st.columns(4)
                 _delta=float(_out.get("expected_delta_rpe") or 0)
                 q1.metric("RPE esperado", f"{float(_out.get('predicted_rpe') or 0):.1f}/10", f"{_delta:+.1f} vs objetivo")
