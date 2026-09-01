@@ -6,6 +6,7 @@ import math
 import re
 import html
 import itertools
+import io
 from supabase import create_client
 
 st.set_page_config(
@@ -363,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.4.0"
+APP_VERSION = "7.5.0"
 
 
 # ============================================================
@@ -6163,6 +6164,7 @@ if ACTIVE_GOAL.get("race_date"):
 if ADAPTIVE_READY:
     st.sidebar.markdown("🧠 **Motor adaptativo:** V7.3")
     st.sidebar.markdown("🧬 **Perfil fisiológico:** V7.4")
+    st.sidebar.markdown("📄 **Exportador PDF:** V7.5")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -6254,6 +6256,508 @@ def session_display_name(session):
         base = re.sub(r"\s+\d+(?:[\.,]\d+)?\s*km\s*$", "", name, flags=re.IGNORECASE).rstrip()
         return f"{base} {km:g} km" if km > 0 else base
     return name
+
+
+# ============================================================
+# V7.5 · EXPORTADOR PDF DEL PLAN
+# ============================================================
+def pdf_export_available():
+    """ReportLab se carga de forma perezosa para no romper la app si falta la dependencia."""
+    try:
+        import reportlab  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _pdf_clean(value):
+    """Texto compatible con las fuentes estándar PDF (mantiene acentos latinos y elimina emoji)."""
+    if value is None:
+        return ""
+    text_value = str(value).replace("–", "-").replace("—", "-")
+    return text_value.encode("latin-1", "ignore").decode("latin-1")
+
+
+def _pdf_esc(value):
+    return html.escape(_pdf_clean(value), quote=False)
+
+
+def _pdf_session_status(session, log_by_date):
+    log = (log_by_date or {}).get(str(session.get("session_date"))) or {}
+    status = str(log.get("status") or "PENDIENTE").upper()
+    return {
+        "COMPLETADO": "Completado",
+        "MODIFICADO": "Modificado",
+        "OMITIDO": "Omitido",
+    }.get(status, "Pendiente")
+
+
+def _pdf_scope_sessions(plan_rows, scope, reference_day=None):
+    reference_day = reference_day or rcp_today()
+    rows = sorted(
+        [p for p in (plan_rows or []) if parse_date_safe(p.get("session_date"))],
+        key=lambda x: str(x.get("session_date")),
+    )
+    if scope == "Semana actual":
+        start, end = week_bounds(reference_day)
+        return [p for p in rows if start <= parse_date_safe(p.get("session_date")) <= end]
+    if scope == "Próximas 4 semanas":
+        end = reference_day + timedelta(days=27)
+        return [p for p in rows if reference_day <= parse_date_safe(p.get("session_date")) <= end]
+    return rows
+
+
+def _pdf_week_groups(plan_rows):
+    groups = {}
+    for p in sorted(plan_rows or [], key=lambda x: str(x.get("session_date"))):
+        w = int(p.get("week_no") or 0)
+        groups.setdefault(w, []).append(p)
+    return groups
+
+
+def _pdf_week_metadata(active_plan):
+    meta = (active_plan or {}).get("metadata") or {}
+    return {
+        int(w.get("week") or 0): w
+        for w in (meta.get("weeks") or [])
+        if isinstance(w, dict)
+    }
+
+
+def build_plan_pdf_bytes(
+    plan_rows,
+    active_plan,
+    active_goal,
+    profile_row,
+    assessment,
+    log_by_date,
+    mode="Detallado",
+    scope="Plan completo",
+    theme="Visual",
+    include_instructions=True,
+    include_progress=True,
+):
+    """Genera el PDF del plan activo en memoria; no escribe ni modifica datos."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        KeepTogether, HRFlowable, CondPageBreak,
+    )
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.barcode import qr
+
+    sessions = _pdf_scope_sessions(plan_rows, scope, rcp_today())
+    if not sessions:
+        raise ValueError("No hay sesiones dentro del rango seleccionado.")
+
+    buffer = io.BytesIO()
+    page_w, page_h = A4
+    visual = theme == "Visual"
+
+    navy = colors.HexColor("#0F172A")
+    blue = colors.HexColor("#2563EB")
+    blue_soft = colors.HexColor("#EFF6FF")
+    slate = colors.HexColor("#64748B")
+    border = colors.HexColor("#DCE4EE")
+    surface = colors.HexColor("#F8FAFC")
+    green = colors.HexColor("#15803D")
+    orange = colors.HexColor("#C2410C")
+    violet = colors.HexColor("#6D28D9")
+    red = colors.HexColor("#B91C1C")
+    white = colors.white
+    black = colors.black
+
+    kind_colors = {
+        "Rodaje": colors.HexColor("#2563EB"),
+        "Recuperación": colors.HexColor("#0EA5E9"),
+        "Series": colors.HexColor("#DC2626"),
+        "Tempo": colors.HexColor("#EA580C"),
+        "Larga": colors.HexColor("#7C3AED"),
+        "Fuerza": colors.HexColor("#0F766E"),
+        "Carrera": colors.HexColor("#111827"),
+    }
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=17 * mm,
+        bottomMargin=17 * mm,
+        title=f"RunningCoachPro - {_pdf_clean((active_goal or {}).get('goal_type') or 'Plan')}",
+        author="RunningCoachPro",
+        subject="Plan de entrenamiento activo",
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+        name="RCPTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=28, leading=31, textColor=navy, alignment=TA_LEFT, spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPSubtitle", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=11, leading=15, textColor=slate, spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPH1", parent=styles["Heading1"], fontName="Helvetica-Bold",
+        fontSize=18, leading=22, textColor=navy, spaceBefore=8, spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPH2", parent=styles["Heading2"], fontName="Helvetica-Bold",
+        fontSize=13, leading=17, textColor=navy, spaceBefore=7, spaceAfter=5,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPBody", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=9.3, leading=13, textColor=navy, spaceAfter=4,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPSmall", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=7.8, leading=10.2, textColor=slate,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPBadge", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=7.4, leading=9, textColor=white,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPIndex", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=9, leading=13, textColor=blue,
+    ))
+
+    story = []
+
+    def P(text, style="RCPBody"):
+        return Paragraph(_pdf_esc(text), styles[style])
+
+    def status_color(status):
+        return {
+            "Completado": green,
+            "Modificado": orange,
+            "Omitido": red,
+            "Pendiente": slate,
+        }.get(status, slate)
+
+    def page_decor(canvas, _doc):
+        canvas.saveState()
+        canvas.setStrokeColor(border)
+        canvas.setLineWidth(0.5)
+        canvas.line(15 * mm, 12 * mm, page_w - 15 * mm, 12 * mm)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(slate)
+        canvas.drawString(15 * mm, 7.5 * mm, f"RunningCoachPro V{APP_VERSION} - plan activo")
+        canvas.drawRightString(page_w - 15 * mm, 7.5 * mm, f"Página {_doc.page}")
+        if APP_URL:
+            canvas.linkURL(APP_URL, (15 * mm, 5.5 * mm, 80 * mm, 10 * mm), relative=0)
+        canvas.restoreState()
+
+    # ----- PORTADA -----
+    meta = (active_plan or {}).get("metadata") or {}
+    assessment_answers = (assessment or {}).get("answers") or {}
+    physiology = physiological_profile_snapshot(profile_row or {})
+    goal_name = _pdf_clean((active_goal or {}).get("goal_type") or meta.get("goal_type") or "Plan de entrenamiento")
+    runner_name = _pdf_clean((profile_row or {}).get("display_name") or "Runner")
+    race_date = parse_date_safe((active_goal or {}).get("race_date"))
+    target_time = fmt_time((active_goal or {}).get("target_time_sec")) if (active_goal or {}).get("target_time_sec") else "Sin marca objetivo"
+    focus_code = meta.get("development_focus") or resolve_development_focus(active_goal or {}, assessment or {}).get("resolved")
+    focus_label = _pdf_clean(development_focus_label(focus_code))
+    engine = _pdf_clean((active_plan or {}).get("engine_version") or meta.get("engine") or "RCP")
+
+    story.append(Spacer(1, 8 * mm))
+    story.append(Paragraph("RUNNINGCOACHPRO", ParagraphStyle(
+        "RCPEyebrow", parent=styles["Normal"], fontName="Helvetica-Bold",
+        fontSize=10, textColor=blue, leading=12, spaceAfter=6,
+    )))
+    story.append(Paragraph(f"Plan { _pdf_esc(goal_name) }", styles["RCPTitle"]))
+    story.append(Paragraph(
+        f"{_pdf_esc(runner_name)} | Motor {_pdf_esc(engine)} | Generado {rcp_today().strftime('%d/%m/%Y')}",
+        styles["RCPSubtitle"],
+    ))
+
+    cover_data = [
+        [P("OBJETIVO", "RCPSmall"), P("FECHA", "RCPSmall"), P("META", "RCPSmall")],
+        [
+            Paragraph(f"<b>{_pdf_esc(goal_name)}</b>", styles["RCPBody"]),
+            Paragraph(f"<b>{race_date.strftime('%d/%m/%Y') if race_date else 'Sin fecha'}</b>", styles["RCPBody"]),
+            Paragraph(f"<b>{_pdf_esc(target_time)}</b>", styles["RCPBody"]),
+        ],
+        [P("ENFOQUE DEL BLOQUE", "RCPSmall"), P("NIVEL RCP", "RCPSmall"), P("VOLUMEN", "RCPSmall")],
+        [
+            Paragraph(f"<b>{_pdf_esc(focus_label)}</b>", styles["RCPBody"]),
+            Paragraph(f"<b>{_pdf_esc((assessment or {}).get('runner_level') or '—')} | {int((assessment or {}).get('runner_score') or 0)}/100</b>", styles["RCPBody"]),
+            Paragraph(f"<b>{float(meta.get('initial_weekly_km') or 0):g} -> {float(meta.get('peak_weekly_km') or 0):g} km/sem</b>", styles["RCPBody"]),
+        ],
+    ]
+    cover_table = Table(cover_data, colWidths=[55 * mm, 55 * mm, 55 * mm], hAlign="LEFT")
+    cover_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), surface if visual else white),
+        ("BOX", (0, 0), (-1, -1), 0.7, border),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, border),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(cover_table)
+    story.append(Spacer(1, 7 * mm))
+
+    facts = []
+    if physiology.get("age_years") is not None:
+        facts.append(f"Edad {physiology['age_years']} años")
+    if assessment_answers.get("weekly_km") is not None:
+        facts.append(f"Base declarada {float(assessment_answers.get('weekly_km') or 0):g} km/sem")
+    if assessment_answers.get("long_run_km") is not None:
+        facts.append(f"Tirada larga actual {float(assessment_answers.get('long_run_km') or 0):g} km")
+    if meta.get("selected_days"):
+        facts.append("Días: " + ", ".join(_pdf_clean(x) for x in meta.get("selected_days") or []))
+    if meta.get("long_day"):
+        facts.append("Larga: " + _pdf_clean(meta.get("long_day")))
+    if facts:
+        story.append(Paragraph(" | ".join(_pdf_esc(x) for x in facts), styles["RCPSubtitle"]))
+
+    if APP_URL:
+        story.append(Spacer(1, 2 * mm))
+        qr_widget = qr.QrCodeWidget(APP_URL)
+        x1, y1, x2, y2 = qr_widget.getBounds()
+        qsize = 31 * mm
+        qdraw = Drawing(qsize, qsize, transform=[qsize / (x2 - x1), 0, 0, qsize / (y2 - y1), 0, 0])
+        qdraw.add(qr_widget)
+        link_para = Paragraph(
+            f'<link href="{html.escape(APP_URL)}" color="#2563EB"><b>Abrir mi plan en RunningCoachPro</b></link><br/>'
+            '<font size="8" color="#64748B">El PDF es una instantánea. La app conserva la versión adaptativa más reciente.</font>',
+            styles["RCPBody"],
+        )
+        qr_table = Table([[qdraw, link_para]], colWidths=[36 * mm, 125 * mm])
+        qr_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BOX", (0, 0), (-1, -1), 0.6, border),
+            ("BACKGROUND", (0, 0), (-1, -1), blue_soft if visual else white),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        story.append(qr_table)
+
+    story.append(PageBreak())
+
+    # ----- RESUMEN -----
+    story.append(Paragraph("Resumen del plan", styles["RCPH1"]))
+    week_groups = _pdf_week_groups(sessions)
+    week_meta = _pdf_week_metadata(active_plan)
+
+    weekly = []
+    for week_no, week_sessions in week_groups.items():
+        dates = [parse_date_safe(p.get("session_date")) for p in week_sessions]
+        km = sum(float(p.get("planned_km") or 0) for p in week_sessions if not session_is_optional(p))
+        long_km = max([
+            float(p.get("planned_km") or 0) for p in week_sessions if workout_kind(p) == "Larga"
+        ] or [0.0])
+        phase = _pdf_clean((week_meta.get(week_no) or {}).get("phase") or "—")
+        quality = sum(1 for p in week_sessions if workout_kind(p) in ("Series", "Tempo"))
+        weekly.append({
+            "week": week_no,
+            "start": min(dates) if dates else None,
+            "end": max(dates) if dates else None,
+            "km": round(km, 1),
+            "long": round(long_km, 1),
+            "phase": phase,
+            "quality": quality,
+        })
+
+    if weekly:
+        chart = Drawing(170 * mm, 48 * mm)
+        bar = VerticalBarChart()
+        bar.x = 10 * mm
+        bar.y = 8 * mm
+        bar.height = 34 * mm
+        bar.width = 150 * mm
+        bar.data = [[x["km"] for x in weekly]]
+        bar.categoryAxis.categoryNames = [f"S{x['week']}" for x in weekly]
+        bar.valueAxis.valueMin = 0
+        max_km = max([x["km"] for x in weekly] or [1])
+        bar.valueAxis.valueMax = max(10, math.ceil(max_km / 10) * 10)
+        bar.valueAxis.valueStep = 10 if max_km > 30 else 5
+        bar.bars[0].fillColor = blue if visual else colors.HexColor("#6B7280")
+        bar.bars[0].strokeColor = None
+        bar.categoryAxis.labels.fontName = "Helvetica"
+        bar.categoryAxis.labels.fontSize = 7
+        bar.valueAxis.labels.fontName = "Helvetica"
+        bar.valueAxis.labels.fontSize = 7
+        bar.valueAxis.gridStrokeColor = border
+        bar.valueAxis.gridStrokeWidth = 0.4
+        chart.add(bar)
+        story.append(chart)
+
+    weekly_rows = [[
+        P("Semana", "RCPSmall"), P("Fechas", "RCPSmall"), P("Fase", "RCPSmall"),
+        P("KM", "RCPSmall"), P("Larga", "RCPSmall"), P("Calidad", "RCPSmall"),
+    ]]
+    for w in weekly:
+        weekly_rows.append([
+            P(str(w["week"])),
+            P(f"{w['start'].strftime('%d/%m') if w['start'] else '—'} - {w['end'].strftime('%d/%m') if w['end'] else '—'}"),
+            P(w["phase"]),
+            P(f"{w['km']:g}"),
+            P(f"{w['long']:g}" if w["long"] else "—"),
+            P(str(w["quality"])),
+        ])
+    wt = Table(weekly_rows, colWidths=[17*mm, 31*mm, 36*mm, 20*mm, 22*mm, 22*mm], repeatRows=1)
+    wt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), navy if visual else colors.HexColor("#E5E7EB")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), white if visual else black),
+        ("GRID", (0, 0), (-1, -1), 0.35, border),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [white, surface]),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(wt)
+
+    if mode == "Detallado":
+        story.append(Spacer(1, 6 * mm))
+        story.append(Paragraph("Índice de semanas", styles["RCPH2"]))
+        links = []
+        for w in weekly:
+            links.append(f'<a href="#week_{w["week"]}" color="#2563EB"><b>Semana {w["week"]}</b></a>')
+        story.append(Paragraph(" | ".join(links), styles["RCPIndex"]))
+    story.append(PageBreak())
+
+    # ----- DÍA A DÍA -----
+    if mode == "Resumido":
+        story.append(Paragraph("Plan día a día - resumen", styles["RCPH1"]))
+        compact = [[P("Fecha", "RCPSmall"), P("Semana", "RCPSmall"), P("Tipo", "RCPSmall"), P("Sesión", "RCPSmall"), P("KM", "RCPSmall"), P("Objetivo", "RCPSmall"), P("Estado", "RCPSmall")]]
+        for p in sessions:
+            d = parse_date_safe(p.get("session_date"))
+            status = _pdf_session_status(p, log_by_date) if include_progress else "-"
+            compact.append([
+                P(d.strftime("%d/%m/%Y") if d else p.get("session_date")),
+                P(str(p.get("week_no") or "—")),
+                P(workout_kind(p)),
+                P(session_display_name(p)),
+                P(f"{float(p.get('planned_km') or 0):g}"),
+                P(p.get("target") or "Por esfuerzo"),
+                P(status),
+            ])
+        ct = Table(compact, colWidths=[22*mm, 13*mm, 20*mm, 41*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
+        ct.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), navy if visual else colors.HexColor("#E5E7EB")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), white if visual else black),
+            ("GRID", (0, 0), (-1, -1), 0.3, border),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [white, surface]),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(ct)
+    else:
+        story.append(Paragraph("Plan día a día", styles["RCPH1"]))
+        story.append(P("Cada sesión refleja el plan activo vigente al momento de generar este documento. Si RCP adapta o replanifica el ciclo, genera un PDF nuevo para mantenerlo sincronizado.", "RCPSubtitle"))
+
+        day_short = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
+        for week_no, week_sessions in week_groups.items():
+            story.append(CondPageBreak(70 * mm))
+            story.append(Paragraph(f'<a name="week_{week_no}"/>Semana {week_no}', styles["RCPH1"]))
+            wm = week_meta.get(week_no) or {}
+            phase = _pdf_clean(wm.get("phase") or "—")
+            wk_km = sum(float(p.get("planned_km") or 0) for p in week_sessions if not session_is_optional(p))
+            story.append(Paragraph(f"Fase: <b>{_pdf_esc(phase)}</b> | Objetivo semanal: <b>{wk_km:.1f} km</b>", styles["RCPSubtitle"]))
+
+            for p in week_sessions:
+                d = parse_date_safe(p.get("session_date"))
+                kind = workout_kind(p)
+                kcolor = kind_colors.get(kind, blue)
+                status = _pdf_session_status(p, log_by_date) if include_progress else "Pendiente"
+                log = (log_by_date or {}).get(str(p.get("session_date"))) or {}
+
+                left = [
+                    Paragraph(f"<b>{_pdf_esc(day_short[d.weekday()] if d else '')}</b>", styles["RCPBadge"]),
+                    Paragraph(f"<b>{d.strftime('%d/%m') if d else ''}</b>", styles["RCPBadge"]),
+                    Spacer(1, 2),
+                    Paragraph(f"<b>{_pdf_esc(kind.upper())}</b>", styles["RCPBadge"]),
+                ]
+                left_table = Table([[x] for x in left], colWidths=[26 * mm])
+                left_table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), kcolor if visual else colors.HexColor("#6B7280")),
+                    ("TEXTCOLOR", (0, 0), (-1, -1), white),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ]))
+
+                right_story = [
+                    Paragraph(f"<b>{_pdf_esc(session_display_name(p))}</b>", styles["RCPH2"]),
+                    Paragraph(
+                        f"<b>{float(p.get('planned_km') or 0):g} km</b> | Intensidad: {_pdf_esc(p.get('intensity') or '—')} | Estado: <font color=\"{status_color(status).hexval()}\"><b>{_pdf_esc(status)}</b></font>",
+                        styles["RCPBody"],
+                    ),
+                    Paragraph(f"<b>Objetivo:</b> {_pdf_esc(p.get('target') or 'Por esfuerzo')}", styles["RCPBody"]),
+                ]
+                if include_instructions:
+                    right_story.append(Paragraph(f"<b>Cómo hacerlo:</b> {_pdf_esc(p.get('description') or 'Sin instrucciones adicionales.')}", styles["RCPBody"]))
+                if include_progress and log:
+                    actual_parts = []
+                    if str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO"):
+                        actual_parts.append(f"Real {float(log.get('actual_km') or 0):g} km")
+                        if log.get("actual_duration_sec"):
+                            actual_parts.append(f"Tiempo {fmt_time(log.get('actual_duration_sec'))}")
+                        if log.get("rpe") is not None:
+                            actual_parts.append(f"RPE {log.get('rpe')}")
+                        if log.get("avg_hr"):
+                            actual_parts.append(f"FC {log.get('avg_hr')} lpm")
+                    elif str(log.get("status") or "").upper() == "OMITIDO":
+                        actual_parts.append("Omitido")
+                        if log.get("missed_reason"):
+                            actual_parts.append("Motivo: " + _pdf_clean(log.get("missed_reason")))
+                    if actual_parts:
+                        right_story.append(Paragraph("<b>Registro:</b> " + _pdf_esc(" | ".join(actual_parts)), styles["RCPSmall"]))
+                if session_is_optional(p):
+                    right_story.append(Paragraph("Sesión opcional", styles["RCPSmall"]))
+                if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
+                    right_story.append(Paragraph("Replanificada por RCP", styles["RCPSmall"]))
+                if ADAPTIVE_READY and str(p.get("adaptation_status") or "BASELINE").upper() != "BASELINE":
+                    base_km = float(p.get("baseline_planned_km") or p.get("planned_km") or 0)
+                    right_story.append(Paragraph(f"Adaptación RCP: plan base {base_km:g} km -> vigente {float(p.get('planned_km') or 0):g} km", styles["RCPSmall"]))
+
+                card = Table([[left_table, right_story]], colWidths=[29 * mm, 137 * mm], hAlign="LEFT")
+                card.setStyle(TableStyle([
+                    ("BOX", (0, 0), (-1, -1), 0.6, border),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("BACKGROUND", (1, 0), (1, 0), white),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ]))
+                story.append(KeepTogether([card, Spacer(1, 3 * mm)]))
+
+            story.append(Spacer(1, 2 * mm))
+            story.append(HRFlowable(width="100%", thickness=0.5, color=border, spaceBefore=2, spaceAfter=5))
+
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph("Notas", styles["RCPH2"]))
+    story.append(P("Este documento es una instantánea del plan activo. Readiness, adaptaciones, replanificaciones y nuevos registros pueden cambiar sesiones futuras dentro de RunningCoachPro. Ante dolor relevante, síntomas de alarma o una situación clínica, no uses este PDF como sustituto de una valoración profesional."))
+
+    doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def plan_pdf_filename(active_goal, scope, mode):
+    goal = re.sub(r"[^A-Za-z0-9]+", "_", _pdf_clean((active_goal or {}).get("goal_type") or "Plan")).strip("_")
+    scope_slug = {"Plan completo": "completo", "Próximas 4 semanas": "4_semanas", "Semana actual": "semana_actual"}.get(scope, "plan")
+    mode_slug = "detallado" if mode == "Detallado" else "resumido"
+    return f"RunningCoachPro_{goal}_{scope_slug}_{mode_slug}_{rcp_today().isoformat()}.pdf"
+
 
 
 # ============================================================
@@ -7025,6 +7529,7 @@ elif current_page == "Progreso":
             st.info("Todavía no hay replanificaciones. Se crean cuando una sesión se registra como OMITIDA —incluidas ausencias futuras conocidas— y V7.2.2 propone una acción.")
 
 
+
 # ============================================================
 # 🗓️ PLAN
 # ============================================================
@@ -7041,6 +7546,74 @@ elif current_page == "Plan":
 
     # V7.2.3 · La reparación del hueco inicial también es visible directamente en Mi plan.
     render_timezone_plan_repair("plan")
+
+    # V7.5 · Exportación PDF del plan activo.
+    with st.expander("📄 Exportar mi plan a PDF", expanded=False):
+        st.caption(
+            "Genera una instantánea del plan activo real. Si después aplicas una adaptación o replanificación, "
+            "vuelve a generar el PDF para mantenerlo actualizado."
+        )
+        if not pdf_export_available():
+            st.error(
+                "Falta la dependencia ReportLab. Añade `reportlab>=4.2,<5` a tu requirements.txt y redeploya la app."
+            )
+        else:
+            p1, p2, p3 = st.columns(3)
+            pdf_mode = p1.selectbox("Formato", ["Detallado", "Resumido"], key="pdf_export_mode")
+            pdf_scope = p2.selectbox(
+                "Rango", ["Plan completo", "Próximas 4 semanas", "Semana actual"], key="pdf_export_scope"
+            )
+            pdf_theme = p3.selectbox("Diseño", ["Visual", "Impresión"], key="pdf_export_theme")
+
+            o1, o2 = st.columns(2)
+            pdf_instructions = o1.checkbox(
+                "Incluir instrucciones de cada sesión", value=(pdf_mode == "Detallado"), key="pdf_export_instructions"
+            )
+            pdf_progress = o2.checkbox(
+                "Incluir estado/progreso actual", value=True, key="pdf_export_progress"
+            )
+
+            preview_sessions = _pdf_scope_sessions(PLAN, pdf_scope, rcp_today())
+            preview_km = sum(float(p.get("planned_km") or 0) for p in preview_sessions if not session_is_optional(p))
+            pv1, pv2, pv3 = st.columns(3)
+            pv1.metric("Sesiones", len(preview_sessions))
+            pv2.metric("KM incluidos", f"{preview_km:.1f}")
+            pv3.metric("Semanas", len(_pdf_week_groups(preview_sessions)))
+
+            # Si cambia el plan activo, descarta un PDF generado para el plan anterior.
+            _current_pdf_plan_id = int((ACTIVE_PLAN or {}).get("id") or 0)
+            if st.session_state.get("rcp_pdf_plan_id") != _current_pdf_plan_id:
+                st.session_state.pop("rcp_pdf_bytes", None)
+                st.session_state.pop("rcp_pdf_filename", None)
+                st.session_state["rcp_pdf_plan_id"] = _current_pdf_plan_id
+
+            if st.button("✨ Generar PDF", type="primary", use_container_width=True, key="generate_plan_pdf"):
+                try:
+                    pdf_bytes = build_plan_pdf_bytes(
+                        PLAN, ACTIVE_PLAN, ACTIVE_GOAL, profile, LATEST_ASSESSMENT, LOG_BY_DATE,
+                        mode=pdf_mode,
+                        scope=pdf_scope,
+                        theme=pdf_theme,
+                        include_instructions=pdf_instructions,
+                        include_progress=pdf_progress,
+                    )
+                    st.session_state["rcp_pdf_bytes"] = pdf_bytes
+                    st.session_state["rcp_pdf_filename"] = plan_pdf_filename(ACTIVE_GOAL, pdf_scope, pdf_mode)
+                    st.session_state["rcp_pdf_plan_id"] = _current_pdf_plan_id
+                    st.success(f"PDF generado: {len(pdf_bytes) / 1024:.0f} KB")
+                except Exception as exc:
+                    st.error(f"No fue posible generar el PDF: {exc}")
+
+            if st.session_state.get("rcp_pdf_bytes"):
+                st.download_button(
+                    "⬇️ Descargar PDF",
+                    data=st.session_state["rcp_pdf_bytes"],
+                    file_name=st.session_state.get("rcp_pdf_filename") or "RunningCoachPro_plan.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="download_plan_pdf",
+                )
+                st.caption("El PDF incluye portada, resumen semanal, gráfico de volumen, índice clicable y el plan día a día.")
 
     types = sorted({workout_kind(p) for p in PLAN})
     f1, f2, f3 = st.columns(3)
