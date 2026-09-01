@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.5.0"
+APP_VERSION = "7.5.1"
 
 
 # ============================================================
@@ -6164,7 +6164,7 @@ if ACTIVE_GOAL.get("race_date"):
 if ADAPTIVE_READY:
     st.sidebar.markdown("🧠 **Motor adaptativo:** V7.3")
     st.sidebar.markdown("🧬 **Perfil fisiológico:** V7.4")
-    st.sidebar.markdown("📄 **Exportador PDF:** V7.5")
+    st.sidebar.markdown("📄 **Exportador PDF:** V7.5.1 Premium")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -6337,7 +6337,7 @@ def build_plan_pdf_bytes(
     include_instructions=True,
     include_progress=True,
 ):
-    """Genera el PDF del plan activo en memoria; no escribe ni modifica datos."""
+    """Genera un PDF premium del plan activo en memoria; no escribe ni modifica datos."""
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4
@@ -6347,7 +6347,7 @@ def build_plan_pdf_bytes(
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
         KeepTogether, HRFlowable, CondPageBreak,
     )
-    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.shapes import Drawing, Rect, String, Line, Circle, PolyLine
     from reportlab.graphics.charts.barcharts import VerticalBarChart
     from reportlab.graphics.barcode import qr
 
@@ -6359,27 +6359,56 @@ def build_plan_pdf_bytes(
     page_w, page_h = A4
     visual = theme == "Visual"
 
-    navy = colors.HexColor("#0F172A")
+    # Paleta RCP Premium.
+    ink = colors.HexColor("#111827")
+    navy = colors.HexColor("#0B1220")
+    navy_2 = colors.HexColor("#172033")
     blue = colors.HexColor("#2563EB")
+    cyan = colors.HexColor("#0EA5E9")
     blue_soft = colors.HexColor("#EFF6FF")
     slate = colors.HexColor("#64748B")
+    slate_2 = colors.HexColor("#94A3B8")
     border = colors.HexColor("#DCE4EE")
     surface = colors.HexColor("#F8FAFC")
+    surface_2 = colors.HexColor("#F1F5F9")
     green = colors.HexColor("#15803D")
+    green_soft = colors.HexColor("#F0FDF4")
     orange = colors.HexColor("#C2410C")
+    orange_soft = colors.HexColor("#FFF7ED")
     violet = colors.HexColor("#6D28D9")
+    violet_soft = colors.HexColor("#F5F3FF")
     red = colors.HexColor("#B91C1C")
+    red_soft = colors.HexColor("#FEF2F2")
+    teal = colors.HexColor("#0F766E")
     white = colors.white
     black = colors.black
 
     kind_colors = {
-        "Rodaje": colors.HexColor("#2563EB"),
-        "Recuperación": colors.HexColor("#0EA5E9"),
-        "Series": colors.HexColor("#DC2626"),
+        "Rodaje": blue,
+        "Recuperación": cyan,
+        "Series": red,
         "Tempo": colors.HexColor("#EA580C"),
-        "Larga": colors.HexColor("#7C3AED"),
-        "Fuerza": colors.HexColor("#0F766E"),
-        "Carrera": colors.HexColor("#111827"),
+        "Larga": violet,
+        "Fuerza": teal,
+        "Carrera": ink,
+    }
+    kind_soft = {
+        "Rodaje": blue_soft,
+        "Recuperación": colors.HexColor("#ECFEFF"),
+        "Series": red_soft,
+        "Tempo": orange_soft,
+        "Larga": violet_soft,
+        "Fuerza": colors.HexColor("#F0FDFA"),
+        "Carrera": surface_2,
+    }
+    phase_colors = {
+        "BASE": blue,
+        "DESARROLLO": cyan,
+        "DESCARGA": teal,
+        "ESPECIFICA": violet,
+        "ESPECÍFICA": violet,
+        "TAPER": orange,
+        "CARRERA": ink,
     }
 
     doc = SimpleDocTemplate(
@@ -6397,35 +6426,55 @@ def build_plan_pdf_bytes(
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
         name="RCPTitle", parent=styles["Title"], fontName="Helvetica-Bold",
-        fontSize=28, leading=31, textColor=navy, alignment=TA_LEFT, spaceAfter=6,
+        fontSize=28, leading=31, textColor=ink, alignment=TA_LEFT, spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPHeroTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+        fontSize=27, leading=30, textColor=white, alignment=TA_LEFT, spaceAfter=5,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPHeroSub", parent=styles["Normal"], fontName="Helvetica",
+        fontSize=9.5, leading=13, textColor=colors.HexColor("#CBD5E1"), spaceAfter=0,
     ))
     styles.add(ParagraphStyle(
         name="RCPSubtitle", parent=styles["Normal"], fontName="Helvetica",
-        fontSize=11, leading=15, textColor=slate, spaceAfter=8,
+        fontSize=10.3, leading=14, textColor=slate, spaceAfter=8,
     ))
     styles.add(ParagraphStyle(
         name="RCPH1", parent=styles["Heading1"], fontName="Helvetica-Bold",
-        fontSize=18, leading=22, textColor=navy, spaceBefore=8, spaceAfter=8,
+        fontSize=17, leading=21, textColor=ink, spaceBefore=8, spaceAfter=8,
     ))
     styles.add(ParagraphStyle(
         name="RCPH2", parent=styles["Heading2"], fontName="Helvetica-Bold",
-        fontSize=13, leading=17, textColor=navy, spaceBefore=7, spaceAfter=5,
+        fontSize=12.5, leading=16, textColor=ink, spaceBefore=7, spaceAfter=5,
     ))
     styles.add(ParagraphStyle(
         name="RCPBody", parent=styles["BodyText"], fontName="Helvetica",
-        fontSize=9.3, leading=13, textColor=navy, spaceAfter=4,
+        fontSize=9.1, leading=12.8, textColor=ink, spaceAfter=4,
     ))
     styles.add(ParagraphStyle(
         name="RCPSmall", parent=styles["BodyText"], fontName="Helvetica",
-        fontSize=7.8, leading=10.2, textColor=slate,
+        fontSize=7.7, leading=10, textColor=slate,
     ))
     styles.add(ParagraphStyle(
         name="RCPBadge", parent=styles["BodyText"], fontName="Helvetica-Bold",
-        fontSize=7.4, leading=9, textColor=white,
+        fontSize=7.2, leading=9, textColor=white, alignment=TA_CENTER,
     ))
     styles.add(ParagraphStyle(
         name="RCPIndex", parent=styles["BodyText"], fontName="Helvetica-Bold",
-        fontSize=9, leading=13, textColor=blue,
+        fontSize=8.8, leading=13, textColor=blue,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPMetricLabel", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=7.1, leading=9, textColor=slate,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPMetricValue", parent=styles["BodyText"], fontName="Helvetica-Bold",
+        fontSize=11.5, leading=14, textColor=ink,
+    ))
+    styles.add(ParagraphStyle(
+        name="RCPWeekTitle", parent=styles["Heading1"], fontName="Helvetica-Bold",
+        fontSize=15, leading=18, textColor=white, spaceAfter=0,
     ))
 
     story = []
@@ -6441,20 +6490,45 @@ def build_plan_pdf_bytes(
             "Pendiente": slate,
         }.get(status, slate)
 
+    def phase_color(label):
+        key = _pdf_clean(label or "").upper()
+        for candidate, color in phase_colors.items():
+            if candidate in key:
+                return color
+        return slate
+
+    def metric_card(label, value, accent=blue, width=53 * mm):
+        card = Table([
+            [Paragraph(_pdf_esc(label.upper()), styles["RCPMetricLabel"])],
+            [Paragraph(f"<b>{_pdf_esc(value)}</b>", styles["RCPMetricValue"])],
+        ], colWidths=[width])
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), white),
+            ("BOX", (0, 0), (-1, -1), 0.7, border),
+            ("LINEABOVE", (0, 0), (-1, 0), 3, accent),
+            ("LEFTPADDING", (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        return card
+
     def page_decor(canvas, _doc):
         canvas.saveState()
+        canvas.setFillColor(navy)
+        canvas.rect(0, page_h - 4 * mm, page_w, 4 * mm, stroke=0, fill=1)
         canvas.setStrokeColor(border)
         canvas.setLineWidth(0.5)
         canvas.line(15 * mm, 12 * mm, page_w - 15 * mm, 12 * mm)
-        canvas.setFont("Helvetica", 7.5)
+        canvas.setFont("Helvetica", 7.2)
         canvas.setFillColor(slate)
-        canvas.drawString(15 * mm, 7.5 * mm, f"RunningCoachPro V{APP_VERSION} - plan activo")
+        canvas.drawString(15 * mm, 7.5 * mm, f"RunningCoachPro V{APP_VERSION} | documento dinámico del plan")
         canvas.drawRightString(page_w - 15 * mm, 7.5 * mm, f"Página {_doc.page}")
         if APP_URL:
-            canvas.linkURL(APP_URL, (15 * mm, 5.5 * mm, 80 * mm, 10 * mm), relative=0)
+            canvas.linkURL(APP_URL, (15 * mm, 5.5 * mm, 86 * mm, 10 * mm), relative=0)
         canvas.restoreState()
 
-    # ----- PORTADA -----
+    # Datos de portada.
     meta = (active_plan or {}).get("metadata") or {}
     assessment_answers = (assessment or {}).get("answers") or {}
     physiology = physiological_profile_snapshot(profile_row or {})
@@ -6465,45 +6539,48 @@ def build_plan_pdf_bytes(
     focus_code = meta.get("development_focus") or resolve_development_focus(active_goal or {}, assessment or {}).get("resolved")
     focus_label = _pdf_clean(development_focus_label(focus_code))
     engine = _pdf_clean((active_plan or {}).get("engine_version") or meta.get("engine") or "RCP")
+    generated = rcp_today().strftime("%d/%m/%Y")
 
-    story.append(Spacer(1, 8 * mm))
-    story.append(Paragraph("RUNNINGCOACHPRO", ParagraphStyle(
-        "RCPEyebrow", parent=styles["Normal"], fontName="Helvetica-Bold",
-        fontSize=10, textColor=blue, leading=12, spaceAfter=6,
-    )))
-    story.append(Paragraph(f"Plan { _pdf_esc(goal_name) }", styles["RCPTitle"]))
-    story.append(Paragraph(
-        f"{_pdf_esc(runner_name)} | Motor {_pdf_esc(engine)} | Generado {rcp_today().strftime('%d/%m/%Y')}",
-        styles["RCPSubtitle"],
-    ))
-
-    cover_data = [
-        [P("OBJETIVO", "RCPSmall"), P("FECHA", "RCPSmall"), P("META", "RCPSmall")],
-        [
-            Paragraph(f"<b>{_pdf_esc(goal_name)}</b>", styles["RCPBody"]),
-            Paragraph(f"<b>{race_date.strftime('%d/%m/%Y') if race_date else 'Sin fecha'}</b>", styles["RCPBody"]),
-            Paragraph(f"<b>{_pdf_esc(target_time)}</b>", styles["RCPBody"]),
-        ],
-        [P("ENFOQUE DEL BLOQUE", "RCPSmall"), P("NIVEL RCP", "RCPSmall"), P("VOLUMEN", "RCPSmall")],
-        [
-            Paragraph(f"<b>{_pdf_esc(focus_label)}</b>", styles["RCPBody"]),
-            Paragraph(f"<b>{_pdf_esc((assessment or {}).get('runner_level') or '—')} | {int((assessment or {}).get('runner_score') or 0)}/100</b>", styles["RCPBody"]),
-            Paragraph(f"<b>{float(meta.get('initial_weekly_km') or 0):g} -> {float(meta.get('peak_weekly_km') or 0):g} km/sem</b>", styles["RCPBody"]),
-        ],
+    # ----- PORTADA PREMIUM -----
+    hero_left = [
+        Paragraph("RUNNINGCOACHPRO", ParagraphStyle(
+            "RCPEyebrowHero", parent=styles["Normal"], fontName="Helvetica-Bold",
+            fontSize=8.5, textColor=colors.HexColor("#60A5FA"), leading=11, spaceAfter=7,
+        )),
+        Paragraph(f"Plan {_pdf_esc(goal_name)}", styles["RCPHeroTitle"]),
+        Paragraph(f"{_pdf_esc(runner_name)}  |  Motor {_pdf_esc(engine)}  |  Generado {generated}", styles["RCPHeroSub"]),
     ]
-    cover_table = Table(cover_data, colWidths=[55 * mm, 55 * mm, 55 * mm], hAlign="LEFT")
-    cover_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), surface if visual else white),
-        ("BOX", (0, 0), (-1, -1), 0.7, border),
-        ("INNERGRID", (0, 0), (-1, -1), 0.35, border),
+    hero = Table([[hero_left]], colWidths=[170 * mm], rowHeights=[42 * mm])
+    hero.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), navy),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 7),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-        ("LEFTPADDING", (0, 0), (-1, -1), 7),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 11 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9 * mm),
+        ("TOPPADDING", (0, 0), (-1, -1), 7 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7 * mm),
+        ("LINEBELOW", (0, 0), (-1, -1), 3, blue),
     ]))
-    story.append(cover_table)
-    story.append(Spacer(1, 7 * mm))
+    story.append(hero)
+    story.append(Spacer(1, 6 * mm))
+
+    volume_text = f"{float(meta.get('initial_weekly_km') or 0):g} -> {float(meta.get('peak_weekly_km') or 0):g} km/sem"
+    level_text = f"{_pdf_clean((assessment or {}).get('runner_level') or '—')} | {int((assessment or {}).get('runner_score') or 0)}/100"
+    cards1 = Table([[
+        metric_card("Objetivo", goal_name, blue),
+        metric_card("Fecha", race_date.strftime("%d/%m/%Y") if race_date else "Sin fecha", violet),
+        metric_card("Meta", target_time, orange),
+    ]], colWidths=[56.5*mm, 56.5*mm, 56.5*mm])
+    cards1.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 3)]))
+    story.append(cards1)
+    story.append(Spacer(1, 3 * mm))
+    cards2 = Table([[
+        metric_card("Enfoque del bloque", focus_label, cyan),
+        metric_card("Nivel RCP", level_text, green),
+        metric_card("Volumen", volume_text, teal),
+    ]], colWidths=[56.5*mm, 56.5*mm, 56.5*mm])
+    cards2.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 3)]))
+    story.append(cards2)
+    story.append(Spacer(1, 6 * mm))
 
     facts = []
     if physiology.get("age_years") is not None:
@@ -6517,21 +6594,28 @@ def build_plan_pdf_bytes(
     if meta.get("long_day"):
         facts.append("Larga: " + _pdf_clean(meta.get("long_day")))
     if facts:
-        story.append(Paragraph(" | ".join(_pdf_esc(x) for x in facts), styles["RCPSubtitle"]))
+        facts_box = Table([[Paragraph("  |  ".join(_pdf_esc(x) for x in facts), styles["RCPSubtitle"]) ]], colWidths=[170*mm])
+        facts_box.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), surface),
+            ("BOX", (0,0), (-1,-1), 0.5, border),
+            ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
+            ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 2),
+        ]))
+        story.append(facts_box)
 
     if APP_URL:
-        story.append(Spacer(1, 2 * mm))
+        story.append(Spacer(1, 4 * mm))
         qr_widget = qr.QrCodeWidget(APP_URL)
         x1, y1, x2, y2 = qr_widget.getBounds()
-        qsize = 31 * mm
+        qsize = 28 * mm
         qdraw = Drawing(qsize, qsize, transform=[qsize / (x2 - x1), 0, 0, qsize / (y2 - y1), 0, 0])
         qdraw.add(qr_widget)
         link_para = Paragraph(
             f'<link href="{html.escape(APP_URL)}" color="#2563EB"><b>Abrir mi plan en RunningCoachPro</b></link><br/>'
-            '<font size="8" color="#64748B">El PDF es una instantánea. La app conserva la versión adaptativa más reciente.</font>',
+            '<font size="8" color="#64748B">Escanea el QR para volver a la versión adaptativa más reciente.</font>',
             styles["RCPBody"],
         )
-        qr_table = Table([[qdraw, link_para]], colWidths=[36 * mm, 125 * mm])
+        qr_table = Table([[qdraw, link_para]], colWidths=[34 * mm, 130 * mm])
         qr_table.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("BOX", (0, 0), (-1, -1), 0.6, border),
@@ -6545,8 +6629,9 @@ def build_plan_pdf_bytes(
 
     story.append(PageBreak())
 
-    # ----- RESUMEN -----
-    story.append(Paragraph("Resumen del plan", styles["RCPH1"]))
+    # ----- RESUMEN DEL BLOQUE -----
+    story.append(Paragraph("Resumen del bloque", styles["RCPH1"]))
+    story.append(P("Estructura, progresión y distribución del plan activo en una sola vista.", "RCPSubtitle"))
     week_groups = _pdf_week_groups(sessions)
     week_meta = _pdf_week_metadata(active_plan)
 
@@ -6554,9 +6639,7 @@ def build_plan_pdf_bytes(
     for week_no, week_sessions in week_groups.items():
         dates = [parse_date_safe(p.get("session_date")) for p in week_sessions]
         km = sum(float(p.get("planned_km") or 0) for p in week_sessions if not session_is_optional(p))
-        long_km = max([
-            float(p.get("planned_km") or 0) for p in week_sessions if workout_kind(p) == "Larga"
-        ] or [0.0])
+        long_km = max([float(p.get("planned_km") or 0) for p in week_sessions if workout_kind(p) == "Larga"] or [0.0])
         phase = _pdf_clean((week_meta.get(week_no) or {}).get("phase") or "—")
         quality = sum(1 for p in week_sessions if workout_kind(p) in ("Series", "Tempo"))
         weekly.append({
@@ -6569,13 +6652,32 @@ def build_plan_pdf_bytes(
             "quality": quality,
         })
 
+    # Timeline de fases.
     if weekly:
-        chart = Drawing(170 * mm, 48 * mm)
+        cell_w = 170 * mm / max(1, len(weekly))
+        timeline_cells = []
+        for w in weekly:
+            pcolor = phase_color(w["phase"])
+            timeline_cells.append(Paragraph(
+                f'<font color="#FFFFFF"><b>S{w["week"]}</b></font><br/><font size="6.6" color="#FFFFFF">{_pdf_esc(w["phase"])}</font>',
+                ParagraphStyle("PhaseCell", parent=styles["RCPSmall"], alignment=TA_CENTER, leading=8),
+            ))
+        timeline = Table([timeline_cells], colWidths=[cell_w] * len(timeline_cells), rowHeights=[14 * mm])
+        commands = [("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("ALIGN", (0,0), (-1,-1), "CENTER")]
+        for i, w in enumerate(weekly):
+            commands += [("BACKGROUND", (i,0), (i,0), phase_color(w["phase"])), ("BOX", (i,0), (i,0), 0.5, white)]
+        timeline.setStyle(TableStyle(commands))
+        story.append(timeline)
+        story.append(Spacer(1, 5 * mm))
+
+    if weekly:
+        # Gráfico principal de volumen.
+        chart = Drawing(105 * mm, 53 * mm)
         bar = VerticalBarChart()
         bar.x = 10 * mm
-        bar.y = 8 * mm
-        bar.height = 34 * mm
-        bar.width = 150 * mm
+        bar.y = 9 * mm
+        bar.height = 35 * mm
+        bar.width = 88 * mm
         bar.data = [[x["km"] for x in weekly]]
         bar.categoryAxis.categoryNames = [f"S{x['week']}" for x in weekly]
         bar.valueAxis.valueMin = 0
@@ -6585,13 +6687,64 @@ def build_plan_pdf_bytes(
         bar.bars[0].fillColor = blue if visual else colors.HexColor("#6B7280")
         bar.bars[0].strokeColor = None
         bar.categoryAxis.labels.fontName = "Helvetica"
-        bar.categoryAxis.labels.fontSize = 7
+        bar.categoryAxis.labels.fontSize = 6.7
         bar.valueAxis.labels.fontName = "Helvetica"
-        bar.valueAxis.labels.fontSize = 7
+        bar.valueAxis.labels.fontSize = 6.5
         bar.valueAxis.gridStrokeColor = border
-        bar.valueAxis.gridStrokeWidth = 0.4
+        bar.valueAxis.gridStrokeWidth = 0.35
         chart.add(bar)
-        story.append(chart)
+        chart.add(String(10*mm, 48*mm, "Kilómetros por semana", fontName="Helvetica-Bold", fontSize=8, fillColor=ink))
+
+        # Gráfico compacto de tirada larga.
+        long_draw = Drawing(61 * mm, 53 * mm)
+        long_draw.add(String(4*mm, 48*mm, "Tirada larga", fontName="Helvetica-Bold", fontSize=8, fillColor=ink))
+        x0, y0, gw, gh = 6*mm, 10*mm, 49*mm, 31*mm
+        long_draw.add(Line(x0, y0, x0, y0+gh, strokeColor=border, strokeWidth=0.6))
+        long_draw.add(Line(x0, y0, x0+gw, y0, strokeColor=border, strokeWidth=0.6))
+        longs = [w["long"] for w in weekly]
+        max_long = max(longs or [1]) or 1
+        pts = []
+        for i, val in enumerate(longs):
+            x = x0 + (gw * i / max(1, len(longs)-1)) if len(longs) > 1 else x0 + gw/2
+            y = y0 + gh * (val / max_long)
+            pts.extend([x, y])
+        if len(pts) >= 4:
+            long_draw.add(PolyLine(pts, strokeColor=violet, strokeWidth=2))
+        for i, val in enumerate(longs):
+            x = x0 + (gw * i / max(1, len(longs)-1)) if len(longs) > 1 else x0 + gw/2
+            y = y0 + gh * (val / max_long)
+            long_draw.add(Circle(x, y, 1.5*mm, fillColor=violet, strokeColor=white, strokeWidth=0.6))
+            long_draw.add(String(x-3*mm, y+2.5*mm, f"{val:g}", fontName="Helvetica", fontSize=5.8, fillColor=slate))
+            long_draw.add(String(x-2.5*mm, y0-4*mm, f"S{weekly[i]['week']}", fontName="Helvetica", fontSize=5.7, fillColor=slate))
+
+        chart_table = Table([[chart, long_draw]], colWidths=[107*mm, 63*mm])
+        chart_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), surface if visual else white),
+            ("BOX", (0,0), (-1,-1), 0.5, border),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
+            ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(chart_table)
+        story.append(Spacer(1, 5 * mm))
+
+    # Distribución por tipo de sesión.
+    type_counts = {}
+    for p in sessions:
+        k = workout_kind(p)
+        type_counts[k] = type_counts.get(k, 0) + 1
+    if type_counts:
+        type_items = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        cells = []
+        for kind, count in type_items:
+            cells.append(Paragraph(f'<font color="#FFFFFF"><b>{_pdf_esc(kind)}</b> · {count}</font>', ParagraphStyle("TypePill", parent=styles["RCPSmall"], alignment=TA_CENTER, leading=9)))
+        type_table = Table([cells], colWidths=[170*mm/len(cells)]*len(cells), rowHeights=[10*mm])
+        cmds=[("VALIGN",(0,0),(-1,-1),"MIDDLE"), ("ALIGN",(0,0),(-1,-1),"CENTER")]
+        for i,(kind,_) in enumerate(type_items):
+            cmds += [("BACKGROUND",(i,0),(i,0), kind_colors.get(kind, slate)), ("BOX",(i,0),(i,0),0.5,white)]
+        type_table.setStyle(TableStyle(cmds))
+        story.append(type_table)
+        story.append(Spacer(1, 5 * mm))
 
     weekly_rows = [[
         P("Semana", "RCPSmall"), P("Fechas", "RCPSmall"), P("Fase", "RCPSmall"),
@@ -6610,7 +6763,7 @@ def build_plan_pdf_bytes(
     wt.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), navy if visual else colors.HexColor("#E5E7EB")),
         ("TEXTCOLOR", (0, 0), (-1, 0), white if visual else black),
-        ("GRID", (0, 0), (-1, -1), 0.35, border),
+        ("GRID", (0, 0), (-1, -1), 0.3, border),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [white, surface]),
         ("TOPPADDING", (0, 0), (-1, -1), 5),
@@ -6621,18 +6774,17 @@ def build_plan_pdf_bytes(
     story.append(wt)
 
     if mode == "Detallado":
-        story.append(Spacer(1, 6 * mm))
-        story.append(Paragraph("Índice de semanas", styles["RCPH2"]))
-        links = []
-        for w in weekly:
-            links.append(f'<a href="#week_{w["week"]}" color="#2563EB"><b>Semana {w["week"]}</b></a>')
-        story.append(Paragraph(" | ".join(links), styles["RCPIndex"]))
+        story.append(Spacer(1, 5 * mm))
+        story.append(Paragraph("Navegación rápida", styles["RCPH2"]))
+        links = [f'<a href="#week_{w["week"]}" color="#2563EB"><b>S{w["week"]}</b></a>' for w in weekly]
+        story.append(Paragraph("  ·  ".join(links), styles["RCPIndex"]))
     story.append(PageBreak())
 
     # ----- DÍA A DÍA -----
     if mode == "Resumido":
-        story.append(Paragraph("Plan día a día - resumen", styles["RCPH1"]))
-        compact = [[P("Fecha", "RCPSmall"), P("Semana", "RCPSmall"), P("Tipo", "RCPSmall"), P("Sesión", "RCPSmall"), P("KM", "RCPSmall"), P("Objetivo", "RCPSmall"), P("Estado", "RCPSmall")]]
+        story.append(Paragraph("Plan día a día", styles["RCPH1"]))
+        story.append(P("Vista compacta del plan activo.", "RCPSubtitle"))
+        compact = [[P("Fecha", "RCPSmall"), P("Sem", "RCPSmall"), P("Tipo", "RCPSmall"), P("Sesión", "RCPSmall"), P("KM", "RCPSmall"), P("Objetivo", "RCPSmall"), P("Estado", "RCPSmall")]]
         for p in sessions:
             d = parse_date_safe(p.get("session_date"))
             status = _pdf_session_status(p, log_by_date) if include_progress else "-"
@@ -6645,7 +6797,7 @@ def build_plan_pdf_bytes(
                 P(p.get("target") or "Por esfuerzo"),
                 P(status),
             ])
-        ct = Table(compact, colWidths=[22*mm, 13*mm, 20*mm, 41*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
+        ct = Table(compact, colWidths=[22*mm, 12*mm, 20*mm, 42*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
         ct.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), navy if visual else colors.HexColor("#E5E7EB")),
             ("TEXTCOLOR", (0, 0), (-1, 0), white if visual else black),
@@ -6660,49 +6812,72 @@ def build_plan_pdf_bytes(
         story.append(ct)
     else:
         story.append(Paragraph("Plan día a día", styles["RCPH1"]))
-        story.append(P("Cada sesión refleja el plan activo vigente al momento de generar este documento. Si RCP adapta o replanifica el ciclo, genera un PDF nuevo para mantenerlo sincronizado.", "RCPSubtitle"))
+        story.append(P("Cada tarjeta refleja la prescripción vigente al generar el PDF. Adaptaciones y replanificaciones posteriores aparecen al generar una nueva versión.", "RCPSubtitle"))
 
         day_short = ["LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"]
         for week_no, week_sessions in week_groups.items():
-            story.append(CondPageBreak(70 * mm))
-            story.append(Paragraph(f'<a name="week_{week_no}"/>Semana {week_no}', styles["RCPH1"]))
+            story.append(CondPageBreak(82 * mm))
             wm = week_meta.get(week_no) or {}
             phase = _pdf_clean(wm.get("phase") or "—")
+            pcolor = phase_color(phase)
             wk_km = sum(float(p.get("planned_km") or 0) for p in week_sessions if not session_is_optional(p))
-            story.append(Paragraph(f"Fase: <b>{_pdf_esc(phase)}</b> | Objetivo semanal: <b>{wk_km:.1f} km</b>", styles["RCPSubtitle"]))
+            wk_long = max([float(p.get("planned_km") or 0) for p in week_sessions if workout_kind(p) == "Larga"] or [0.0])
+            wk_quality = sum(1 for p in week_sessions if workout_kind(p) in ("Series", "Tempo"))
+
+            week_header = Table([[
+                Paragraph(f'<a name="week_{week_no}"/><font color="#FFFFFF"><b>SEMANA {week_no}</b></font><br/><font size="8" color="#E2E8F0">{_pdf_esc(phase)}</font>', styles["RCPWeekTitle"]),
+                Paragraph(f'<font color="#FFFFFF"><b>{wk_km:.1f} km</b></font><br/><font size="7" color="#E2E8F0">Larga {wk_long:g} km · Calidad {wk_quality}</font>', ParagraphStyle("WeekStats", parent=styles["RCPBody"], alignment=TA_LEFT, leading=11)),
+            ]], colWidths=[105*mm, 65*mm], rowHeights=[21*mm])
+            week_header.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), pcolor),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
+                ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ]))
+            story.append(week_header)
+            story.append(Spacer(1, 4 * mm))
 
             for p in week_sessions:
                 d = parse_date_safe(p.get("session_date"))
                 kind = workout_kind(p)
                 kcolor = kind_colors.get(kind, blue)
+                ksoft = kind_soft.get(kind, surface)
                 status = _pdf_session_status(p, log_by_date) if include_progress else "Pendiente"
                 log = (log_by_date or {}).get(str(p.get("session_date"))) or {}
 
-                left = [
-                    Paragraph(f"<b>{_pdf_esc(day_short[d.weekday()] if d else '')}</b>", styles["RCPBadge"]),
-                    Paragraph(f"<b>{d.strftime('%d/%m') if d else ''}</b>", styles["RCPBadge"]),
-                    Spacer(1, 2),
-                    Paragraph(f"<b>{_pdf_esc(kind.upper())}</b>", styles["RCPBadge"]),
-                ]
-                left_table = Table([[x] for x in left], colWidths=[26 * mm])
-                left_table.setStyle(TableStyle([
+                # Badge de fecha/tipo.
+                left = Table([
+                    [Paragraph(f"<b>{_pdf_esc(day_short[d.weekday()] if d else '')}</b>", styles["RCPBadge"])],
+                    [Paragraph(f"<b>{d.strftime('%d/%m') if d else ''}</b>", styles["RCPBadge"])],
+                    [Paragraph(f"<b>{_pdf_esc(kind.upper())}</b>", styles["RCPBadge"])],
+                ], colWidths=[26 * mm], rowHeights=[7*mm, 8*mm, 8*mm])
+                left.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, -1), kcolor if visual else colors.HexColor("#6B7280")),
                     ("TEXTCOLOR", (0, 0), (-1, -1), white),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("TOPPADDING", (0, 0), (-1, -1), 3),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("LINEABOVE", (0,2), (-1,2), 0.5, white),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
                 ]))
 
-                right_story = [
-                    Paragraph(f"<b>{_pdf_esc(session_display_name(p))}</b>", styles["RCPH2"]),
-                    Paragraph(
-                        f"<b>{float(p.get('planned_km') or 0):g} km</b> | Intensidad: {_pdf_esc(p.get('intensity') or '—')} | Estado: <font color=\"{status_color(status).hexval()}\"><b>{_pdf_esc(status)}</b></font>",
-                        styles["RCPBody"],
-                    ),
-                    Paragraph(f"<b>Objetivo:</b> {_pdf_esc(p.get('target') or 'Por esfuerzo')}", styles["RCPBody"]),
-                ]
+                status_hex = status_color(status).hexval()
+                title_row = Paragraph(
+                    f'<font size="12"><b>{_pdf_esc(session_display_name(p))}</b></font><br/>'
+                    f'<font size="8" color="#64748B">{float(p.get("planned_km") or 0):g} km  ·  Intensidad {_pdf_esc(p.get("intensity") or "—")}  ·  '
+                    f'<font color="{status_hex}"><b>{_pdf_esc(status)}</b></font></font>',
+                    styles["RCPBody"],
+                )
+                target_box = Table([[Paragraph(f'<b>Objetivo</b><br/>{_pdf_esc(p.get("target") or "Por esfuerzo")}', styles["RCPBody"]) ]], colWidths=[130*mm])
+                target_box.setStyle(TableStyle([
+                    ("BACKGROUND", (0,0), (-1,-1), ksoft if visual else surface),
+                    ("LINEBEFORE", (0,0), (0,-1), 3, kcolor),
+                    ("LEFTPADDING", (0,0), (-1,-1), 7), ("RIGHTPADDING", (0,0), (-1,-1), 7),
+                    ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+                ]))
+                right_story = [title_row, Spacer(1, 2), target_box]
                 if include_instructions:
+                    right_story.append(Spacer(1, 2))
                     right_story.append(Paragraph(f"<b>Cómo hacerlo:</b> {_pdf_esc(p.get('description') or 'Sin instrucciones adicionales.')}", styles["RCPBody"]))
                 if include_progress and log:
                     actual_parts = []
@@ -6720,37 +6895,52 @@ def build_plan_pdf_bytes(
                             actual_parts.append("Motivo: " + _pdf_clean(log.get("missed_reason")))
                     if actual_parts:
                         right_story.append(Paragraph("<b>Registro:</b> " + _pdf_esc(" | ".join(actual_parts)), styles["RCPSmall"]))
+                tags=[]
                 if session_is_optional(p):
-                    right_story.append(Paragraph("Sesión opcional", styles["RCPSmall"]))
+                    tags.append("Sesión opcional")
                 if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
-                    right_story.append(Paragraph("Replanificada por RCP", styles["RCPSmall"]))
+                    tags.append("Replanificada por RCP")
                 if ADAPTIVE_READY and str(p.get("adaptation_status") or "BASELINE").upper() != "BASELINE":
                     base_km = float(p.get("baseline_planned_km") or p.get("planned_km") or 0)
-                    right_story.append(Paragraph(f"Adaptación RCP: plan base {base_km:g} km -> vigente {float(p.get('planned_km') or 0):g} km", styles["RCPSmall"]))
+                    tags.append(f"Adaptación: {base_km:g} -> {float(p.get('planned_km') or 0):g} km")
+                if tags:
+                    right_story.append(Paragraph(" · ".join(_pdf_esc(x) for x in tags), styles["RCPSmall"]))
 
-                card = Table([[left_table, right_story]], colWidths=[29 * mm, 137 * mm], hAlign="LEFT")
+                card = Table([[left, right_story]], colWidths=[29 * mm, 141 * mm], hAlign="LEFT")
                 card.setStyle(TableStyle([
-                    ("BOX", (0, 0), (-1, -1), 0.6, border),
+                    ("BOX", (0, 0), (-1, -1), 0.7, border),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ("BACKGROUND", (1, 0), (1, 0), white),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-                    ("TOPPADDING", (0, 0), (-1, -1), 6),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (0, 0), 4),
+                    ("RIGHTPADDING", (0, 0), (0, 0), 4),
+                    ("TOPPADDING", (0, 0), (0, 0), 5),
+                    ("BOTTOMPADDING", (0, 0), (0, 0), 5),
+                    ("LEFTPADDING", (1, 0), (1, 0), 8),
+                    ("RIGHTPADDING", (1, 0), (1, 0), 8),
+                    ("TOPPADDING", (1, 0), (1, 0), 7),
+                    ("BOTTOMPADDING", (1, 0), (1, 0), 7),
                 ]))
                 story.append(KeepTogether([card, Spacer(1, 3 * mm)]))
 
             story.append(Spacer(1, 2 * mm))
-            story.append(HRFlowable(width="100%", thickness=0.5, color=border, spaceBefore=2, spaceAfter=5))
 
     story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph("Notas", styles["RCPH2"]))
-    story.append(P("Este documento es una instantánea del plan activo. Readiness, adaptaciones, replanificaciones y nuevos registros pueden cambiar sesiones futuras dentro de RunningCoachPro. Ante dolor relevante, síntomas de alarma o una situación clínica, no uses este PDF como sustituto de una valoración profesional."))
+    note_box = Table([[Paragraph(
+        "<b>Documento vivo.</b> Este PDF es una instantánea del plan activo. Readiness, adaptaciones, replanificaciones y nuevos registros pueden modificar sesiones futuras dentro de RunningCoachPro. Ante dolor relevante, síntomas de alarma o una situación clínica, no uses este documento como sustituto de una valoración profesional.",
+        styles["RCPBody"],
+    )]], colWidths=[170*mm])
+    note_box.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), surface),
+        ("BOX", (0,0), (-1,-1), 0.5, border),
+        ("LINEBEFORE", (0,0), (0,-1), 3, slate_2),
+        ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+    ]))
+    story.append(note_box)
 
     doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
     buffer.seek(0)
     return buffer.getvalue()
-
 
 def plan_pdf_filename(active_goal, scope, mode):
     goal = re.sub(r"[^A-Za-z0-9]+", "_", _pdf_clean((active_goal or {}).get("goal_type") or "Plan")).strip("_")
