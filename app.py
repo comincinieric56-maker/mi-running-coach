@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import math
 import re
 import html
+import itertools
 from supabase import create_client
 
 st.set_page_config(
@@ -14,7 +15,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V6.4.2 · Diseño UI/UX responsive · Navigation Grid
+# V7.0 · Plan Engine RCP + UI/UX responsive
 # ============================================================
 st.markdown(
     """
@@ -301,7 +302,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.4.2"
+APP_VERSION = "7.0.0"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -1817,6 +1818,759 @@ def legacy_profile_for_goal(goal_row, profile, assessment):
     }
 
 
+# ============================================================
+# V7.0 · PLAN ENGINE RCP
+# ============================================================
+# Motor heurístico de entrenamiento basado en Evaluación RCP, objetivo,
+# disponibilidad, carga reciente y rendimiento. No es una escala clínica
+# validada ni sustituye valoración médica/coaching individual.
+
+DAY_INDEX = {name: idx for idx, name in enumerate(DAY_NAMES)}
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _day_gap(a, b):
+    """Distancia circular mínima entre dos días de la semana (0..6)."""
+    d = abs(int(a) - int(b))
+    return min(d, 7 - d)
+
+
+def _available_day_indices(answers):
+    raw = answers.get("available_days") or []
+    indices = sorted({DAY_INDEX[x] for x in raw if x in DAY_INDEX})
+    return indices
+
+
+def _choose_running_days(answers, level):
+    """Selecciona días reales de entrenamiento sin asumir plantillas fijas."""
+    available = _available_day_indices(answers)
+    if len(available) < 2:
+        return [], None
+
+    current_days = int(answers.get("current_days") or 0)
+    level = str(level or "INICIACIÓN").upper()
+    level_ceiling = {
+        "INICIACIÓN": 3,
+        "PRINCIPIANTE": 4,
+        "INTERMEDIO": 5,
+        "AVANZADO": 6,
+    }.get(level, 4)
+    floor = 2 if level in ("INICIACIÓN", "PRINCIPIANTE") else 3
+    desired = current_days if current_days >= floor else floor
+    if current_days > 0:
+        desired = min(desired + 1, level_ceiling)
+    desired = int(_clamp(desired, 2, min(level_ceiling, len(available))))
+
+    preferred_name = answers.get("preferred_long_day")
+    long_day = DAY_INDEX.get(preferred_name) if preferred_name in DAY_INDEX else None
+    if long_day not in available:
+        weekend = [d for d in (6, 5) if d in available]
+        long_day = weekend[0] if weekend else available[-1]
+
+    if len(available) <= desired:
+        return available, long_day
+
+    # Selección por separación: siempre conserva el día de larga y agrega
+    # iterativamente el día que maximiza distancia respecto de los elegidos.
+    selected = [long_day]
+    pool = [d for d in available if d != long_day]
+    while len(selected) < desired and pool:
+        best = max(pool, key=lambda d: (min(_day_gap(d, x) for x in selected), -d))
+        selected.append(best)
+        pool.remove(best)
+    return sorted(selected), long_day
+
+
+def _quality_days(selected_days, long_day, answers, max_quality):
+    no_intensity = {DAY_INDEX[x] for x in (answers.get("no_intensity_days") or []) if x in DAY_INDEX}
+    candidates = [d for d in selected_days if d != long_day and d not in no_intensity]
+    chosen = []
+    for _ in range(max_quality):
+        if not candidates:
+            break
+        if not chosen:
+            # Prioriza un día con al menos 2 días de separación respecto a la larga.
+            day = max(candidates, key=lambda d: (_day_gap(d, long_day), -d))
+        else:
+            day = max(
+                candidates,
+                key=lambda d: (min([_day_gap(d, long_day)] + [_day_gap(d, x) for x in chosen]), -d),
+            )
+        if _day_gap(day, long_day) < 2 and len(selected_days) >= 4:
+            candidates.remove(day)
+            continue
+        chosen.append(day)
+        candidates.remove(day)
+    return sorted(chosen)
+
+
+def _pace_range(fast_sec, slow_sec):
+    if not fast_sec or not slow_sec:
+        return None
+    return f"{pace_string(fast_sec).replace(' min/km','')}–{pace_string(slow_sec)}"
+
+
+def v7_pace_profile(assessment, goal_row):
+    """Ritmos orientativos. Si no hay marca reciente fiable, usa solo RPE/talk test."""
+    answers = dict((assessment or {}).get("answers") or {})
+    perf = performance_summary(answers)
+    out = {
+        "basis": "RPE / talk test",
+        "usable": False,
+        "source": perf,
+        "recovery": None,
+        "easy": None,
+        "long": None,
+        "steady": None,
+        "threshold": None,
+        "interval": None,
+        "race": None,
+    }
+    if not perf.get("usable"):
+        return out
+    if str(perf.get("terrain") or "").lower() == "trail":
+        out["basis"] = "RPE / talk test (marca trail no usada para ritmos de ruta)"
+        return out
+
+    equivalents = perf.get("equivalents_sec") or {}
+    p5 = (float(equivalents.get("5K")) / 5.0) if equivalents.get("5K") else None
+    p10 = (float(equivalents.get("10K")) / 10.0) if equivalents.get("10K") else None
+    if not p10:
+        source_km = float(perf.get("source_distance_km") or 0)
+        source_sec = float(perf.get("source_time_sec") or 0)
+        p10 = source_sec / source_km if source_km > 0 else None
+    if not p10:
+        return out
+    if not p5:
+        p5 = max(1.0, p10 - 18)
+
+    out.update({
+        "basis": "marca reciente + RPE",
+        "usable": True,
+        "recovery": [round(p10 + 75), round(p10 + 110)],
+        "easy": [round(p10 + 55), round(p10 + 90)],
+        "long": [round(p10 + 50), round(p10 + 85)],
+        "steady": [round(p10 + 30), round(p10 + 50)],
+        "threshold": [round(p10 + 10), round(p10 + 25)],
+        "interval": [round(max(1, p5 - 5)), round(p5 + 10)],
+    })
+
+    goal_km = GOAL_KM.get(str(goal_row.get("goal_type") or ""))
+    target_seconds = goal_row.get("target_time_sec")
+    source_seconds = perf.get("source_time_sec")
+    source_km = perf.get("source_distance_km")
+    estimated = estimate_equivalent_time(source_seconds, source_km, goal_km) if goal_km else None
+    if goal_km:
+        race_sec = None
+        # Una meta >5% por delante de la equivalencia actual no se usa como ritmo de
+        # prescripción; V7 entrena desde la capacidad actual y conserva la meta como objetivo.
+        gap = None
+        if estimated and target_seconds:
+            gap = (float(estimated) - float(target_seconds)) / float(estimated) * 100
+        if target_seconds and (gap is None or gap <= 5):
+            race_sec = float(target_seconds) / float(goal_km)
+        elif estimated:
+            race_sec = float(estimated) / float(goal_km)
+        elif target_seconds:
+            race_sec = float(target_seconds) / float(goal_km)
+        if race_sec:
+            out["race"] = round(race_sec)
+    return out
+
+
+def _target_with_pace(label, zone, rpe):
+    if zone and isinstance(zone, (list, tuple)) and len(zone) == 2:
+        return f"{_pace_range(zone[0], zone[1])} · RPE {rpe}"
+    if zone and isinstance(zone, (int, float)):
+        return f"{pace_string(zone)} · RPE {rpe}"
+    return f"RPE {rpe}"
+
+
+def _v7_phase_schedule(goal, total_weeks, base_status, level, experience):
+    """Devuelve una fase por semana: BASE, DESARROLLO, ESPECÍFICA, TAPER, CARRERA."""
+    goal = str(goal or "Condición física")
+    race_goal = goal in ("5K", "10K", "21K", "42K")
+    if total_weeks <= 0:
+        return []
+
+    if not race_goal:
+        base_weeks = min(3, max(1, total_weeks // 3))
+        return ["BASE" if i < base_weeks else "DESARROLLO" for i in range(total_weeks)]
+
+    taper_weeks = {"5K": 1, "10K": 1, "21K": 2, "42K": 3}.get(goal, 1)
+    taper_weeks = min(taper_weeks, max(1, total_weeks - 2))
+
+    short_history = experience in ("Nunca", "<1 mes", "1–3 meses", "3–6 meses")
+    base_weeks = 0
+    if base_status == "BASE PREVIA":
+        base_weeks = min(3, max(1, total_weeks - taper_weeks - 3))
+    elif short_history or str(level).upper() in ("INICIACIÓN", "PRINCIPIANTE"):
+        base_weeks = 1 if total_weeks >= 6 else 0
+
+    remaining = max(1, total_weeks - base_weeks - taper_weeks)
+    specific_weeks = max(1, round(remaining * (0.45 if goal in ("21K", "42K") else 0.40)))
+    build_weeks = max(0, remaining - specific_weeks)
+
+    phases = ["BASE"] * base_weeks + ["DESARROLLO"] * build_weeks + ["ESPECÍFICA"] * specific_weeks + ["TAPER"] * taper_weeks
+    return phases[:total_weeks]
+
+
+def _v7_initial_volume(answers, level, base_status, goal):
+    current = float(answers.get("weekly_km") or 0)
+    continuous = int(answers.get("continuous_min") or 0)
+    level = str(level or "INICIACIÓN").upper()
+
+    if current <= 0:
+        current = 6.0 if continuous < 20 else 10.0
+    factor = 1.0
+    if str(goal) == "Volver a correr tras una pausa":
+        factor = 0.70
+    elif base_status == "BASE PREVIA":
+        factor = 0.88
+    elif level == "INICIACIÓN":
+        factor = 0.80
+    elif level == "PRINCIPIANTE":
+        factor = 0.92
+    return max(5.0, current * factor)
+
+
+def _v7_weekly_volumes(initial_km, total_weeks, phases, progression_mode, goal):
+    if total_weeks <= 0:
+        return []
+    mode = str(progression_mode or "ESTÁNDAR").upper()
+    growth = {"RESTRINGIDA": 0.00, "CONSERVADORA": 0.035, "ESTÁNDAR": 0.05}.get(mode, 0.04)
+    peak_cap = {"RESTRINGIDA": 1.05, "CONSERVADORA": 1.20, "ESTÁNDAR": 1.28}.get(mode, 1.20)
+    if str(goal) == "42K":
+        peak_cap += 0.05
+
+    values = []
+    prev = float(initial_km)
+    peak = prev
+    taper_indices = [i for i, p in enumerate(phases) if p == "TAPER"]
+    first_taper = taper_indices[0] if taper_indices else total_weeks
+
+    for i, phase in enumerate(phases):
+        if phase == "TAPER":
+            taper_pos = taper_indices.index(i)
+            taper_count = len(taper_indices)
+            factors = {1: [0.58], 2: [0.76, 0.56], 3: [0.84, 0.70, 0.52]}.get(taper_count, [0.60] * taper_count)
+            target = peak * factors[min(taper_pos, len(factors) - 1)]
+        else:
+            if i == 0:
+                target = prev
+            else:
+                target = prev * (1.0 + growth)
+                # Descarga cada 4 semanas de carga, pero no durante la fase específica final.
+                if (i + 1) % 4 == 0 and phase != "ESPECÍFICA":
+                    target = prev * 0.88
+            target = min(target, initial_km * peak_cap)
+            if phase == "ESPECÍFICA" and i >= max(0, first_taper - 2):
+                target = min(target, peak)
+            peak = max(peak, target)
+        target = max(5.0, float(target))
+        values.append(round(target, 1))
+        prev = target
+    return values
+
+
+def _v7_long_cap(goal):
+    return {
+        "5K": 12.0,
+        "10K": 18.0,
+        "21K": 24.0,
+        "42K": 32.0,
+        "Condición física": 16.0,
+        "Mantener rendimiento": 20.0,
+        "Volver a correr tras una pausa": 14.0,
+        "Empezar a correr": 8.0,
+        "Correr 30 min continuos": 8.0,
+    }.get(str(goal), 18.0)
+
+
+def _v7_long_distance(weekly_km, answers, goal, phase, week_idx, total_weeks, days_count):
+    current_long = float(answers.get("long_run_km") or 0)
+    cap = _v7_long_cap(goal)
+    frac = 0.32 if days_count <= 3 else 0.28
+    upper_frac = 0.42 if days_count <= 3 else 0.38
+    baseline_long = max(4.0, weekly_km * frac)
+    if current_long > 0:
+        preserve = current_long * (0.82 if week_idx == 0 else 0.88)
+        baseline_long = max(baseline_long, preserve)
+    long_km = min(cap, baseline_long, weekly_km * upper_frac)
+
+    if phase == "TAPER":
+        taper_weeks_left = max(1, total_weeks - week_idx)
+        factor = 0.65 if taper_weeks_left >= 2 else 0.48
+        long_km = min(long_km, max(4.0, current_long * factor if current_long else weekly_km * 0.24))
+    if str(goal) in ("Empezar a correr", "Correr 30 min continuos"):
+        long_km = min(long_km, 6.0)
+    return round(max(3.0, long_km), 1)
+
+
+def _v7_quality_count(level, days_count, phase, answers):
+    level = str(level or "INICIACIÓN").upper()
+    experience = str(answers.get("experience") or "Nunca")
+    prior_quality = len(set(answers.get("quality_types") or []))
+    if phase == "BASE" or level == "INICIACIÓN" or days_count <= 2:
+        return 0
+    if phase == "TAPER":
+        return 1 if days_count >= 3 else 0
+    if level == "PRINCIPIANTE" or experience in ("<1 mes", "1–3 meses", "3–6 meses"):
+        return 1 if days_count >= 3 else 0
+    if days_count >= 4 and prior_quality >= 2 and phase in ("DESARROLLO", "ESPECÍFICA"):
+        return 2
+    return 1
+
+
+def _run_walk_recipe(week_no):
+    recipes = [
+        (1, 2, 8),
+        (2, 2, 7),
+        (3, 2, 6),
+        (4, 2, 5),
+        (5, 1, 5),
+        (8, 1, 4),
+        (10, 1, 3),
+        (15, 1, 2),
+    ]
+    run_min, walk_min, reps = recipes[min(max(0, week_no - 1), len(recipes) - 1)]
+    return run_min, walk_min, reps
+
+
+def _v7_quality_session(goal, phase, week_no, slot, pace_profile, level):
+    goal = str(goal)
+    slot = int(slot)
+    if phase == "TAPER":
+        return {
+            "type": "ACTIVACION",
+            "name": "Activación corta",
+            "target": _target_with_pace("", pace_profile.get("interval"), "6–7/10"),
+            "intensity": "CONTROLADA",
+            "description": "15 min suave + 4–6 × 60–90 s alegres con recuperación completa + 10 min suave. Debes terminar con sensación de reserva.",
+        }
+
+    if goal == "5K":
+        if (week_no + slot) % 2 == 0:
+            return {
+                "type": "SERIES",
+                "name": "Intervalos cortos",
+                "target": _target_with_pace("", pace_profile.get("interval"), "7–8/10"),
+                "intensity": "ALTA CONTROLADA",
+                "description": "15 min suave + movilidad + 8 × 400 m controlados, 75–90 s de trote/pausa + 10 min suave. Evita convertirlo en sprint.",
+            }
+        return {
+            "type": "UMBRAL",
+            "name": "Umbral fraccionado",
+            "target": _target_with_pace("", pace_profile.get("threshold"), "6–7/10"),
+            "intensity": "UMBRAL",
+            "description": "15 min suave + 3 × 8 min a esfuerzo de umbral con 2 min suaves + 10 min suave.",
+        }
+
+    if goal == "10K":
+        if slot == 0:
+            return {
+                "type": "UMBRAL",
+                "name": "Umbral sostenido",
+                "target": _target_with_pace("", pace_profile.get("threshold"), "6–7/10"),
+                "intensity": "UMBRAL",
+                "description": "15 min suave + 20–30 min totales de trabajo a umbral (continuo o 2–3 bloques) + 10 min suave.",
+            }
+        return {
+            "type": "SERIES",
+            "name": "Intervalos largos",
+            "target": _target_with_pace("", pace_profile.get("interval"), "7–8/10"),
+            "intensity": "ALTA CONTROLADA",
+            "description": "15 min suave + 5–6 × 800 m o 4–5 × 1 km controlados, 90–120 s suaves + 10 min suave.",
+        }
+
+    if goal == "21K":
+        if slot == 0:
+            return {
+                "type": "UMBRAL",
+                "name": "Umbral controlado",
+                "target": _target_with_pace("", pace_profile.get("threshold"), "6–7/10"),
+                "intensity": "UMBRAL",
+                "description": "15 min suave + 2–3 bloques de 10–12 min a umbral con 2–3 min suaves + 10 min suave.",
+            }
+        race_pace = pace_profile.get("race")
+        return {
+            "type": "RITMO_CARRERA",
+            "name": "Bloques a ritmo MM",
+            "target": _target_with_pace("", race_pace, "5–6/10"),
+            "intensity": "ESPECÍFICA",
+            "description": "15 min suave + 3–5 bloques de 1–2 km al esfuerzo específico de media maratón, 2–3 min suaves entre bloques + enfriamiento.",
+        }
+
+    if goal == "42K":
+        if slot == 0:
+            return {
+                "type": "UMBRAL",
+                "name": "Umbral aeróbico",
+                "target": _target_with_pace("", pace_profile.get("threshold"), "6–7/10"),
+                "intensity": "UMBRAL",
+                "description": "15 min suave + 2–3 × 10 min controlados a umbral con 3 min suaves + 10 min suave.",
+            }
+        return {
+            "type": "RITMO_CARRERA",
+            "name": "Ritmo maratón controlado",
+            "target": _target_with_pace("", pace_profile.get("race"), "5–6/10"),
+            "intensity": "ESPECÍFICA",
+            "description": "Rodaje con bloques a esfuerzo de maratón. Mantén control respiratorio; no conviertas la sesión en un tempo máximo.",
+        }
+
+    # Objetivos generales / mantenimiento.
+    return {
+        "type": "FARTLEK",
+        "name": "Fartlek controlado",
+        "target": "RPE 6–7/10 en los tramos rápidos",
+        "intensity": "MODERADA",
+        "description": "15 min suave + 8–10 × 1 min ágil / 1–2 min suave + 10 min suave. Debes conservar técnica y control.",
+    }
+
+
+def _v7_allocate_distances(weekly_km, days, long_day, quality_days, long_km, phase, goal):
+    roles = {}
+    for d in days:
+        if d == long_day:
+            roles[d] = "LONG"
+        elif d in quality_days:
+            roles[d] = "QUALITY"
+        else:
+            roles[d] = "EASY"
+
+    distances = {long_day: long_km}
+    remaining = max(0.0, weekly_km - long_km)
+    quality_share = 0.0
+    if quality_days:
+        quality_share = min(remaining * 0.48, weekly_km * (0.22 * len(quality_days)))
+    per_quality = quality_share / len(quality_days) if quality_days else 0
+    for d in quality_days:
+        distances[d] = round(max(4.0, per_quality), 1)
+
+    easy_days = [d for d in days if d != long_day and d not in quality_days]
+    used = sum(distances.values())
+    easy_remaining = max(0.0, weekly_km - used)
+    per_easy = easy_remaining / len(easy_days) if easy_days else 0
+    for d in easy_days:
+        distances[d] = round(max(3.0, per_easy), 1)
+
+    # Ajuste final para aproximar el total semanal sin tocar la larga.
+    total = sum(distances.values())
+    delta = round(weekly_km - total, 1)
+    adjust_candidates = easy_days or quality_days
+    if adjust_candidates and abs(delta) >= 0.1:
+        d = adjust_candidates[0]
+        distances[d] = round(max(2.5, distances[d] + delta), 1)
+    return roles, distances
+
+
+def can_generate_v7_plan(goal_row, assessment):
+    if not assessment_is_complete(assessment):
+        return False, "Falta una Evaluación RCP completa."
+    if str(assessment.get("safety_status") or "") != "SIN ALERTAS DECLARADAS":
+        return False, "El cribado de seguridad no permite generar automáticamente un plan de entrenamiento."
+
+    answers = assessment.get("answers") or {}
+    available = _available_day_indices(answers)
+    if len(available) < 2:
+        return False, "Se requieren al menos 2 días disponibles para generar un plan RCP V7."
+
+    goal_type = str(goal_row.get("goal_type") or "")
+    if goal_type not in RCP_GOALS:
+        return False, "Objetivo no reconocido por el motor RCP V7."
+
+    snapshot = goal_row.get("readiness_snapshot") or goal_analysis_snapshot(
+        goal_type,
+        goal_row.get("goal_style") or "Terminar",
+        goal_row.get("race_date"),
+        goal_row.get("target_time_sec"),
+        assessment,
+    )
+    base_status = str(snapshot.get("base_status") or "")
+    calendar_status = str(snapshot.get("calendar_status") or "")
+
+    if goal_type in ("5K", "10K", "21K", "42K"):
+        if base_status == "INSUFICIENTE":
+            return False, "La base actual es insuficiente para un plan específico de esa distancia. Conviene crear primero un objetivo de base/retorno y reevaluar."
+        if calendar_status in ("INSUFICIENTE", "FECHA INVÁLIDA", "EVALUAR SEGURIDAD"):
+            return False, "El calendario disponible no permite generar de forma responsable este plan específico."
+        if not goal_row.get("race_date"):
+            return False, "Para un objetivo de carrera específico V7 necesita una fecha objetivo."
+    return True, None
+
+
+def build_v7_plan(goal_row, assessment, start_date_value=None):
+    """Genera filas de rc_plan_sessions + metadata de plan. Función pura salvo USER_ID/date.today()."""
+    can_generate, reason = can_generate_v7_plan(goal_row, assessment)
+    if not can_generate:
+        return [], {}, reason
+
+    answers = dict((assessment or {}).get("answers") or {})
+    level = str((assessment or {}).get("runner_level") or "INICIACIÓN").upper()
+    runner_profile = ((assessment or {}).get("explanation") or {}).get("runner_profile") or {}
+    tolerance = runner_profile.get("tolerance") or {}
+    progression_mode = str(tolerance.get("progression_mode") or "CONSERVADORA")
+    goal = str(goal_row.get("goal_type") or "Condición física")
+    if progression_mode == "ESTÁNDAR" and (
+        level == "INICIACIÓN"
+        or goal in ("Empezar a correr", "Correr 30 min continuos", "Volver a correr tras una pausa")
+        or str((goal_row.get("readiness_snapshot") or {}).get("base_status") or "") == "BASE PREVIA"
+    ):
+        progression_mode = "CONSERVADORA"
+    race_date = date.fromisoformat(str(goal_row["race_date"])) if goal_row.get("race_date") else None
+    start_date_value = start_date_value or (date.today() + timedelta(days=1))
+
+    selected_days, long_day = _choose_running_days(answers, level)
+    if len(selected_days) < 2:
+        return [], {}, "No fue posible construir una distribución semanal con los días disponibles."
+
+    if race_date:
+        total_days = (race_date - start_date_value).days + 1
+        total_weeks = max(1, math.ceil(total_days / 7))
+    else:
+        total_weeks = {
+            "Empezar a correr": 8,
+            "Correr 30 min continuos": 8,
+            "Condición física": 10,
+            "Mantener rendimiento": 8,
+            "Volver a correr tras una pausa": 8,
+        }.get(goal, 10)
+
+    snapshot = goal_row.get("readiness_snapshot") or goal_analysis_snapshot(
+        goal,
+        goal_row.get("goal_style") or "Terminar",
+        goal_row.get("race_date"),
+        goal_row.get("target_time_sec"),
+        assessment,
+    )
+    base_status = str(snapshot.get("base_status") or "ADECUADA")
+    experience = str(answers.get("experience") or "Nunca")
+    phases = _v7_phase_schedule(goal, total_weeks, base_status, level, experience)
+    initial_km = _v7_initial_volume(answers, level, base_status, goal)
+    weekly_volumes = _v7_weekly_volumes(initial_km, total_weeks, phases, progression_mode, goal)
+    pace_profile = v7_pace_profile(assessment, goal_row)
+
+    monday0 = start_date_value - timedelta(days=start_date_value.weekday())
+    rows = []
+    week_meta = []
+    continuous_min = int(answers.get("continuous_min") or 0)
+    run_walk_mode = level == "INICIACIÓN" or continuous_min < 20 or goal in ("Empezar a correr", "Correr 30 min continuos")
+
+    for w in range(total_weeks):
+        week_no = w + 1
+        monday = monday0 + timedelta(days=7 * w)
+        phase = phases[w] if w < len(phases) else "DESARROLLO"
+        weekly_km = weekly_volumes[w]
+        q_count = _v7_quality_count(level, len(selected_days), phase, answers)
+        quality_days = _quality_days(selected_days, long_day, answers, q_count)
+        long_km = _v7_long_distance(weekly_km, answers, goal, phase, w, total_weeks, len(selected_days))
+        roles, distances = _v7_allocate_distances(weekly_km, selected_days, long_day, quality_days, long_km, phase, goal)
+
+        week_meta.append({
+            "week": week_no,
+            "phase": phase,
+            "target_km": weekly_km,
+            "long_km": long_km,
+            "quality_sessions": len(quality_days),
+        })
+
+        quality_slot = 0
+        for weekday in selected_days:
+            d = monday + timedelta(days=weekday)
+            if d < start_date_value:
+                continue
+            if race_date and d > race_date:
+                continue
+            if race_date and d == race_date and goal in GOAL_KM and GOAL_KM.get(goal):
+                continue
+
+            distance_km = float(distances.get(weekday) or 0)
+            role = roles.get(weekday, "EASY")
+
+            _rw_this_week = run_walk_mode and (
+                phase == "BASE"
+                or goal in ("Empezar a correr", "Correr 30 min continuos")
+            )
+            if _rw_this_week:
+                run_min, walk_min, reps = _run_walk_recipe(week_no)
+                if role == "LONG":
+                    reps += 1
+                description = (
+                    f"5–8 min caminando + {reps} × ({run_min} min trote muy suave / {walk_min} min caminata) "
+                    "+ 5 min caminando. El objetivo es acumular tiempo cómodo, no velocidad. "
+                    "Si aparece dolor que cambie la zancada, detén la sesión."
+                )
+                rows.append({
+                    "user_id": USER_ID,
+                    "session_date": d.isoformat(),
+                    "week_no": week_no,
+                    "workout_type": "RUN_WALK_LONG" if role == "LONG" else "RUN_WALK",
+                    "workout_name": f"Run–Walk {'largo ' if role == 'LONG' else ''}{run_min}:{walk_min}",
+                    "planned_km": round(max(2.5, distance_km), 1),
+                    "target": "RPE 2–3/10 · respiración controlada",
+                    "intensity": "ADAPTACIÓN",
+                    "description": description,
+                    "is_optional": False,
+                })
+                continue
+
+            if role == "LONG":
+                long_target = _target_with_pace("", pace_profile.get("long"), "3–4/10")
+                desc = "Empieza muy suave y mantén conversación completa. En subidas manda el esfuerzo, no el ritmo."
+                if phase == "ESPECÍFICA" and goal in ("21K", "42K") and pace_profile.get("race") and level in ("INTERMEDIO", "AVANZADO"):
+                    desc += " En el tercio final, si estás recuperado, añade 15–25 min al esfuerzo específico de carrera; no es obligatorio si la fatiga es alta."
+                rows.append({
+                    "user_id": USER_ID,
+                    "session_date": d.isoformat(),
+                    "week_no": week_no,
+                    "workout_type": "LARGA",
+                    "workout_name": f"Tirada larga {distance_km:g} km",
+                    "planned_km": round(distance_km, 1),
+                    "target": long_target,
+                    "intensity": "BASE" if phase != "ESPECÍFICA" else "ESPECÍFICA CONTROLADA",
+                    "description": desc,
+                    "is_optional": False,
+                })
+                continue
+
+            if role == "QUALITY":
+                q = _v7_quality_session(goal, phase, week_no, quality_slot, pace_profile, level)
+                quality_slot += 1
+                rows.append({
+                    "user_id": USER_ID,
+                    "session_date": d.isoformat(),
+                    "week_no": week_no,
+                    "workout_type": q["type"],
+                    "workout_name": q["name"],
+                    "planned_km": round(max(4.0, distance_km), 1),
+                    "target": q["target"],
+                    "intensity": q["intensity"],
+                    "description": q["description"],
+                    "is_optional": False,
+                })
+                continue
+
+            # Rodaje fácil / recuperación.
+            is_recovery = len(selected_days) >= 5 and any(_day_gap(weekday, qd) == 1 for qd in quality_days)
+            zone = pace_profile.get("recovery" if is_recovery else "easy")
+            target = _target_with_pace("", zone, "2–3/10" if is_recovery else "3–4/10")
+            desc = "Muy suave; debe dejarte mejor de lo que empezaste." if is_recovery else "Ritmo conversacional. Mantén técnica relajada y reserva clara al terminar."
+            # Dos recordatorios de fuerza/semana sin crear una segunda sesión en la misma fecha.
+            easy_rank = [x for x in selected_days if roles.get(x) == "EASY"].index(weekday) if weekday in [x for x in selected_days if roles.get(x) == "EASY"] else -1
+            if easy_rank in (0, 1) and phase != "TAPER":
+                desc += " Fuerza RCP sugerida después o en otro momento del día: 15–25 min (sentadilla/split squat, bisagra, gemelos/sóleo y core), con técnica controlada."
+            rows.append({
+                "user_id": USER_ID,
+                "session_date": d.isoformat(),
+                "week_no": week_no,
+                "workout_type": "RECUPERACION" if is_recovery else "RODAJE",
+                "workout_name": f"{'Recuperación' if is_recovery else 'Rodaje suave'} {distance_km:g} km",
+                "planned_km": round(max(2.5, distance_km), 1),
+                "target": target,
+                "intensity": "RECUPERACIÓN" if is_recovery else "BASE",
+                "description": desc,
+                "is_optional": False,
+            })
+
+    # Carrera objetivo: se agrega siempre aunque no coincida con un día habitual.
+    if race_date and goal in GOAL_KM and GOAL_KM.get(goal):
+        race_distance = float(GOAL_KM[goal])
+        race_pace = pace_profile.get("race")
+        rows = [r for r in rows if r["session_date"] != race_date.isoformat()]
+        rows.append({
+            "user_id": USER_ID,
+            "session_date": race_date.isoformat(),
+            "week_no": total_weeks,
+            "workout_type": "CARRERA",
+            "workout_name": f"{goal} objetivo",
+            "planned_km": race_distance,
+            "target": _target_with_pace("", race_pace, "según estrategia") if race_pace else "Ritmo/Esfuerzo de carrera controlado",
+            "intensity": "COMPETENCIA",
+            "description": "Calentamiento habitual. Salida controlada, estabiliza el esfuerzo y reserva capacidad para el tramo final. No persigas una meta de ritmo si las condiciones o sensaciones no la sostienen.",
+            "is_optional": False,
+        })
+
+    rows.sort(key=lambda x: x["session_date"])
+    if not rows:
+        return [], {}, "El motor V7 no produjo sesiones en el intervalo disponible."
+
+    metadata = {
+        "engine": "RCP-V7.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "assessment_id": assessment.get("id"),
+        "assessment_version": assessment.get("assessment_version"),
+        "runner_level": level,
+        "runner_score": int(assessment.get("runner_score") or 0),
+        "progression_mode": progression_mode,
+        "goal_type": goal,
+        "goal_style": goal_row.get("goal_style"),
+        "selected_days": [DAY_NAMES[d] for d in selected_days],
+        "long_day": DAY_NAMES[long_day] if long_day is not None else None,
+        "initial_weekly_km": round(initial_km, 1),
+        "peak_weekly_km": round(max(weekly_volumes) if weekly_volumes else initial_km, 1),
+        "pace_basis": pace_profile.get("basis"),
+        "pace_profile": {k: v for k, v in pace_profile.items() if k != "source"},
+        "weeks": week_meta,
+        "methodology": {
+            "load": "Progresión RCP individualizada por historial, nivel, base y modo de progresión; incluye descargas y límites de pico.",
+            "intensity": "RPE/talk test siempre; ritmos solo cuando existe una marca reciente utilizable.",
+            "taper": "Reducción progresiva de volumen manteniendo estímulos breves de intensidad antes de carrera.",
+            "strength": "Fuerza complementaria sugerida 1–2 veces/semana según fase y tolerancia.",
+        },
+    }
+    return rows, metadata, None
+
+
+def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=None):
+    """Crea primero un plan FUTURE V7; solo después archiva el activo y promueve V7 a ACTIVE."""
+    rows, metadata, reason = build_v7_plan(goal_row, assessment, start_date_value=start_date_value)
+    if reason:
+        return None, reason
+
+    plan_payload = {
+        "user_id": USER_ID,
+        "goal_id": int(goal_row["id"]),
+        "status": "FUTURE",
+        "engine_version": "RCP-V7.0",
+        "start_date": rows[0]["session_date"],
+        "end_date": rows[-1]["session_date"],
+        "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
+        "days_per_week": len(metadata.get("selected_days") or []),
+        "metadata": metadata,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    created = client.table("rc_plans").insert(plan_payload).execute().data or []
+    if not created:
+        return None, "No fue posible crear el ciclo V7."
+    new_plan = created[0]
+    try:
+        insert_plan_sessions(new_plan["id"], rows)
+    except Exception as exc:
+        client.table("rc_plans").delete().eq("user_id", USER_ID).eq("id", int(new_plan["id"])).execute()
+        return None, f"No fue posible guardar las sesiones V7: {exc}"
+
+    old_plan = get_active_plan_record()
+    if old_plan and int(old_plan["id"]) != int(new_plan["id"]):
+        update_plan_record(old_plan["id"], status="ARCHIVED")
+    update_plan_record(new_plan["id"], status="ACTIVE")
+    new_plan["status"] = "ACTIVE"
+
+    # Compatibilidad de perfil sin convertirlo otra vez en fuente de verdad.
+    update_profile_fields({
+        "goal": goal_row.get("goal_type") if goal_row.get("goal_type") in GOAL_KM else "Condición física",
+        "days_per_week": len(metadata.get("selected_days") or []),
+        "weekly_km": float(metadata.get("initial_weekly_km") or 0),
+        "has_race": bool(goal_row.get("race_date")),
+        "race_date": goal_row.get("race_date"),
+        "target_time_sec": goal_row.get("target_time_sec"),
+    })
+    return new_plan, None
+
+
+
 def can_generate_legacy_plan(goal_row, assessment):
     """V6.3.2 conserva el motor legacy, pero evita forzarlo donde no aplica."""
     if not assessment_is_complete(assessment):
@@ -1853,64 +2607,52 @@ def can_generate_legacy_plan(goal_row, assessment):
 
 
 def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTIVE"):
-    """Crea un ciclo y sus sesiones sin borrar ningún plan anterior."""
-    can_generate, reason = can_generate_legacy_plan(goal_row, assessment)
+    """V7.0: crea un ciclo RCP desde la Evaluación; nunca borra planes anteriores."""
+    can_generate, reason = can_generate_v7_plan(goal_row, assessment)
     if not can_generate:
         return None, reason
 
-    legacy_profile = legacy_profile_for_goal(goal_row, base_profile, assessment)
-    rows = generate_plan(legacy_profile)
-    if not rows:
-        return None, "El generador no produjo sesiones para este objetivo."
+    rows, metadata, reason = build_v7_plan(goal_row, assessment)
+    if reason or not rows:
+        return None, reason or "El Plan Engine V7 no produjo sesiones."
 
     plan_payload = {
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "LEGACY-V6.3.2",
+        "engine_version": "RCP-V7.0",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
-        "initial_weekly_km": float(legacy_profile["weekly_km"]),
-        "days_per_week": int(legacy_profile["days_per_week"]),
-        "metadata": {
-            "source": "official_goal",
-            "assessment_id": assessment.get("id"),
-            "assessment_version": assessment.get("assessment_version"),
-            "note": "Plan generado por motor legacy; se preservará al migrar al Plan Engine V7.",
-        },
+        "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
+        "days_per_week": len(metadata.get("selected_days") or []),
+        "metadata": metadata,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     result = client.table("rc_plans").insert(plan_payload).execute().data or []
     if not result:
-        return None, "No fue posible crear el registro del plan."
+        return None, "No fue posible crear el registro del plan V7."
 
     plan_row = result[0]
-    insert_plan_sessions(plan_row["id"], rows)
+    try:
+        insert_plan_sessions(plan_row["id"], rows)
+    except Exception as exc:
+        client.table("rc_plans").delete().eq("user_id", USER_ID).eq("id", int(plan_row["id"])).execute()
+        return None, f"No fue posible guardar las sesiones V7: {exc}"
 
-    # Mantener rc_profiles solo como capa de compatibilidad del motor legacy.
-    update_profile_fields({
-        "goal": legacy_profile["goal"],
-        "level": legacy_profile["level"],
-        "days_per_week": legacy_profile["days_per_week"],
-        "weekly_km": legacy_profile["weekly_km"],
-        "has_race": legacy_profile["has_race"],
-        "race_date": legacy_profile["race_date"],
-        "target_time_sec": legacy_profile["target_time_sec"],
-        "current_distance_km": legacy_profile["current_distance_km"],
-        "current_time_sec": legacy_profile["current_time_sec"],
-    })
+    if status == "ACTIVE":
+        update_profile_fields({
+            "goal": goal_row.get("goal_type") if goal_row.get("goal_type") in GOAL_KM else "Condición física",
+            "days_per_week": len(metadata.get("selected_days") or []),
+            "weekly_km": float(metadata.get("initial_weekly_km") or 0),
+            "has_race": bool(goal_row.get("race_date")),
+            "race_date": goal_row.get("race_date"),
+            "target_time_sec": goal_row.get("target_time_sec"),
+        })
     return plan_row, None
 
 
 def activate_existing_goal(goal_row, profile, assessment):
-    """
-    Activa un FUTURE conservando el objetivo/plan anterior como historial.
-
-    Si ya existe un plan ACTIVE, V6.3.2 NO lo archiva hasta comprobar que el
-    nuevo objetivo puede recibir un plan con el motor disponible. Así evitamos
-    dejar al usuario sin entrenamiento por activar una modalidad todavía no
-    soportada por el motor legacy.
-    """
+    """Activa un FUTURE sin destruir el plan vigente si la creación V7 falla."""
     snapshot = goal_analysis_snapshot(
         goal_row.get("goal_type"),
         goal_row.get("goal_style") or "Terminar",
@@ -1921,12 +2663,41 @@ def activate_existing_goal(goal_row, profile, assessment):
     candidate = dict(goal_row)
     candidate["readiness_snapshot"] = snapshot
 
-    can_generate, generation_reason = can_generate_legacy_plan(candidate, assessment)
+    can_generate, generation_reason = can_generate_v7_plan(candidate, assessment)
     current_active_plan = get_active_plan_record()
-
-    if current_active_plan and not can_generate:
+    if not can_generate:
         update_goal_record(goal_row["id"], readiness_snapshot=snapshot)
         return None, generation_reason, False
+
+    # Con plan activo: construir el nuevo ciclo como FUTURE primero. Solo cuando
+    # sesiones y metadata existen se archiva el ciclo anterior.
+    if current_active_plan:
+        future_plan, generation_reason = create_plan_record_for_goal(
+            candidate, profile, assessment, status="FUTURE"
+        )
+        if not future_plan:
+            return None, generation_reason, False
+
+        archive_active_goal_and_plan(except_goal_id=goal_row["id"])
+        update_goal_record(
+            goal_row["id"],
+            status="ACTIVE",
+            readiness_snapshot=snapshot,
+            source_assessment_id=assessment.get("id"),
+        )
+        update_plan_record(future_plan["id"], status="ACTIVE")
+        future_plan["status"] = "ACTIVE"
+
+        meta = future_plan.get("metadata") or {}
+        update_profile_fields({
+            "goal": goal_row.get("goal_type") if goal_row.get("goal_type") in GOAL_KM else "Condición física",
+            "days_per_week": int(future_plan.get("days_per_week") or len(meta.get("selected_days") or []) or 2),
+            "weekly_km": float(future_plan.get("initial_weekly_km") or meta.get("initial_weekly_km") or 0),
+            "has_race": bool(goal_row.get("race_date")),
+            "race_date": goal_row.get("race_date"),
+            "target_time_sec": goal_row.get("target_time_sec"),
+        })
+        return future_plan, None, True
 
     archive_active_goal_and_plan(except_goal_id=goal_row["id"])
     update_goal_record(
@@ -1936,11 +2707,9 @@ def activate_existing_goal(goal_row, profile, assessment):
         source_assessment_id=assessment.get("id"),
     )
     candidate["status"] = "ACTIVE"
-
-    plan_row = None
-    if can_generate:
-        plan_row, generation_reason = create_plan_record_for_goal(candidate, profile, assessment, status="ACTIVE")
-
+    plan_row, generation_reason = create_plan_record_for_goal(
+        candidate, profile, assessment, status="ACTIVE"
+    )
     return plan_row, generation_reason, True
 
 
@@ -2116,7 +2885,7 @@ def show_assessment_result(assessment):
                 "no es una escala médica ni una medida de talento o velocidad. El nivel final también aplica reglas de experiencia mínima."
             )
 
-    with st.expander("Ver perfil técnico que usará el futuro Plan Engine V7"):
+    with st.expander("Ver perfil técnico que usa el Plan Engine RCP V7"):
         st.json(runner_profile)
 
 def assessment_form(existing_assessment=None, onboarding=False):
@@ -2838,7 +3607,7 @@ def official_goal_setup(profile, assessment):
         race_date_value=race_date_value.isoformat() if has_date else None,
         target_time_sec=target_seconds,
         status="ACTIVE",
-        notes="Objetivo oficial creado durante onboarding V6.3.2",
+        notes="Objetivo oficial creado durante onboarding V7.0",
         assessment=assessment,
     )
     if not goal_row:
@@ -2847,7 +3616,7 @@ def official_goal_setup(profile, assessment):
 
     plan_row, reason = create_plan_record_for_goal(goal_row, profile, assessment, status="ACTIVE")
     if plan_row:
-        st.success("Objetivo guardado y plan creado. Tu historial queda preparado para futuras planificaciones.")
+        st.success("Objetivo guardado y plan RCP V7 creado. Tu historial queda preparado para futuras planificaciones.")
     else:
         st.warning(f"Objetivo guardado. No se creó un plan automático todavía: {reason}")
     st.rerun()
@@ -2879,9 +3648,81 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         )
     else:
         st.warning(
-            "Este objetivo está activo pero todavía no tiene plan. Puede ocurrir si la base/seguridad no permite "
-            "prescripción automática o si el objetivo requiere el futuro Plan Engine V7."
+            "Este objetivo está activo pero todavía no tiene plan. RunningCoachPro V7 puede generarlo cuando la evaluación, seguridad y calendario lo permiten."
         )
+
+    engine_name = str((active_plan or {}).get("engine_version") or "")
+    if active_plan and engine_name.startswith("RCP-V7"):
+        meta = active_plan.get("metadata") or {}
+        st.markdown("### 🧠 Plan Engine RCP V7")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Motor", engine_name)
+        e2.metric("Días/sem", int(active_plan.get("days_per_week") or 0))
+        e3.metric("Inicio", f"{float(meta.get('initial_weekly_km') or active_plan.get('initial_weekly_km') or 0):g} km")
+        e4.metric("Pico previsto", f"{float(meta.get('peak_weekly_km') or 0):g} km")
+        selected = meta.get("selected_days") or []
+        if selected:
+            st.caption(
+                f"Días elegidos por V7: {', '.join(selected)} · Tirada larga: {meta.get('long_day') or '—'} · "
+                f"Progresión: {meta.get('progression_mode') or '—'} · Ritmos: {meta.get('pace_basis') or 'RPE'}"
+            )
+    elif active_plan:
+        with st.expander("🧠 Actualizar mi plan al motor RCP V7", expanded=True):
+            st.write(
+                "V7 utiliza tu Evaluación RCP, días realmente disponibles, base actual, experiencia, tirada larga, "
+                "objetivo, calendario y rendimiento reciente. El plan actual no se borra: queda ARCHIVADO como historial."
+            )
+            preview_rows, preview_meta, preview_reason = build_v7_plan(
+                active_goal, assessment, start_date_value=date.today() + timedelta(days=1)
+            )
+            if preview_reason:
+                st.warning(f"Todavía no puedo generar el plan V7: {preview_reason}")
+            else:
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric("Sesiones", len(preview_rows))
+                v2.metric("Días/sem", len(preview_meta.get("selected_days") or []))
+                v3.metric("Inicio", f"{float(preview_meta.get('initial_weekly_km') or 0):g} km/sem")
+                v4.metric("Pico", f"{float(preview_meta.get('peak_weekly_km') or 0):g} km/sem")
+                st.caption(
+                    f"Distribución: {', '.join(preview_meta.get('selected_days') or [])} · "
+                    f"Larga: {preview_meta.get('long_day') or '—'} · "
+                    f"Progresión: {preview_meta.get('progression_mode') or '—'} · "
+                    f"Base de ritmos: {preview_meta.get('pace_basis') or 'RPE'}"
+                )
+                phase_rows = preview_meta.get("weeks") or []
+                if phase_rows:
+                    st.dataframe(
+                        [
+                            {
+                                "Semana": x.get("week"),
+                                "Fase": x.get("phase"),
+                                "KM objetivo": x.get("target_km"),
+                                "Larga": x.get("long_km"),
+                                "Calidad": x.get("quality_sessions"),
+                            }
+                            for x in phase_rows
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                confirm_v7 = st.checkbox(
+                    "Entiendo que mi plan actual quedará archivado y el nuevo plan V7 empezará desde la próxima fecha disponible.",
+                    key="confirm_upgrade_v7",
+                )
+                if st.button(
+                    "🚀 Crear mi plan RCP V7",
+                    use_container_width=True,
+                    disabled=not confirm_v7,
+                    key="upgrade_plan_v7_button",
+                ):
+                    new_plan, err = replace_active_plan_with_v7(
+                        active_goal, profile, assessment, start_date_value=date.today() + timedelta(days=1)
+                    )
+                    if new_plan:
+                        st.success("Plan V7 creado. Tu plan anterior y sus registros permanecen en el historial.")
+                        st.rerun()
+                    else:
+                        st.error(err or "No fue posible crear el plan V7.")
 
     with st.expander("✏️ Cambiar fecha o marca del objetivo actual"):
         styles = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
@@ -2935,7 +3776,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     "target_time_sec": target_seconds,
                 })
                 st.success("Objetivo actualizado. El plan actual NO fue borrado ni recalibrado.")
-                st.info("La recalibración automática de sesiones futuras se conectará al Plan Engine V7.")
+                st.info("La recalibración automática semana a semana llegará en V7.1. Cambiar la meta no borra ni reescribe el plan activo.")
                 st.rerun()
 
     with st.expander("➕ Crear otro objetivo"):
@@ -3331,6 +4172,14 @@ def all_weekly_stats():
     return [weekly[k] for k in sorted(weekly)]
 
 
+def active_plan_week_info(week_no):
+    meta = (ACTIVE_PLAN or {}).get("metadata") or {}
+    for item in meta.get("weeks") or []:
+        if int(item.get("week") or 0) == int(week_no or 0):
+            return item
+    return {}
+
+
 def render_goal_hero():
     goal_name = html.escape(str(ACTIVE_GOAL.get("goal_type") or "Objetivo"))
     race_day = parse_date_safe(ACTIVE_GOAL.get("race_date"))
@@ -3503,7 +4352,12 @@ if current_page == "Hoy":
                     st.rerun()
         else:
             status_label = status_label_for_date(selected_day)
-            st.caption(f"{workout_kind(today_session).upper()} · {status_label}")
+            _week_info = active_plan_week_info(today_session.get("week_no"))
+            _phase = _week_info.get("phase")
+            st.caption(
+                f"{workout_kind(today_session).upper()} · {status_label}"
+                + (f" · Fase {_phase}" if _phase else "")
+            )
             st.markdown(f"## {today_session['workout_name']}")
             st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
 
@@ -3625,6 +4479,14 @@ elif current_page == "Semana":
     monday, sunday = week_bounds(selected_day)
     title_col, prev_col, next_col = st.columns([3.5, 1, 1])
     title_col.subheader(f"📅 Semana · {monday.strftime('%d/%m')} – {sunday.strftime('%d/%m/%Y')}")
+    _week_sessions = [p for p in PLAN if monday <= (parse_date_safe(p.get("session_date")) or monday - timedelta(days=1)) <= sunday]
+    if _week_sessions:
+        _wi = active_plan_week_info(_week_sessions[0].get("week_no"))
+        if _wi:
+            title_col.caption(
+                f"Fase {_wi.get('phase') or '—'} · Objetivo {_wi.get('target_km') or '—'} km · "
+                f"Larga {_wi.get('long_km') or '—'} km"
+            )
     if prev_col.button("← Anterior", use_container_width=True):
         set_page("Semana", selected_day - timedelta(days=7))
         st.rerun()
@@ -3970,7 +4832,13 @@ elif current_page == "Progreso":
 # ============================================================
 elif current_page == "Plan":
     st.subheader("🗓️ Mi plan")
-    st.caption("Filtra el ciclo y abre una sesión para revisar su detalle.")
+    _plan_engine = str((ACTIVE_PLAN or {}).get("engine_version") or "—")
+    _plan_meta = (ACTIVE_PLAN or {}).get("metadata") or {}
+    st.caption(
+        f"Motor {_plan_engine} · "
+        f"{', '.join(_plan_meta.get('selected_days') or []) if _plan_meta.get('selected_days') else 'distribución legacy'} · "
+        f"abre una sesión para revisar su detalle."
+    )
 
     types = sorted({workout_kind(p) for p in PLAN})
     f1, f2, f3 = st.columns(3)
@@ -3996,6 +4864,7 @@ elif current_page == "Plan":
         table.append({
             "Fecha": d.strftime("%d/%m/%Y") if d else str(p.get("session_date")),
             "Semana": p.get("week_no"),
+            "Fase": active_plan_week_info(p.get("week_no")).get("phase") or "—",
             "Tipo": kind,
             "Entrenamiento": p.get("workout_name"),
             "KM": float(p.get("planned_km") or 0),
