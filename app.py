@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# V8.0 · Core Complete · Plan Engine + adaptación + zonas + carga + tests
+# V8.1 · Motor Estadístico Adaptativo · Core V8 + modelos multivariables
 # ============================================================
 st.markdown(
     """
@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.0.2"
+APP_VERSION = "8.1.0"
 
 
 # ============================================================
@@ -746,10 +746,10 @@ def render_qa_sandbox():
         st.caption("Límite de seguridad: la progresión de esta muestra se mantiene por debajo del 12% y no apila más de dos estímulos exigentes en 7 días.")
 
     with tabs[4]:
-        st.subheader("✅ Batería automática V8.0.2"); st.caption("Ejecuta todos los escenarios sintéticos y compara la decisión obtenida con la esperada."); matrix = _qa_automated_matrix(); passes = sum(1 for r in matrix if r["Resultado"] == "CORRECTO"); st.metric("Pruebas superadas", f"{passes}/{len(matrix)}"); st.dataframe(matrix, use_container_width=True, hide_index=True)
+        st.subheader("✅ Batería automática V8.1"); st.caption("Ejecuta todos los escenarios sintéticos y compara la decisión obtenida con la esperada."); matrix = _qa_automated_matrix(); passes = sum(1 for r in matrix if r["Resultado"] == "CORRECTO"); st.metric("Pruebas superadas", f"{passes}/{len(matrix)}"); st.dataframe(matrix, use_container_width=True, hide_index=True)
         if passes == len(matrix): st.success("Batería interna de pruebas superada. Esto valida coherencia de reglas; no sustituye la validación longitudinal con entrenamientos reales.")
         else: st.error("Hay pruebas fallidas. No conviene promover esta lógica a estable hasta corregirlas.")
-    st.divider(); st.caption("Modo de pruebas V8.0.2: datos sintéticos en memoria. No representa consejo médico ni una prescripción individual real.")
+    st.divider(); st.caption("Modo de pruebas V8.1: datos sintéticos en memoria. No representa consejo médico ni una prescripción individual real.")
 
 def authenticated_client():
     client = new_client()
@@ -2144,6 +2144,72 @@ def core_v8_storage_ready():
         return False
 
 
+
+# ============================================================
+# V8.1 · MOTOR ESTADÍSTICO ADAPTATIVO
+# ============================================================
+def v81_storage_ready():
+    """Comprueba que existen las variables ampliadas y la auditoría estadística V8.1."""
+    try:
+        (
+            client.table("rc_daily_readiness")
+            .select("id,sleep_hours,sleepiness,energy,mental_fatigue,legs_heaviness,strength_feeling")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        (
+            client.table("rc_workout_logs")
+            .select("id,prescription_adherence")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        (
+            client.table("rc_statistical_predictions")
+            .select("id,prediction_date,decision,confidence")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_v81_predictions(plan_id=None, limit=60):
+    if not v81_storage_ready():
+        return []
+    q = client.table("rc_statistical_predictions").select("*").eq("user_id", USER_ID)
+    if plan_id:
+        q = q.eq("plan_id", int(plan_id))
+    return q.order("prediction_date", desc=True).limit(limit).execute().data or []
+
+
+def persist_v81_prediction(session, readiness_row, prediction):
+    """Audita la predicción al guardar el registro diario; no modifica el plan."""
+    if not v81_storage_ready() or not session or not prediction:
+        return None
+    active = get_active_plan_record()
+    if not active:
+        return None
+    row = {
+        "user_id": USER_ID,
+        "plan_id": int(active["id"]),
+        "plan_session_id": int(session["id"]) if session.get("id") is not None else None,
+        "prediction_date": str(session.get("session_date") or rcp_today().isoformat()),
+        "engine_version": "RCP-STAT-8.1",
+        "input_features": prediction.get("input_features") or {},
+        "outputs": prediction.get("outputs") or {},
+        "decision": prediction.get("decision") or "MANTENER",
+        "confidence": prediction.get("confidence") or "inicial",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return client.table("rc_statistical_predictions").upsert(
+        row,
+        on_conflict="user_id,plan_id,plan_session_id,prediction_date",
+    ).execute()
+
 def get_performance_tests(limit=30):
     if not core_v8_storage_ready():
         return []
@@ -2595,6 +2661,432 @@ def v8_runner_state():
         "guardrails": guardrails,
     }
 
+
+
+# ============================================================
+# V8.1 · Modelos multivariables regularizados
+# ============================================================
+_V81_HISTORY_CACHE = {}
+
+
+def _v81_clip(x, lo, hi):
+    return max(lo, min(hi, float(x)))
+
+
+def _v81_sigmoid(x):
+    x = _v81_clip(x, -30.0, 30.0)
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _v81_dot(a, b):
+    return sum(float(x) * float(y) for x, y in zip(a, b))
+
+
+def _v81_solve(a, b):
+    """Gauss-Jordan con pivoteo; matrices pequeñas del motor estadístico."""
+    n = len(b)
+    m = [list(map(float, a[i])) + [float(b[i])] for i in range(n)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-10:
+            m[pivot][col] += 1e-6
+        if pivot != col:
+            m[col], m[pivot] = m[pivot], m[col]
+        div = m[col][col]
+        if abs(div) < 1e-12:
+            div = 1e-12
+        m[col] = [v / div for v in m[col]]
+        for r in range(n):
+            if r == col:
+                continue
+            f = m[r][col]
+            if abs(f) < 1e-14:
+                continue
+            m[r] = [m[r][c] - f * m[col][c] for c in range(n + 1)]
+    return [m[i][-1] for i in range(n)]
+
+
+def _v81_ridge_prior(X, y, weights, prior, lam=16.0):
+    """Regresión ridge alrededor de un prior RCP, estilo empirical-Bayes simplificado."""
+    p = len(prior)
+    A = [[0.0 for _ in range(p)] for _ in range(p)]
+    b = [0.0 for _ in range(p)]
+    for j in range(p):
+        A[j][j] += float(lam)
+        b[j] += float(lam) * float(prior[j])
+    for x, yy, ww in zip(X, y, weights):
+        w = max(0.01, float(ww))
+        for j in range(p):
+            b[j] += w * float(x[j]) * float(yy)
+            for k in range(p):
+                A[j][k] += w * float(x[j]) * float(x[k])
+    beta = _v81_solve(A, b)
+    preds = [_v81_dot(beta, x) for x in X]
+    if y:
+        sw = sum(max(.01, float(w)) for w in weights)
+        rmse = math.sqrt(sum(max(.01, float(w)) * (float(yy)-pp)**2 for yy, pp, w in zip(y,preds,weights)) / max(sw,1e-9))
+    else:
+        rmse = None
+    return beta, rmse
+
+
+def _v81_logistic_prior(X, y, weights, prior, lam=18.0, iterations=10):
+    """Regresión logística regularizada alrededor de coeficientes prior."""
+    if not X:
+        return list(prior)
+    beta = list(map(float, prior))
+    p_dim = len(prior)
+    for _ in range(iterations):
+        A = [[0.0 for _ in range(p_dim)] for _ in range(p_dim)]
+        b = [0.0 for _ in range(p_dim)]
+        for j in range(p_dim):
+            A[j][j] += float(lam)
+            b[j] += float(lam) * float(prior[j])
+        for x, yy, ww in zip(X, y, weights):
+            eta = _v81_dot(beta, x)
+            pr = _v81_clip(_v81_sigmoid(eta), 0.02, 0.98)
+            var = pr * (1.0-pr)
+            iw = max(.01, float(ww)) * var
+            z = eta + (float(yy)-pr) / max(var, 1e-5)
+            for j in range(p_dim):
+                b[j] += iw * float(x[j]) * z
+                for k in range(p_dim):
+                    A[j][k] += iw * float(x[j]) * float(x[k])
+        new_beta = _v81_solve(A, b)
+        if max(abs(a-bb) for a,bb in zip(new_beta,beta)) < 1e-4:
+            beta = new_beta
+            break
+        beta = new_beta
+    return beta
+
+
+_V81_FEATURE_NAMES = [
+    "intercepto", "sueño_deficiente", "sueño_corto", "somnolencia", "fatiga_física",
+    "baja_energía", "fatiga_mental", "piernas_pesadas", "baja_fuerza", "estrés",
+    "baja_motivación", "dolor", "agujetas", "carga_reciente", "rpe_previo_alto",
+    "sesión_calidad", "tirada_larga", "volumen_sesión", "somnolencia×fatiga",
+    "fatiga×calidad", "piernas×calidad", "carga×calidad", "dolor×larga",
+]
+
+_V81_FEATURE_LABELS = {
+    "sueño_deficiente":"calidad de sueño baja", "sueño_corto":"pocas horas de sueño",
+    "somnolencia":"somnolencia actual", "fatiga_física":"fatiga física", "baja_energía":"energía física baja",
+    "fatiga_mental":"fatiga mental", "piernas_pesadas":"piernas pesadas", "baja_fuerza":"sensación de fuerza baja",
+    "estrés":"estrés", "baja_motivación":"motivación baja", "dolor":"dolor localizado",
+    "agujetas":"dolor muscular/agujetas", "carga_reciente":"carga reciente elevada",
+    "rpe_previo_alto":"esfuerzo reciente por encima de lo previsto", "sesión_calidad":"demanda de sesión de calidad",
+    "tirada_larga":"demanda de tirada larga", "volumen_sesión":"volumen de la sesión",
+    "somnolencia×fatiga":"combinación somnolencia + fatiga", "fatiga×calidad":"fatiga en una sesión de calidad",
+    "piernas×calidad":"piernas pesadas en una sesión de calidad", "carga×calidad":"carga reciente + sesión de calidad",
+    "dolor×larga":"dolor en contexto de tirada larga",
+}
+
+# Priors conservadores. Los datos personales desplazan estos coeficientes gradualmente.
+_V81_RPE_PRIOR = [
+    -0.10, .35, .20, .70, .85, .60, .35, .65, .45, .25, .20, .75, .25, .45, .35,
+    .10, .10, .15, .95, .70, .45, .40, .40,
+]
+_V81_COMPLETE_PRIOR = [
+    2.65, -.30, -.20, -.65, -.85, -.55, -.30, -.55, -.35, -.20, -.15, -1.05, -.25,
+    -.55, -.40, -.25, -.20, -.15, -.85, -.75, -.45, -.45, -.55,
+]
+
+
+def _v81_num(row, key, default):
+    try:
+        value = row.get(key)
+        return float(value) if value is not None else float(default)
+    except Exception:
+        return float(default)
+
+
+def _v81_context_features(readiness_row, session, load_pressure=0.0, prior_rpe_excess=0.0):
+    r = readiness_row or {}
+    sleep_q = _v81_num(r, "sleep_quality", 3)
+    sleep_hours = r.get("sleep_hours")
+    sleep_short = 0.0
+    if sleep_hours is not None:
+        try:
+            sleep_short = _v81_clip((7.0-float(sleep_hours))/3.0, 0.0, 1.4)
+        except Exception:
+            sleep_short = 0.0
+    sleepiness = (_v81_num(r,"sleepiness",2)-1.0)/4.0
+    fatigue = (_v81_num(r,"fatigue",2)-1.0)/4.0
+    low_energy = (5.0-_v81_num(r,"energy",4))/4.0
+    mental = (_v81_num(r,"mental_fatigue",2)-1.0)/4.0
+    legs = (_v81_num(r,"legs_heaviness",2)-1.0)/4.0
+    low_strength = (5.0-_v81_num(r,"strength_feeling",4))/4.0
+    stress = (_v81_num(r,"stress",2)-1.0)/4.0
+    low_mot = (5.0-_v81_num(r,"motivation",4))/4.0
+    pain = _v81_num(r,"pain",0)/10.0
+    soreness = _v81_num(r,"soreness",0)/10.0
+    kind = workout_kind(session or {})
+    quality = 1.0 if kind in {"Series","Tempo","Carrera"} else 0.0
+    long_run = 1.0 if kind == "Larga" else 0.0
+    volume = _v81_clip(float((session or {}).get("planned_km") or 0)/20.0, 0.0, 1.5)
+    vals = [
+        1.0,
+        _v81_clip((5.0-sleep_q)/4.0,0,1), sleep_short, _v81_clip(sleepiness,0,1), _v81_clip(fatigue,0,1),
+        _v81_clip(low_energy,0,1), _v81_clip(mental,0,1), _v81_clip(legs,0,1), _v81_clip(low_strength,0,1),
+        _v81_clip(stress,0,1), _v81_clip(low_mot,0,1), _v81_clip(pain,0,1), _v81_clip(soreness,0,1),
+        _v81_clip(load_pressure,0,1.5), _v81_clip(prior_rpe_excess,0,1.5), quality, long_run, volume,
+    ]
+    vals.extend([
+        vals[3]*vals[4], vals[4]*quality, vals[7]*quality, vals[13]*quality, vals[11]*long_run,
+    ])
+    return vals
+
+
+def _v81_has_extended_context(r):
+    return sum(1 for k in ("sleep_hours","sleepiness","energy","mental_fatigue","legs_heaviness","strength_feeling") if (r or {}).get(k) is not None) >= 4
+
+
+def _v81_history(days=210):
+    key = (int(days), rcp_today().isoformat())
+    if key in _V81_HISTORY_CACHE:
+        return _V81_HISTORY_CACHE[key]
+    if not v81_storage_ready():
+        return {"rows":[], "context_n":0}
+    start = rcp_today()-timedelta(days=int(days))
+    try:
+        logs = client.table("rc_workout_logs").select("*").eq("user_id",USER_ID).gte("session_date",start.isoformat()).order("session_date").execute().data or []
+        ready = client.table("rc_daily_readiness").select("*").eq("user_id",USER_ID).gte("checkin_date",start.isoformat()).order("checkin_date").execute().data or []
+        sessions = client.table("rc_plan_sessions").select("*").eq("user_id",USER_ID).gte("session_date",start.isoformat()).execute().data or []
+    except Exception:
+        return {"rows":[], "context_n":0}
+    ready_by_date = {}
+    for r in ready:
+        ready_by_date.setdefault(str(r.get("checkin_date")), []).append(r)
+    sess_by_id = {int(x["id"]):x for x in sessions if x.get("id") is not None}
+    sess_by_plan_date = {(int(x.get("plan_id") or 0),str(x.get("session_date"))):x for x in sessions}
+    parsed_logs=[]
+    for l in logs:
+        d=parse_date_safe(l.get("session_date"))
+        if not d: continue
+        if str(l.get("status") or "").upper() not in {"COMPLETADO","MODIFICADO","OMITIDO"}: continue
+        parsed_logs.append((d,l))
+    rows=[]
+    for d,l in parsed_logs:
+        sid=int(l.get("plan_session_id") or 0)
+        sess=sess_by_id.get(sid) or sess_by_plan_date.get((int(l.get("plan_id") or 0),str(l.get("session_date")))) or {}
+        candidates=ready_by_date.get(d.isoformat(),[])
+        rr=next((x for x in candidates if int(x.get("plan_id") or 0)==int(l.get("plan_id") or 0)), candidates[0] if candidates else {})
+        # Carga previa 7d relativa a los 28d anteriores, usando solo información anterior a la sesión.
+        prior28=[]
+        prior14_ex=[]
+        for pd,pl in parsed_logs:
+            if not (d-timedelta(days=28) <= pd < d): continue
+            if str(pl.get("status") or "").upper() not in {"COMPLETADO","MODIFICADO"}: continue
+            sec=float(pl.get("actual_duration_sec") or 0); rp=float(pl.get("rpe") or 0)
+            if sec>0 and 1<=rp<=10:
+                prior28.append((pd,(sec/60.0)*rp))
+            if d-timedelta(days=14)<=pd<d and rp:
+                ps=sess_by_id.get(int(pl.get("plan_session_id") or 0),{})
+                lo,hi=expected_rpe_range(ps)
+                prior14_ex.append(max(0.0,rp-hi))
+        load7=sum(v for pd,v in prior28 if pd>=d-timedelta(days=7))
+        avg7=(sum(v for _,v in prior28)/4.0) if prior28 else 0.0
+        if avg7>80:
+            ratio=load7/avg7
+            pressure=_v81_clip((ratio-.80)/.80,0,1.5)
+        else:
+            pressure=_v81_clip(load7/650.0,0,1.0)
+        prev_ex=(sum(prior14_ex)/len(prior14_ex)/2.0) if prior14_ex else 0.0
+        x=_v81_context_features(rr,sess,pressure,prev_ex)
+        status=str(l.get("status") or "").upper()
+        planned=float(sess.get("planned_km") or 0)
+        actual=float(l.get("actual_km") or 0)
+        explicit=str(l.get("prescription_adherence") or "").upper()
+        if explicit=="FULL": completed_as_prescribed=1.0
+        elif explicit in {"PARTIAL","NO"}: completed_as_prescribed=0.0
+        else:
+            ratio_km=actual/planned if planned>0 else 1.0
+            completed_as_prescribed=1.0 if status=="COMPLETADO" and .85<=ratio_km<=1.15 else 0.0
+        try: actual_rpe=float(l.get("rpe")) if l.get("rpe") is not None else None
+        except Exception: actual_rpe=None
+        mid_rpe=sum(expected_rpe_range(sess))/2.0
+        delta_rpe=(actual_rpe-mid_rpe) if actual_rpe is not None else None
+        speed=None
+        try:
+            sec=float(l.get("actual_duration_sec") or 0)
+            if actual>0 and sec>0: speed=3600.0*actual/sec
+        except Exception: pass
+        recency=0.5**(max(0,(rcp_today()-d).days)/60.0)
+        next_candidates=ready_by_date.get((d+timedelta(days=1)).isoformat(),[])
+        nr=next_candidates[0] if next_candidates else None
+        recovery_y=None
+        if nr:
+            f=(_v81_num(nr,"fatigue",2)-1)/4
+            sl=(_v81_num(nr,"sleepiness",2)-1)/4 if nr.get("sleepiness") is not None else (5-_v81_num(nr,"sleep_quality",3))/8
+            en=(5-_v81_num(nr,"energy",4))/4 if nr.get("energy") is not None else 0
+            lg=(_v81_num(nr,"legs_heaviness",2)-1)/4 if nr.get("legs_heaviness") is not None else _v81_num(nr,"soreness",0)/10
+            st=(5-_v81_num(nr,"strength_feeling",4))/4 if nr.get("strength_feeling") is not None else 0
+            recovery_y=_v81_clip((f+sl+en+lg+st)/5.0,0,1)
+        rows.append({
+            "date":d,"log":l,"session":sess,"readiness":rr,"x":x,"weight":max(.08,recency),
+            "delta_rpe":delta_rpe,"completed":completed_as_prescribed,"actual_rpe":actual_rpe,"speed":speed,
+            "surface":str(l.get("training_surface_used") or "").upper(),"recovery_y":recovery_y,
+            "load_pressure":pressure,"prior_rpe_excess":prev_ex,"extended":_v81_has_extended_context(rr),
+        })
+    result={"rows":rows,"context_n":sum(1 for r in rows if r["extended"])}
+    _V81_HISTORY_CACHE[key]=result
+    return result
+
+
+def _v81_model_confidence(n_context, n_total):
+    if n_context >= 25 and n_total >= 30: return "alta"
+    if n_context >= 10 and n_total >= 15: return "moderada"
+    if n_context >= 3: return "provisional"
+    return "inicial"
+
+
+def _v81_recovery_features(row):
+    x=row["x"]
+    log=row.get("log") or {}; sess=row.get("session") or {}
+    sec=float(log.get("actual_duration_sec") or 0)
+    rpe=float(log.get("rpe") or 0)
+    load_norm=_v81_clip(((sec/60.0)*rpe)/700.0,0,1.5) if sec>0 and rpe else 0
+    post_f=_v81_clip((_v81_num(log,"post_fatigue",2)-1)/4,0,1)
+    post_p=_v81_clip(_v81_num(log,"post_pain",0)/10,0,1)
+    quality=1.0 if workout_kind(sess) in {"Series","Tempo","Carrera"} else 0.0
+    long_run=1.0 if workout_kind(sess)=="Larga" else 0.0
+    return [1.0,x[3],x[4],x[5],x[7],load_norm,_v81_clip(rpe/10,0,1),post_f,post_p,quality,long_run,load_norm*quality]
+
+
+def _v81_recovery_prediction(current_x, session, history_rows):
+    prior=[.16,.08,.10,.08,.08,.20,.10,.16,.12,.06,.07,.10]
+    eligible=[r for r in history_rows if r.get("recovery_y") is not None and r.get("actual_rpe") is not None]
+    X=[_v81_recovery_features(r) for r in eligible]
+    y=[float(r["recovery_y"]) for r in eligible]
+    w=[float(r["weight"]) for r in eligible]
+    beta,rmse=_v81_ridge_prior(X,y,w,prior,lam=20.0)
+    kind=workout_kind(session or {})
+    target_mid=sum(expected_rpe_range(session or {}))/2.0
+    planned=float((session or {}).get("planned_km") or 0)
+    # Aproximación de carga prevista sin inventar duración exacta: volumen relativo + RPE.
+    load_norm=_v81_clip((planned/12.0)*(target_mid/5.0),0,1.5)
+    quality=1.0 if kind in {"Series","Tempo","Carrera"} else 0.0
+    long_run=1.0 if kind=="Larga" else 0.0
+    xf=[1.0,current_x[3],current_x[4],current_x[5],current_x[7],load_norm,target_mid/10.0,0.25,0.0,quality,long_run,load_norm*quality]
+    pred=_v81_clip(_v81_dot(beta,xf),0,1)
+    label="bajo" if pred<.34 else ("moderado" if pred<.56 else "alto")
+    return {"score":round(pred*100),"label":label,"n":len(eligible),"rmse":round(rmse,3) if rmse is not None else None}
+
+
+def _v81_contextual_speed(session, readiness_row, current_x, history_rows, surface="CAMINADORA"):
+    rpe_range=_target_rpe_range((session or {}).get("target")) or expected_rpe_range(session or {})
+    target_mid=sum(rpe_range)/2.0
+    eligible=[r for r in history_rows if r.get("speed") and 5<=float(r["speed"])<=22 and r.get("actual_rpe") and r.get("surface")==surface and _session_zone_key(r.get("session")) not in {"interval","threshold","race"}]
+    if eligible:
+        base_samples=[{"rpe":r["actual_rpe"],"speed_kmh":r["speed"],"weight":r["weight"]} for r in eligible]
+        base=_weighted_linear_speed_model(base_samples)
+    else:
+        base=None
+    if base:
+        bi,bs=base
+        residual_y=[float(r["speed"])-(bi+bs*float(r["actual_rpe"])) for r in eligible]
+        # Solo variables de contexto; prior pequeño y negativo para estados desfavorables.
+        idx=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,18]
+        X=[[r["x"][i] for i in idx] for r in eligible]
+        xf=[current_x[i] for i in idx]
+        prior=[0.0,-.08,-.05,-.22,-.30,-.22,-.10,-.24,-.15,-.08,-.05,-.18,-.08,-.15,-.10,-.22]
+        beta,rmse=_v81_ridge_prior(X,residual_y,[r["weight"] for r in eligible],prior,lam=22.0)
+        speed=_v81_clip(bi+bs*target_mid+_v81_dot(beta,xf),5,22)
+        uncertainty=max(.20, min(1.0, (rmse or .55)*1.25))
+        lo=round(max(5,speed-uncertainty)*10)/10; hi=round(min(22,speed+uncertainty)*10)/10
+        return {"lo":lo,"hi":hi,"n":len(eligible),"source":"modelo contextual personal","uncertainty":round(uncertainty,2)}
+    # Fallback al motor dinámico V8, sin fingir aprendizaje estadístico inexistente.
+    guide=treadmill_guidance(session, ACTIVE_GOAL, LATEST_ASSESSMENT) or {}
+    return {"lo":None,"hi":None,"n":0,"source":guide.get("source") or "RPE","display":guide.get("speed")}
+
+
+def v81_statistical_prediction(session, readiness_row):
+    """Predicción multivariable para la sesión actual. Experimental; no es modelo clínico validado."""
+    if not v81_storage_ready() or not session:
+        return None
+    hist=_v81_history(210)
+    rows=hist.get("rows") or []
+    # Contexto de carga a hoy calculado sobre el histórico reciente.
+    today=parse_date_safe((session or {}).get("session_date")) or rcp_today()
+    past=[r for r in rows if r.get("date") and r["date"]<today]
+    load7=sum((float((r.get("log") or {}).get("actual_duration_sec") or 0)/60.0)*float(r.get("actual_rpe") or 0) for r in past if r["date"]>=today-timedelta(days=7) and r.get("actual_rpe"))
+    load28=sum((float((r.get("log") or {}).get("actual_duration_sec") or 0)/60.0)*float(r.get("actual_rpe") or 0) for r in past if r["date"]>=today-timedelta(days=28) and r.get("actual_rpe"))
+    baseline7=load28/4.0 if load28>0 else 0
+    pressure=_v81_clip((load7/baseline7-.8)/.8,0,1.5) if baseline7>80 else _v81_clip(load7/650.0,0,1)
+    prior_ex=[max(0,float(r.get("delta_rpe") or 0)) for r in past if r["date"]>=today-timedelta(days=14) and r.get("delta_rpe") is not None]
+    prev_ex=(sum(prior_ex)/len(prior_ex)/2.0) if prior_ex else 0
+    x=_v81_context_features(readiness_row,session,pressure,prev_ex)
+
+    rpe_rows=[r for r in rows if r.get("delta_rpe") is not None]
+    beta_a,rmse_a=_v81_ridge_prior([r["x"] for r in rpe_rows],[r["delta_rpe"] for r in rpe_rows],[r["weight"] for r in rpe_rows],_V81_RPE_PRIOR,lam=18.0)
+    delta=_v81_clip(_v81_dot(beta_a,x),-1.5,4.0)
+    target_mid=sum(expected_rpe_range(session))/2.0
+    predicted_rpe=_v81_clip(target_mid+delta,1,10)
+    uncertainty=max(.55,min(1.8,(rmse_a or .9)*1.35))
+
+    comp_rows=[r for r in rows if r.get("completed") is not None]
+    beta_b=_v81_logistic_prior([r["x"] for r in comp_rows],[r["completed"] for r in comp_rows],[r["weight"] for r in comp_rows],_V81_COMPLETE_PRIOR,lam=20.0)
+    prob=_v81_clip(_v81_sigmoid(_v81_dot(beta_b,x)),.03,.98)
+    n_comp=len(comp_rows)
+    p_unc=max(.08,min(.25,1.96*math.sqrt(prob*(1-prob)/max(n_comp+6,6))))
+
+    recovery=_v81_recovery_prediction(x,session,rows)
+    speed=_v81_contextual_speed(session,readiness_row,x,rows,"CAMINADORA")
+    context_n=int(hist.get("context_n") or 0)
+    confidence=_v81_model_confidence(context_n,len(rows))
+
+    # Guardrails deterministas siempre tienen prioridad.
+    illness=bool((readiness_row or {}).get("illness")); gait=bool((readiness_row or {}).get("pain_changes_gait")); pain=_v81_num(readiness_row or {},"pain",0)
+    kind=workout_kind(session)
+    if illness or gait or pain>=7:
+        decision="PROTEGER"; summary="Las reglas de seguridad tienen prioridad sobre cualquier predicción estadística."
+    elif kind in {"Series","Tempo","Carrera"} and (prob<.48 or delta>=1.7 or recovery["score"]>=70):
+        decision="SUSTITUIR_POR_SUAVE"; summary="La combinación entre tu estado y una sesión exigente sugiere retirar intensidad hoy."
+    elif kind in {"Series","Tempo","Carrera"} and (prob<.68 or delta>=.85 or recovery["score"]>=56):
+        decision="REDUCIR"; summary="La sesión probablemente costará más de lo previsto; conviene reducir la demanda."
+    elif kind=="Larga" and (prob<.60 or delta>=1.0 or recovery["score"]>=62):
+        decision="REDUCIR_LARGA"; summary="La tirada larga tiene un coste esperado alto para el estado actual; conviene acortarla o moverla."
+    elif kind in {"Rodaje","Recuperación"} and (prob<.42 or delta>=1.8):
+        decision="REDUCIR"; summary="Incluso una sesión fácil parece poco tolerable hoy; reduce volumen y mantén esfuerzo muy bajo."
+    else:
+        decision="MANTENER"; summary="La predicción es compatible con realizar la sesión prevista controlando el esfuerzo."
+
+    contributions=[]
+    for name,val,beta in zip(_V81_FEATURE_NAMES,x,beta_a):
+        if name=="intercepto": continue
+        c=float(val)*float(beta)
+        if abs(c)>=.04:
+            contributions.append((c,_V81_FEATURE_LABELS.get(name,name)))
+    risk=[label for c,label in sorted(contributions,reverse=True) if c>0][:4]
+    favorable=[label for c,label in sorted(contributions) if c<-.04][:3]
+
+    inputs={name:round(float(val),3) for name,val in zip(_V81_FEATURE_NAMES,x)}
+    outputs={
+        "expected_delta_rpe":round(delta,2),"predicted_rpe":round(predicted_rpe,1),"rpe_uncertainty":round(uncertainty,2),
+        "completion_probability":round(prob,3),"completion_uncertainty":round(p_unc,3),
+        "recovery_cost":recovery,"contextual_speed":speed,"data_rows":len(rows),"extended_context_rows":context_n,
+        "risk_factors":risk,"favorable_factors":favorable,
+    }
+    return {"decision":decision,"summary":summary,"confidence":confidence,"input_features":inputs,"outputs":outputs}
+
+
+def v81_decision_label(decision):
+    return {
+        "MANTENER":"Mantener la sesión", "REDUCIR":"Reducir la sesión", "SUSTITUIR_POR_SUAVE":"Sustituir intensidad por trabajo suave",
+        "REDUCIR_LARGA":"Reducir o mover la tirada larga", "PROTEGER":"Proteger la recuperación",
+    }.get(str(decision or ""),str(decision or "—"))
+
+
+def v81_statistical_summary():
+    hist=_v81_history(210) if v81_storage_ready() else {"rows":[],"context_n":0}
+    rows=hist.get("rows") or []
+    return {
+        "training_rows":len(rows), "extended_context_rows":int(hist.get("context_n") or 0),
+        "rpe_rows":sum(1 for r in rows if r.get("delta_rpe") is not None),
+        "completion_rows":sum(1 for r in rows if r.get("completed") is not None),
+        "recovery_pairs":sum(1 for r in rows if r.get("recovery_y") is not None),
+        "confidence":_v81_model_confidence(int(hist.get("context_n") or 0),len(rows)),
+    }
 
 def v8_self_checks():
     checks = []
@@ -6079,6 +6571,10 @@ WEEKLY_REVIEW_BY_WEEK = {int(x.get("week_no") or 0): x for x in WEEKLY_REVIEWS}
 CORE_V8_READY = core_v8_storage_ready()
 PERFORMANCE_TESTS = get_performance_tests(limit=30) if CORE_V8_READY else []
 
+# V8.1 · Cerebro estadístico multivariable. Si falta SQL, V8.0 sigue en modo compatible.
+V81_READY = v81_storage_ready() if ADAPTIVE_READY else False
+V81_PREDICTIONS = get_v81_predictions(ACTIVE_PLAN["id"], limit=60) if V81_READY and ACTIVE_PLAN else []
+
 # ============================================================
 # V6.4.2 · Navigation Grid por iconos / Sidebar
 # ============================================================
@@ -6153,8 +6649,9 @@ def workout_kind(session):
 # ============================================================
 # V7.1 · Motor Adaptativo RCP
 # ============================================================
-def readiness_score_from_inputs(sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait):
-    """Índice heurístico RCP 0–100. No es una escala médica validada."""
+def readiness_score_from_inputs(sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait,
+                                sleep_hours=None, sleepiness=2, energy=4, mental_fatigue=2, legs_heaviness=2, strength_feeling=4):
+    """Índice visual 0–100. V8.1 usa modelos multivariables para decidir; este número ya no es el cerebro del sistema."""
     sleep_quality = int(sleep_quality)
     fatigue = int(fatigue)
     soreness = int(soreness)
@@ -6169,6 +6666,18 @@ def readiness_score_from_inputs(sleep_quality, fatigue, soreness, stress, motiva
     score -= {1: 0, 2: 2, 3: 5, 4: 9, 5: 15}.get(stress, 5)
     score -= {1: 10, 2: 6, 3: 3, 4: 1, 5: 0}.get(motivation, 3)
     score -= 0 if pain == 0 else (8 if pain <= 3 else 25 if pain <= 6 else 40)
+    # V8.1: estas variables enriquecen el resumen visual; las interacciones reales se modelan aparte.
+    score -= {1: 0, 2: 2, 3: 6, 4: 12, 5: 20}.get(int(sleepiness or 2), 2)
+    score -= {1: 18, 2: 10, 3: 5, 4: 1, 5: 0}.get(int(energy or 4), 1)
+    score -= {1: 0, 2: 1, 3: 4, 4: 8, 5: 12}.get(int(mental_fatigue or 2), 1)
+    score -= {1: 0, 2: 1, 3: 5, 4: 10, 5: 16}.get(int(legs_heaviness or 2), 1)
+    score -= {1: 14, 2: 8, 3: 4, 4: 1, 5: 0}.get(int(strength_feeling or 4), 1)
+    if sleep_hours is not None:
+        try:
+            if float(sleep_hours) < 5: score -= 8
+            elif float(sleep_hours) < 6: score -= 4
+        except Exception:
+            pass
     if illness:
         score -= 35
     if pain_changes_gait:
@@ -6178,10 +6687,10 @@ def readiness_score_from_inputs(sleep_quality, fatigue, soreness, stress, motiva
     if illness or pain_changes_gait or pain >= 7:
         status = "RED"
         message = "No se recomienda ejecutar intensidad con este registro diario. Prioriza recuperación y valoración si los síntomas o el dolor lo requieren."
-    elif score < 55 or pain >= 5 or fatigue >= 5:
+    elif score < 55 or pain >= 5 or fatigue >= 5 or int(sleepiness or 2) >= 5 or int(energy or 4) <= 1:
         status = "ORANGE"
         message = "La disponibilidad para entrenar está reducida. Conviene disminuir carga e intensidad."
-    elif score < 75 or sleep_quality <= 2 or fatigue >= 4 or soreness >= 6:
+    elif score < 75 or sleep_quality <= 2 or fatigue >= 4 or soreness >= 6 or int(sleepiness or 2) >= 4 or int(legs_heaviness or 2) >= 4:
         status = "YELLOW"
         message = "Hay señales de recuperación incompleta. Mantén una sesión conservadora y reevalúa sensaciones."
     else:
@@ -6228,6 +6737,9 @@ def readiness_summary_html(readiness_row, session):
     fatigue = int((readiness_row or {}).get("fatigue") or 0)
     soreness = int((readiness_row or {}).get("soreness") or 0)
     pain = int((readiness_row or {}).get("pain") or 0)
+    sleepiness = int((readiness_row or {}).get("sleepiness") or 0)
+    energy = int((readiness_row or {}).get("energy") or 0)
+    legs = int((readiness_row or {}).get("legs_heaviness") or 0)
     message = html.escape(str((readiness_row or {}).get("readiness_message") or ""))
     guidance = html.escape(readiness_session_guidance(readiness_row, session))
     return (
@@ -6240,7 +6752,10 @@ def readiness_summary_html(readiness_row, session):
         f'<span class="rcp-ready-chip">⚡ Fatiga {fatigue}/5</span>'
         f'<span class="rcp-ready-chip">🦵 Agujetas {soreness}/10</span>'
         f'<span class="rcp-ready-chip">📍 Dolor {pain}/10</span>'
-        f'</div><div class="rcp-session-guidance"><b>Impacto en hoy:</b> {guidance}</div></div>'
+        + (f'<span class="rcp-ready-chip">😴 Somnolencia {sleepiness}/5</span>' if sleepiness else '')
+        + (f'<span class="rcp-ready-chip">🔋 Energía {energy}/5</span>' if energy else '')
+        + (f'<span class="rcp-ready-chip">🦿 Piernas {legs}/5</span>' if legs else '')
+        + f'</div><div class="rcp-session-guidance"><b>Impacto en hoy:</b> {guidance}</div></div>'
     )
 
 
@@ -6410,6 +6925,25 @@ def adaptation_snapshot(trigger_day=None):
     if missed_schedule >= 2:
         reasons.append("Se observan omisiones por tiempo/viaje; conviene revisar disponibilidad, no aumentar carga para compensarlas.")
 
+    # V8.1 · El modelo estadístico puede hacer la recomendación MÁS conservadora, nunca saltarse guardrails.
+    stat_prediction = None
+    if globals().get("V81_READY"):
+        stat_session = PLAN_BY_DATE.get(trigger_day.isoformat())
+        stat_ready = READINESS_BY_DATE.get(trigger_day.isoformat())
+        if stat_session and stat_ready:
+            try:
+                stat_prediction = v81_statistical_prediction(stat_session, stat_ready)
+                stat_decision = str((stat_prediction or {}).get("decision") or "")
+                if stat_decision == "PROTEGER":
+                    decision, severity = "PROTECT", "high"
+                    reasons.append("El modelo multivariable V8.1 coincide en que hoy debe priorizarse recuperación.")
+                elif stat_decision in {"REDUCIR","SUSTITUIR_POR_SUAVE","REDUCIR_LARGA"} and decision not in {"PROTECT"}:
+                    if decision in {"COLLECTING","MAINTAIN","RESTORE"}:
+                        decision, severity = "REDUCE", "moderate"
+                    reasons.append("El modelo multivariable V8.1 prevé mayor dificultad o menor tolerancia para la demanda de la sesión actual.")
+            except Exception:
+                stat_prediction = None
+
     return {
         "trigger_date": trigger_day.isoformat(),
         "decision": decision,
@@ -6433,6 +6967,7 @@ def adaptation_snapshot(trigger_day=None):
             "schedule_related_omissions": missed_schedule,
             "adapted_future_sessions": len(adapted_future),
         },
+        "statistical_prediction": stat_prediction,
     }
 
 
@@ -7977,7 +8512,7 @@ def render_goal_hero():
 
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
-st.sidebar.caption(f"V{APP_VERSION}")
+st.sidebar.caption(f"V{APP_VERSION} · motor estadístico adaptativo")
 if st.sidebar.button("🧪 Modo de pruebas", use_container_width=True, key="enter_qa_sandbox_sidebar"):
     st.session_state["rcp_qa_mode"] = True
     st.rerun()
@@ -8872,8 +9407,21 @@ if current_page == "Hoy":
             st.caption("Tarda menos de un minuto. No diagnostica enfermedad; se usa para modular la carga de entrenamiento.")
             with st.form("daily_readiness_form"):
                 c1, c2 = st.columns(2)
-                sleep_quality = c1.slider("Sueño", 1, 5, int(existing_ready.get("sleep_quality") or 4), help="1 = muy malo · 5 = excelente")
-                fatigue = c2.slider("Fatiga", 1, 5, int(existing_ready.get("fatigue") or 2), help="1 = mínima · 5 = muy alta")
+                sleep_quality = c1.slider("Calidad del sueño", 1, 5, int(existing_ready.get("sleep_quality") or 4), help="1 = muy mala · 5 = excelente")
+                fatigue = c2.slider("Fatiga física", 1, 5, int(existing_ready.get("fatigue") or 2), help="1 = mínima · 5 = muy alta")
+                if V81_READY:
+                    s1, s2 = st.columns(2)
+                    sleep_hours = s1.number_input("Horas de sueño", 0.0, 16.0, float(existing_ready.get("sleep_hours") if existing_ready.get("sleep_hours") is not None else 7.0), 0.5)
+                    sleepiness = s2.slider("Somnolencia ahora", 1, 5, int(existing_ready.get("sleepiness") or 2), help="1 = completamente despierto · 5 = cuesta mantenerse activo")
+                    e1, e2 = st.columns(2)
+                    energy = e1.slider("Energía física", 1, 5, int(existing_ready.get("energy") or 4), help="1 = sin energía · 5 = muy alta")
+                    mental_fatigue = e2.slider("Fatiga mental", 1, 5, int(existing_ready.get("mental_fatigue") or 2))
+                    l1, l2 = st.columns(2)
+                    legs_heaviness = l1.slider("Sensación de piernas", 1, 5, int(existing_ready.get("legs_heaviness") or 2), help="1 = frescas · 5 = muy pesadas")
+                    strength_feeling = l2.slider("Sensación de fuerza", 1, 5, int(existing_ready.get("strength_feeling") or 4), help="1 = muy baja · 5 = muy buena")
+                else:
+                    sleep_hours, sleepiness, energy, mental_fatigue, legs_heaviness, strength_feeling = None, 2, 4, 2, 2, 4
+                    st.caption("Ejecuta la migración V8.1 para activar somnolencia, energía, fatiga mental, piernas y fuerza.")
                 c3, c4 = st.columns(2)
                 soreness = c3.slider("Dolor muscular / agujetas", 0, 10, int(existing_ready.get("soreness") or 0))
                 stress = c4.slider("Estrés", 1, 5, int(existing_ready.get("stress") or 2))
@@ -8886,9 +9434,11 @@ if current_page == "Hoy":
                 save_ready = st.form_submit_button("Guardar registro diario", use_container_width=True)
             if save_ready:
                 rs, rst, rmsg = readiness_score_from_inputs(
-                    sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait
+                    sleep_quality, fatigue, soreness, stress, motivation, pain, illness, pain_changes_gait,
+                    sleep_hours=sleep_hours, sleepiness=sleepiness, energy=energy, mental_fatigue=mental_fatigue,
+                    legs_heaviness=legs_heaviness, strength_feeling=strength_feeling,
                 )
-                save_readiness({
+                ready_payload = {
                     "checkin_date": selected_day.isoformat(),
                     "sleep_quality": int(sleep_quality),
                     "fatigue": int(fatigue),
@@ -8902,7 +9452,20 @@ if current_page == "Hoy":
                     "readiness_score": int(rs),
                     "readiness_status": rst,
                     "readiness_message": rmsg,
-                })
+                }
+                if V81_READY:
+                    ready_payload.update({
+                        "sleep_hours": float(sleep_hours) if sleep_hours is not None else None,
+                        "sleepiness": int(sleepiness), "energy": int(energy), "mental_fatigue": int(mental_fatigue),
+                        "legs_heaviness": int(legs_heaviness), "strength_feeling": int(strength_feeling),
+                    })
+                save_readiness(ready_payload)
+                if V81_READY and today_session:
+                    try:
+                        _pred = v81_statistical_prediction(today_session, ready_payload)
+                        persist_v81_prediction(today_session, ready_payload, _pred)
+                    except Exception:
+                        pass
                 st.success(f"Registro diario guardado · {readiness_status_label(rst)} · {rs}/100")
                 st.rerun()
 
@@ -9040,6 +9603,38 @@ if current_page == "Hoy":
                     (st.success if ok else st.error)(msg)
                     if ok:
                         st.rerun()
+
+
+    # V8.1 · Cerebro estadístico de la sesión actual.
+    if V81_READY and selected_day == rcp_today() and today_session and READINESS_BY_DATE.get(selected_day.isoformat()):
+        _stat = v81_statistical_prediction(today_session, READINESS_BY_DATE.get(selected_day.isoformat()))
+        if _stat:
+            _out = _stat.get("outputs") or {}
+            st.markdown("### 📊 Análisis estadístico RCP")
+            with st.container(border=True):
+                st.markdown(f"**{v81_decision_label(_stat.get('decision'))}**")
+                st.write(_stat.get("summary") or "")
+                q1,q2,q3,q4 = st.columns(4)
+                _delta=float(_out.get("expected_delta_rpe") or 0)
+                q1.metric("RPE esperado", f"{float(_out.get('predicted_rpe') or 0):.1f}/10", f"{_delta:+.1f} vs objetivo")
+                _prob=float(_out.get("completion_probability") or 0)*100
+                q2.metric("Completar según plan", f"{_prob:.0f}%")
+                _rec=_out.get("recovery_cost") or {}
+                q3.metric("Coste de recuperación", f"{int(_rec.get('score') or 0)}/100", str(_rec.get("label") or "—").title())
+                q4.metric("Confianza", str(_stat.get("confidence") or "inicial").title())
+                _spd=_out.get("contextual_speed") or {}
+                if _spd.get("lo") is not None:
+                    st.info(f"🏃‍♂️ Referencia contextual de caminadora para el RPE de hoy: **{float(_spd['lo']):.1f}–{float(_spd['hi']):.1f} km/h**. El RPE sigue siendo el control principal.")
+                elif _spd.get("display"):
+                    st.caption(f"Referencia de velocidad disponible: {_spd.get('display')} · fuente: {_spd.get('source')}.")
+                with st.expander("¿Cómo llegó RCP a esta conclusión?", expanded=False):
+                    st.caption("V8.1 usa regresión multivariable regularizada con priors conservadores. Seguridad > modelo estadístico > ajustes del plan.")
+                    st.write(f"Observaciones históricas utilizables: **{int(_out.get('data_rows') or 0)}** · con contexto ampliado V8.1: **{int(_out.get('extended_context_rows') or 0)}**.")
+                    if _out.get("risk_factors"):
+                        st.write("Factores que más elevan la dificultad prevista: " + ", ".join(_out.get("risk_factors") or []))
+                    if _out.get("favorable_factors"):
+                        st.write("Factores favorables: " + ", ".join(_out.get("favorable_factors") or []))
+                    st.caption(f"Incertidumbre aproximada del RPE: ±{float(_out.get('rpe_uncertainty') or 0):.1f}. La probabilidad es una estimación de entrenamiento, no una probabilidad clínica validada.")
 
     # V7.2 · Reorganización del plan de una sesión omitida explícitamente registrada.
     if REPLAN_READY and selected_day == rcp_today():
@@ -9684,7 +10279,7 @@ elif current_page == "Progreso":
                 use_container_width=True,
             )
         else:
-            st.info("Haz registros diarios desde 🏠 Hoy para activar la tendencia de readiness.")
+            st.info("Haz registros diarios desde 🏠 Hoy para activar la tendencia del estado para entrenar.")
 
         if ADJUSTMENTS:
             st.markdown("### Historial de ajustes")
@@ -9735,7 +10330,32 @@ elif current_page == "Progreso":
 
 
 
-    # 9 · V8.0 carga, recuperación, tests y estancamiento
+
+    # 9 · V8.1 · Aprendizaje estadístico personal
+    st.divider()
+    st.markdown("## 🧠 Aprendizaje estadístico personal")
+    if not V81_READY:
+        st.warning("Ejecuta `supabase_v8_1_statistical_engine.sql` para activar el motor multivariable V8.1. El resto de V8 continúa funcionando.")
+    else:
+        _ms = v81_statistical_summary()
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Sesiones analizadas", int(_ms.get("training_rows") or 0))
+        m2.metric("Contexto completo", int(_ms.get("extended_context_rows") or 0))
+        m3.metric("Pares recuperación", int(_ms.get("recovery_pairs") or 0))
+        m4.metric("Confianza", str(_ms.get("confidence") or "inicial").title())
+        st.caption("El modelo usa tus propios entrenamientos para actualizar gradualmente coeficientes multivariables. Al principio predominan priors conservadores RCP; con más datos pesa más tu respuesta individual.")
+        if _ms.get("extended_context_rows",0) < 3:
+            st.info("Fase inicial: todavía hay pocos registros con somnolencia, energía, fatiga mental, piernas y fuerza. Las predicciones son deliberadamente conservadoras.")
+        if V81_PREDICTIONS:
+            with st.expander("Historial de predicciones auditadas", expanded=False):
+                st.dataframe([{
+                    "Fecha":x.get("prediction_date"), "Decisión":v81_decision_label(x.get("decision")),
+                    "Confianza":str(x.get("confidence") or "").title(),
+                    "RPE previsto":((x.get("outputs") or {}).get("predicted_rpe")),
+                    "Prob. completar":f"{100*float((x.get('outputs') or {}).get('completion_probability') or 0):.0f}%",
+                } for x in V81_PREDICTIONS[:20]], use_container_width=True, hide_index=True)
+
+    # 10 · V8.0 carga, recuperación, tests y estancamiento
     st.divider()
     st.markdown("## 🧬 Carga y recuperación a lo largo del tiempo")
     _load = v8_training_load_summary(days=56)
@@ -10108,10 +10728,22 @@ elif current_page == "Registro":
                     difficulty_options,
                     index=difficulty_options.index(current_difficulty) if current_difficulty in difficulty_options else 2,
                 )
+                if V81_READY:
+                    _pa_map = {"FULL":"Sí, completa", "PARTIAL":"Parcialmente", "NO":"No"}
+                    _pa_saved = _pa_map.get(str(existing.get("prescription_adherence") or "").upper(), "Sí, completa")
+                    prescription_adherence_ui = st.selectbox(
+                        "¿Cumpliste la sesión tal como estaba indicada?",
+                        ["Sí, completa", "Parcialmente", "No"],
+                        index=["Sí, completa", "Parcialmente", "No"].index(_pa_saved),
+                        help="Este dato permite que RCP aprenda la probabilidad de completar distintos tipos de sesión según tu estado previo.",
+                    )
+                else:
+                    prescription_adherence_ui = None
             else:
                 post_pain = None
                 post_fatigue = None
                 perceived_difficulty = None
+                prescription_adherence_ui = None
 
             status_options = ["COMPLETADO", "MODIFICADO", "OMITIDO"]
             current_status = str(existing.get("status") or "COMPLETADO").upper()
@@ -10144,7 +10776,7 @@ elif current_page == "Registro":
                 else:
                     km_to_save = float(km)
 
-                save_log({
+                log_payload = {
                     "session_date": selected_day.isoformat(),
                     "plan_session_id": session["id"],
                     "actual_km": km_to_save,
@@ -10163,7 +10795,12 @@ elif current_page == "Registro":
                     "perceived_difficulty": perceived_difficulty if ADAPTIVE_READY and status != "OMITIDO" else None,
                     "missed_reason": (missed_reason if ADAPTIVE_READY and status == "OMITIDO" and missed_reason != "—" else None),
                     "notes": notes.strip(),
-                })
+                }
+                if V81_READY and status != "OMITIDO" and prescription_adherence_ui:
+                    log_payload["prescription_adherence"] = {"Sí, completa":"FULL","Parcialmente":"PARTIAL","No":"NO"}.get(prescription_adherence_ui)
+                elif V81_READY and status == "OMITIDO":
+                    log_payload["prescription_adherence"] = "NO"
+                save_log(log_payload)
                 if status == "OMITIDO" and REPLAN_READY:
                     if selected_day > rcp_today():
                         st.session_state["rcp_saved_notice"] = (
