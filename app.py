@@ -1,6 +1,7 @@
 
 import streamlit as st
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import math
 import re
 import html
@@ -362,7 +363,49 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.2.0"
+APP_VERSION = "7.2.2"
+
+
+# ============================================================
+# V7.2.2 · FECHA LOCAL DEL USUARIO (NO FECHA DEL SERVIDOR)
+# ============================================================
+def rcp_timezone():
+    """Zona horaria del navegador; fallback seguro a offset y finalmente UTC."""
+    try:
+        tz_name = getattr(st.context, "timezone", None)
+        if tz_name:
+            try:
+                return ZoneInfo(str(tz_name)), str(tz_name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        offset = getattr(st.context, "timezone_offset", None)
+        if offset is not None:
+            tz_obj = timezone(-timedelta(minutes=int(offset)))
+            signed = -int(offset)
+            sign = "+" if signed >= 0 else "-"
+            mins = abs(signed)
+            return tz_obj, f"UTC{sign}{mins // 60:02d}:{mins % 60:02d}"
+    except Exception:
+        pass
+    return timezone.utc, "UTC"
+
+
+def rcp_now():
+    tz_obj, _ = rcp_timezone()
+    return datetime.now(timezone.utc).astimezone(tz_obj)
+
+
+def rcp_today():
+    return rcp_now().date()
+
+
+def rcp_timezone_name():
+    _, name = rcp_timezone()
+    return name
+
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -1408,7 +1451,7 @@ def calendar_goal_readiness(answers, safety_status):
     except Exception:
         return "FECHA INVÁLIDA", ["No fue posible interpretar la fecha objetivo."]
 
-    days_left = (race_day - date.today()).days
+    days_left = (race_day - rcp_today()).days
     weeks_left = max(0.0, days_left / 7)
     if days_left <= 0:
         return "INSUFICIENTE", ["La fecha objetivo ya ocurrió o corresponde al día actual."]
@@ -1474,7 +1517,7 @@ def performance_summary(answers):
     age_days = None
     if mark_date_text:
         try:
-            age_days = max(0, (date.today() - date.fromisoformat(str(mark_date_text))).days)
+            age_days = max(0, (rcp_today() - date.fromisoformat(str(mark_date_text))).days)
         except Exception:
             age_days = None
 
@@ -1571,7 +1614,7 @@ def build_runner_profile(answers, safety_status, safety_message, score, level, c
     weeks_to_goal = None
     if goal_date:
         try:
-            weeks_to_goal = round(max(0, (date.fromisoformat(str(goal_date)) - date.today()).days) / 7, 1)
+            weeks_to_goal = round(max(0, (date.fromisoformat(str(goal_date)) - rcp_today()).days) / 7, 1)
         except Exception:
             pass
 
@@ -1757,12 +1800,12 @@ def generate_plan(profile):
     race_distance = GOAL_KM.get(goal)
     target_pace = pace_from_target(target_seconds, race_distance)
 
-    start = next_monday(date.today())
+    start = next_monday(rcp_today())
     total_weeks = week_count(start, race_date, has_race)
 
     # Si la carrera está muy cerca, empezar mañana evita crear sesiones en el pasado.
     if has_race and race_date and (race_date - start).days < 35:
-        start = date.today() + timedelta(days=1)
+        start = rcp_today() + timedelta(days=1)
         total_weeks = max(4, math.ceil(((race_date - start).days + 1) / 7))
 
     run_days = RUN_DAYS[days]
@@ -2536,7 +2579,7 @@ def can_generate_v7_plan(goal_row, assessment):
 
 
 def build_v7_plan(goal_row, assessment, start_date_value=None):
-    """Genera filas de rc_plan_sessions + metadata de plan. Función pura salvo USER_ID/date.today()."""
+    """Genera filas de rc_plan_sessions + metadata de plan. Función pura salvo USER_ID/rcp_today()."""
     can_generate, reason = can_generate_v7_plan(goal_row, assessment)
     if not can_generate:
         return [], {}, reason
@@ -2554,7 +2597,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     ):
         progression_mode = "CONSERVADORA"
     race_date = date.fromisoformat(str(goal_row["race_date"])) if goal_row.get("race_date") else None
-    start_date_value = start_date_value or (date.today() + timedelta(days=1))
+    start_date_value = start_date_value or (rcp_today() + timedelta(days=1))
 
     selected_days, long_day = _choose_running_days(answers, level)
     if len(selected_days) < 2:
@@ -2731,7 +2774,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         return [], {}, "El motor V7 no produjo sesiones en el intervalo disponible."
 
     metadata = {
-        "engine": "RCP-V7.1",
+        "engine": "RCP-V7.2.2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -2767,7 +2810,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V7.1",
+        "engine_version": "RCP-V7.2.2",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -2853,7 +2896,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V7.1",
+        "engine_version": "RCP-V7.2.2",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -3286,7 +3329,7 @@ def assessment_form(existing_assessment=None, onboarding=False):
             help="Formato MM:SS o HH:MM:SS.",
         )
 
-        default_mark_date = date.today() - timedelta(days=30)
+        default_mark_date = rcp_today() - timedelta(days=30)
         if existing_answers.get("recent_mark_date"):
             try:
                 default_mark_date = date.fromisoformat(str(existing_answers["recent_mark_date"]))
@@ -3296,8 +3339,8 @@ def assessment_form(existing_assessment=None, onboarding=False):
         recent_mark_date = pm4.date_input(
             "Fecha de la marca",
             value=default_mark_date,
-            min_value=date.today() - timedelta(days=730),
-            max_value=date.today(),
+            min_value=rcp_today() - timedelta(days=730),
+            max_value=rcp_today(),
         )
         recent_mark_context = pm5.selectbox(
             "Tipo de registro",
@@ -3383,7 +3426,7 @@ def assessment_form(existing_assessment=None, onboarding=False):
             "Tengo una fecha de carrera/objetivo",
             value=bool(existing_answers.get("has_goal_race")),
         )
-        default_goal_date = date.today() + timedelta(weeks=12)
+        default_goal_date = rcp_today() + timedelta(weeks=12)
         if existing_answers.get("goal_race_date"):
             try:
                 default_goal_date = date.fromisoformat(str(existing_answers["goal_race_date"]))
@@ -3392,8 +3435,8 @@ def assessment_form(existing_assessment=None, onboarding=False):
         goal_race_date = st.date_input(
             "Fecha objetivo (se ignora si no marcaste la casilla anterior)",
             value=default_goal_date,
-            min_value=date.today() + timedelta(days=1),
-            max_value=date.today() + timedelta(days=730),
+            min_value=rcp_today() + timedelta(days=1),
+            max_value=rcp_today() + timedelta(days=730),
         )
         goal_target_time = st.text_input(
             "Marca objetivo (opcional)",
@@ -3619,13 +3662,13 @@ def profile_form(existing=None, assessed_level=None):
             default_race = (
                 date.fromisoformat(existing["race_date"])
                 if existing.get("race_date")
-                else date.today() + timedelta(weeks=12)
+                else rcp_today() + timedelta(weeks=12)
             )
             race_date = r1.date_input(
                 "Fecha de carrera",
                 value=default_race,
-                min_value=date.today() + timedelta(days=14),
-                max_value=date.today() + timedelta(days=365),
+                min_value=rcp_today() + timedelta(days=14),
+                max_value=rcp_today() + timedelta(days=365),
             )
             existing_target = existing.get("target_time_sec")
             target_time = r2.text_input(
@@ -3806,18 +3849,18 @@ def official_goal_setup(profile, assessment):
         styles = ["Terminar", "Terminar cómodo", "Mejorar mi marca", "Buscar una marca concreta"]
         goal_style = g2.selectbox("Finalidad", styles)
         has_date = st.checkbox("Tengo una fecha objetivo", value=bool((assessment.get("answers") or {}).get("has_goal_race")))
-        default_date = date.today() + timedelta(weeks=12)
+        default_date = rcp_today() + timedelta(weeks=12)
         old_date = (assessment.get("answers") or {}).get("goal_race_date")
         if old_date:
             try:
-                default_date = max(date.today() + timedelta(days=1), date.fromisoformat(str(old_date)))
+                default_date = max(rcp_today() + timedelta(days=1), date.fromisoformat(str(old_date)))
             except Exception:
                 pass
         race_date_value = st.date_input(
             "Fecha objetivo",
             value=default_date,
-            min_value=date.today() + timedelta(days=1),
-            max_value=date.today() + timedelta(days=730),
+            min_value=rcp_today() + timedelta(days=1),
+            max_value=rcp_today() + timedelta(days=730),
         )
         target_text = st.text_input(
             "Marca objetivo (opcional)",
@@ -3906,7 +3949,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                 "objetivo, calendario y rendimiento reciente. El plan actual no se borra: queda ARCHIVADO como historial."
             )
             preview_rows, preview_meta, preview_reason = build_v7_plan(
-                active_goal, assessment, start_date_value=date.today() + timedelta(days=1)
+                active_goal, assessment, start_date_value=rcp_today() + timedelta(days=1)
             )
             if preview_reason:
                 st.warning(f"Todavía no puedo generar el plan V7: {preview_reason}")
@@ -3949,7 +3992,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     key="upgrade_plan_v7_button",
                 ):
                     new_plan, err = replace_active_plan_with_v7(
-                        active_goal, profile, assessment, start_date_value=date.today() + timedelta(days=1)
+                        active_goal, profile, assessment, start_date_value=rcp_today() + timedelta(days=1)
                     )
                     if new_plan:
                         st.success("Plan V7 creado. Tu plan anterior y sus registros permanecen en el historial.")
@@ -3966,17 +4009,17 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                 index=_option_index(styles, active_goal.get("goal_style"), 0),
             )
             has_date = st.checkbox("Tiene fecha", value=bool(active_goal.get("race_date")))
-            default_date = date.today() + timedelta(weeks=12)
+            default_date = rcp_today() + timedelta(weeks=12)
             if active_goal.get("race_date"):
                 try:
-                    default_date = max(date.today() + timedelta(days=1), date.fromisoformat(str(active_goal["race_date"])))
+                    default_date = max(rcp_today() + timedelta(days=1), date.fromisoformat(str(active_goal["race_date"])))
                 except Exception:
                     pass
             race_date_value = st.date_input(
                 "Fecha",
                 value=default_date,
-                min_value=date.today() + timedelta(days=1),
-                max_value=date.today() + timedelta(days=730),
+                min_value=rcp_today() + timedelta(days=1),
+                max_value=rcp_today() + timedelta(days=730),
             )
             target_text = st.text_input(
                 "Marca objetivo",
@@ -4021,9 +4064,9 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
             new_has_date = st.checkbox("Tiene fecha", value=True, key="new_goal_has_date")
             new_date = st.date_input(
                 "Fecha",
-                value=date.today() + timedelta(weeks=16),
-                min_value=date.today() + timedelta(days=1),
-                max_value=date.today() + timedelta(days=1095),
+                value=rcp_today() + timedelta(weeks=16),
+                min_value=rcp_today() + timedelta(days=1),
+                max_value=rcp_today() + timedelta(days=1095),
                 key="new_goal_date",
             )
             new_target = st.text_input("Marca objetivo (opcional)", key="new_goal_target")
@@ -4421,7 +4464,7 @@ def _session_baseline(session):
 
 def adaptation_snapshot(trigger_day=None):
     """Resume 14 días recientes y propone una acción conservadora sobre el plan futuro."""
-    trigger_day = trigger_day or date.today()
+    trigger_day = trigger_day or rcp_today()
     start14 = trigger_day - timedelta(days=13)
     start7 = trigger_day - timedelta(days=6)
 
@@ -4649,7 +4692,7 @@ def _adapt_session_fields(session, decision, severity, quality_index=0):
 def apply_adaptation(recommendation, trigger_day=None):
     if not ADAPTIVE_READY or not ACTIVE_PLAN:
         return False, "El módulo adaptativo V7.1 no está disponible."
-    trigger_day = trigger_day or date.today()
+    trigger_day = trigger_day or rcp_today()
     decision = str(recommendation.get("decision") or "")
     severity = str(recommendation.get("severity") or "")
     if decision not in ("PROTECT", "REDUCE", "RESTORE"):
@@ -4768,9 +4811,9 @@ def status_label_for_date(day_value):
             return "🟡 Modificado"
         if status == "OMITIDO":
             return "⏭️ Omitido"
-    if day_value < date.today():
+    if day_value < rcp_today():
         return "⚠️ Pendiente"
-    if day_value == date.today():
+    if day_value == rcp_today():
         return "⏱️ Hoy"
     return "○ Pendiente"
 
@@ -4809,7 +4852,7 @@ def _available_weekday_indexes():
 def _plan_end_date():
     return parse_date_safe((ACTIVE_PLAN or {}).get("end_date")) or max(
         [d for p in PLAN if (d := parse_date_safe(p.get("session_date")))],
-        default=date.today(),
+        default=rcp_today(),
     )
 
 
@@ -4873,32 +4916,57 @@ def _handled_replan_trigger(log_row, session_row):
     return False
 
 
-def unresolved_missed_event(trigger_day=None, lookback_days=14):
-    """Última omisión explícitamente registrada que todavía no fue procesada por V7.2."""
-    trigger_day = trigger_day or date.today()
+def unresolved_missed_event(trigger_day=None, lookback_days=14, future_days=7):
+    """
+    Devuelve una omisión/restricción pendiente de procesar por V7.2.2.
+
+    Además de omisiones ya ocurridas, acepta ausencias futuras explícitamente
+    registradas dentro de los próximos `future_days`. Esto permite replanificar
+    una guardia, viaje u otra indisponibilidad conocida sin esperar a que llegue
+    la fecha. Las omisiones vencidas tienen prioridad; si solo hay futuras, se
+    procesa primero la más próxima.
+    """
+    trigger_day = trigger_day or rcp_today()
     start = trigger_day - timedelta(days=max(1, int(lookback_days)))
-    candidates = []
+    end = trigger_day + timedelta(days=max(0, int(future_days)))
+    past_or_today = []
+    future = []
     for log in CURRENT_LOGS:
         if str(log.get("status") or "").upper() != "OMITIDO":
             continue
         d = parse_date_safe(log.get("session_date"))
-        if not d or not (start <= d <= trigger_day):
+        if not d or not (start <= d <= end):
             continue
         session = PLAN_BY_DATE.get(str(log.get("session_date")))
         if not session or session_is_optional(session):
             continue
         if _handled_replan_trigger(log, session):
             continue
-        candidates.append((d, log, session))
-    if not candidates:
+        item = (d, log, session)
+        if d <= trigger_day:
+            past_or_today.append(item)
+        else:
+            future.append(item)
+
+    if past_or_today:
+        past_or_today.sort(key=lambda x: x[0], reverse=True)
+        d, log, session = past_or_today[0]
+    elif future:
+        future.sort(key=lambda x: x[0])
+        d, log, session = future[0]
+    else:
         return None
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    d, log, session = candidates[0]
-    return {"date": d, "log": log, "session": session}
+
+    return {
+        "date": d,
+        "log": log,
+        "session": session,
+        "planned_ahead": d > trigger_day,
+    }
 
 
 def _days_since_last_completed(before_or_on=None):
-    ref = before_or_on or date.today()
+    ref = before_or_on or rcp_today()
     dates = []
     for log in CURRENT_LOGS:
         if str(log.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
@@ -4961,7 +5029,7 @@ def replan_snapshot(trigger_day=None):
     """Clasifica una sesión omitida y propone una replanificación conservadora y auditable."""
     if not REPLAN_READY or not ACTIVE_PLAN:
         return None
-    trigger_day = trigger_day or date.today()
+    trigger_day = trigger_day or rcp_today()
     event = unresolved_missed_event(trigger_day)
     if not event:
         return None
@@ -4969,6 +5037,7 @@ def replan_snapshot(trigger_day=None):
     missed_day = event["date"]
     log = event["log"]
     session = event["session"]
+    planned_ahead = bool(event.get("planned_ahead"))
     kind = workout_kind(session)
     reason = str(log.get("missed_reason") or "No informado")
     reason_group = _replan_reason_group(reason)
@@ -4980,8 +5049,12 @@ def replan_snapshot(trigger_day=None):
     today_readiness_status = str(today_readiness.get("readiness_status") or "").upper()
 
     decision = "SKIP"
-    summary = "No recuperar esta sesión; continuar con el plan."
-    explanation = "Recuperar una sesión aislada puede concentrar carga sin aportar una adaptación útil."
+    if planned_ahead:
+        summary = "Ausencia futura registrada; evaluar el plan antes de que llegue la fecha."
+        explanation = "V7.2.2 puede anticipar una indisponibilidad conocida y reorganizar sin añadir carga extra."
+    else:
+        summary = "No recuperar esta sesión; continuar con el plan."
+        explanation = "Recuperar una sesión aislada puede concentrar carga sin aportar una adaptación útil."
     target = None
     scope_days = 0
 
@@ -5058,6 +5131,7 @@ def replan_snapshot(trigger_day=None):
             "missed_kind": kind,
             "missed_reason": reason,
             "reason_group": reason_group,
+            "planned_ahead": planned_ahead,
             "recent_omitted_7d": recent_omitted,
             "days_since_last_completed": gap_days,
             "days_to_race": days_to_race,
@@ -5125,10 +5199,10 @@ def apply_replan(recommendation, trigger_day=None):
     event = recommendation.get("event") or {}
     log = event.get("log") or {}
     missed = event.get("session") or {}
-    missed_day = event.get("date") or trigger_day or date.today()
+    missed_day = event.get("date") or trigger_day or rcp_today()
     decision = str(recommendation.get("decision") or "SKIP")
     scope_days = int(recommendation.get("scope_days") or 0)
-    scope_start = max(date.today(), missed_day + timedelta(days=1)) if scope_days else None
+    scope_start = max(rcp_today(), missed_day + timedelta(days=1)) if scope_days else None
     scope_end = (scope_start + timedelta(days=scope_days - 1)) if scope_start and scope_days else None
 
     record = create_replan_record({
@@ -5306,6 +5380,96 @@ def revert_last_replan():
         return False, f"No fue posible revertir la replanificación: {exc}"
 
 
+def revert_replan_record(record):
+    """Revierte una replanificación concreta si ninguna sesión afectada fue ya registrada."""
+    if not record:
+        return True, "No había replanificación asociada."
+    status = str(record.get("status") or "").upper()
+    if status in ("REVERTED", "FAILED"):
+        return True, "La replanificación asociada ya estaba cerrada."
+    changes = record.get("changes") or []
+    if not isinstance(changes, list):
+        return False, "La auditoría de la replanificación asociada no es válida."
+    current_logs = get_logs(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
+    by_date = {str(x.get("session_date")): x for x in current_logs}
+    for ch in changes:
+        sid = int(ch.get("session_id") or 0)
+        current = get_plan_session_by_id(sid)
+        if not current and ch.get("op") == "INSERT":
+            continue
+        current_date = parse_date_safe((current or {}).get("session_date") or (ch.get("after") or {}).get("session_date"))
+        if current_date:
+            log = by_date.get(current_date.isoformat())
+            if log and str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
+                return False, "No puedo cancelar esta ausencia porque una sesión afectada por la replanificación ya tiene un registro."
+    try:
+        for ch in reversed(changes):
+            if ch.get("op") == "UPDATE":
+                update_plan_session_fields(ch["session_id"], **(ch.get("before") or {}))
+            elif ch.get("op") == "INSERT":
+                delete_plan_session_by_id(ch["session_id"])
+        update_replan_record(record["id"], status="REVERTED", reverted_at=datetime.now(timezone.utc).isoformat())
+        return True, "Replanificación asociada revertida."
+    except Exception as exc:
+        return False, f"No fue posible revertir la replanificación asociada: {exc}"
+
+
+def cancel_planned_absence(log_row, session_row):
+    """Cancela una ausencia futura y deshace su replanificación si ya fue aplicada."""
+    if not log_row or str(log_row.get("status") or "").upper() != "OMITIDO":
+        return False, "No existe una ausencia planificada para cancelar."
+    session_day = parse_date_safe(log_row.get("session_date"))
+    if not session_day or session_day <= rcp_today():
+        return False, "Esta acción solo se usa para ausencias futuras planificadas."
+    log_id = int(log_row.get("id") or 0)
+    session_id = int((session_row or {}).get("id") or 0)
+    related = []
+    for r in REPLANS:
+        if str(r.get("status") or "").upper() not in ("APPLIED", "PENDING"):
+            continue
+        if log_id and int(r.get("trigger_log_id") or 0) == log_id:
+            related.append(r)
+        elif session_id and int(r.get("trigger_session_id") or 0) == session_id and str(r.get("trigger_date")) == session_day.isoformat():
+            related.append(r)
+    for record in related:
+        ok, msg = revert_replan_record(record)
+        if not ok:
+            return False, msg
+    try:
+        delete_log_by_id(log_id) if log_id else delete_log(session_day.isoformat())
+        return True, f"Ausencia planificada del {session_day.strftime('%d/%m')} cancelada; la sesión vuelve a estar pendiente."
+    except Exception as exc:
+        return False, f"No fue posible cancelar la ausencia planificada: {exc}"
+
+
+def expected_next_training_date(from_day=None):
+    from_day = from_day or rcp_today()
+    meta = (ACTIVE_PLAN or {}).get("metadata") or {}
+    names = meta.get("selected_days") or []
+    weekdays = {DAY_INDEX[n] for n in names if n in DAY_INDEX}
+    if not weekdays:
+        return None
+    for offset in range(1, 8):
+        d = from_day + timedelta(days=offset)
+        if d.weekday() in weekdays:
+            return d
+    return None
+
+
+def timezone_plan_gap():
+    """Detecta el patrón del bug UTC: el plan empieza después del próximo día elegible local."""
+    if not ACTIVE_PLAN or not str(ACTIVE_PLAN.get("engine_version") or "").startswith("RCP-V7"):
+        return None
+    expected = expected_next_training_date(rcp_today())
+    if not expected:
+        return None
+    future_dates = sorted(d for p in PLAN if (d := parse_date_safe(p.get("session_date"))) and d > rcp_today())
+    first = future_dates[0] if future_dates else None
+    if first and expected < first and expected.isoformat() not in PLAN_BY_DATE:
+        return {"expected": expected, "first": first}
+    return None
+
+
 def replan_decision_label(decision):
     return {
         "SKIP": "Continuar sin recuperar",
@@ -5347,7 +5511,7 @@ def week_snapshot(day_value):
 
     due = [
         p for p in base_sessions
-        if (d := parse_date_safe(p.get("session_date"))) and d <= date.today()
+        if (d := parse_date_safe(p.get("session_date"))) and d <= rcp_today()
     ]
     done = [
         p for p in due
@@ -5392,7 +5556,7 @@ def all_weekly_stats():
         item["start"] = min(item["start"], d - timedelta(days=d.weekday()))
         if not session_is_optional(p):
             item["plan"] += float(p.get("planned_km") or 0)
-            if d <= date.today():
+            if d <= rcp_today():
                 item["due"] += 1
                 status = str(LOG_BY_DATE.get(d.isoformat(), {}).get("status") or "").upper()
                 if status in ("COMPLETADO", "MODIFICADO"):
@@ -5433,7 +5597,7 @@ def render_goal_hero():
     target_sec = ACTIVE_GOAL.get("target_time_sec")
     target_label = fmt_time(target_sec) if target_sec else "Sin marca objetivo"
     if race_day:
-        days = (race_day - date.today()).days
+        days = (race_day - rcp_today()).days
         race_label = race_day.strftime("%d/%m/%Y")
         countdown = f"{days} días" if days >= 0 else "Finalizado"
     else:
@@ -5444,11 +5608,11 @@ def render_goal_hero():
     if PLAN:
         past = [
             p for p in PLAN
-            if (d := parse_date_safe(p.get("session_date"))) and d <= date.today()
+            if (d := parse_date_safe(p.get("session_date"))) and d <= rcp_today()
         ]
         future = [
             p for p in PLAN
-            if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+            if (d := parse_date_safe(p.get("session_date"))) and d >= rcp_today()
         ]
         ref = past[-1] if past else (future[0] if future else PLAN[-1])
         active_week = str(ref.get("week_no") or "—")
@@ -5478,12 +5642,13 @@ st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
+st.sidebar.caption(f"🕒 {rcp_timezone_name()} · hoy {rcp_today().strftime('%d/%m/%Y')}")
 st.sidebar.markdown(f"🎯 **{ACTIVE_GOAL.get('goal_type') or '—'}**")
 if ACTIVE_GOAL.get("race_date"):
     st.sidebar.caption(f"Fecha objetivo · {ACTIVE_GOAL.get('race_date')}")
 
 if ADAPTIVE_READY:
-    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.2")
+    st.sidebar.markdown("🧠 **Motor adaptativo:** V7.2.2")
 else:
     st.sidebar.warning("V7.1 pendiente de migración SQL")
 
@@ -5501,7 +5666,7 @@ if LATEST_ASSESSMENT:
 if "rcp_pending_day" in st.session_state:
     st.session_state["selected_day_picker"] = st.session_state.pop("rcp_pending_day")
 elif "selected_day_picker" not in st.session_state:
-    st.session_state["selected_day_picker"] = date.today()
+    st.session_state["selected_day_picker"] = rcp_today()
 
 selected_day = st.sidebar.date_input(
     "Explorar fecha",
@@ -5509,7 +5674,7 @@ selected_day = st.sidebar.date_input(
 )
 
 if st.sidebar.button("↩️ Volver a Hoy", use_container_width=True):
-    set_page("Hoy", date.today())
+    set_page("Hoy", rcp_today())
     st.rerun()
 
 with st.sidebar.expander("📲 Añadir al celular"):
@@ -5542,7 +5707,7 @@ completed = [
 ]
 actual_km_total = sum(float(x.get("actual_km") or 0) for x in completed)
 
-dashboard_day = date.today()
+dashboard_day = rcp_today()
 due_sessions = [
     p for p in PLAN
     if (d := parse_date_safe(p.get("session_date")))
@@ -5567,22 +5732,55 @@ current_page = st.session_state.get("rcp_page", "Hoy")
 icon, subtitle = PAGE_META[current_page]
 
 
+def session_display_name(session):
+    """Mantiene el nombre sincronizado con planned_km tras adaptaciones/replanificaciones."""
+    name = str((session or {}).get("workout_name") or "Entrenamiento")
+    km = float((session or {}).get("planned_km") or 0)
+    if re.search(r"\s+\d+(?:[\.,]\d+)?\s*km\s*$", name, flags=re.IGNORECASE):
+        base = re.sub(r"\s+\d+(?:[\.,]\d+)?\s*km\s*$", "", name, flags=re.IGNORECASE).rstrip()
+        return f"{base} {km:g} km" if km > 0 else base
+    return name
+
+
 # ============================================================
 # 🏠 HOY · Home real
 # ============================================================
 if current_page == "Hoy":
-    if selected_day == date.today():
+    if selected_day == rcp_today():
         st.subheader("🏠 Hoy")
     else:
         st.subheader(f"📍 {DAY_NAMES[selected_day.weekday()]} · {selected_day.strftime('%d/%m/%Y')}")
         st.caption("Estás explorando otra fecha. Usa “Volver a Hoy” para regresar al inicio.")
+
+    _saved_notice = st.session_state.pop("rcp_saved_notice", None)
+    if _saved_notice:
+        st.success(_saved_notice)
+
+    _tz_gap = timezone_plan_gap() if selected_day == rcp_today() else None
+    if _tz_gap:
+        st.warning(
+            f"Detecté un desfase horario: según tu navegador hoy es {rcp_today().strftime('%d/%m/%Y')} y "
+            f"tu próximo día elegible es {_tz_gap['expected'].strftime('%d/%m')}, pero el plan activo comienza en "
+            f"{_tz_gap['first'].strftime('%d/%m')}."
+        )
+        if st.button(f"🛠️ Reparar plan desde {_tz_gap['expected'].strftime('%d/%m')}", type="primary", use_container_width=True, key="repair_timezone_plan"):
+            completed_active = [l for l in CURRENT_LOGS if str(l.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO")]
+            if completed_active:
+                st.error("El plan activo ya tiene entrenamientos realizados; no lo regenero automáticamente para no reescribir historia.")
+            else:
+                new_plan, err = replace_active_plan_with_v7(ACTIVE_GOAL, profile, LATEST_ASSESSMENT, start_date_value=_tz_gap["expected"])
+                if new_plan:
+                    st.session_state["rcp_saved_notice"] = f"Plan reparado con tu fecha local ({rcp_timezone_name()}); vuelve a iniciar el {_tz_gap['expected'].strftime('%d/%m')}."
+                    st.rerun()
+                else:
+                    st.error(err or "No fue posible reparar el inicio del plan.")
 
     today_session = PLAN_BY_DATE.get(selected_day.isoformat())
     today_log = LOG_BY_DATE.get(selected_day.isoformat())
 
     # V7.1.1 · Readiness compacto. El formulario permanece cerrado por defecto.
     coach = None
-    if ADAPTIVE_READY and selected_day == date.today():
+    if ADAPTIVE_READY and selected_day == rcp_today():
         existing_ready = READINESS_BY_DATE.get(selected_day.isoformat(), {})
         st.markdown("### 🧠 Estado de hoy")
         if existing_ready:
@@ -5640,7 +5838,7 @@ if current_page == "Hoy":
                 st.rerun()
 
         # Se calcula aquí, pero el Coach se presenta DESPUÉS de la sesión del día.
-        coach = adaptation_snapshot(date.today())
+        coach = adaptation_snapshot(rcp_today())
 
     elif not ADAPTIVE_READY:
         st.warning("Motor adaptativo V7.1 pendiente: ejecuta supabase_v7_1_adaptive.sql para activar check-in y ajustes dinámicos.")
@@ -5722,7 +5920,7 @@ if current_page == "Hoy":
                 st.rerun()
 
     # V7.1.1 · Coach después de la sesión: Home prioriza readiness → entrenamiento → adaptación.
-    if ADAPTIVE_READY and selected_day == date.today() and coach is not None:
+    if ADAPTIVE_READY and selected_day == rcp_today() and coach is not None:
         decision = coach.get("decision")
         reasons = coach.get("reasons") or []
         metrics = coach.get("metrics") or {}
@@ -5750,7 +5948,7 @@ if current_page == "Hoy":
         latest_applied = next((a for a in ADJUSTMENTS if str(a.get("status") or "").upper() == "APPLIED"), None)
         already_today = bool(
             latest_applied
-            and str(latest_applied.get("trigger_date")) == date.today().isoformat()
+            and str(latest_applied.get("trigger_date")) == rcp_today().isoformat()
             and str(latest_applied.get("decision") or "") == str(decision or "")
         )
         if decision in ("PROTECT", "REDUCE", "RESTORE"):
@@ -5758,23 +5956,25 @@ if current_page == "Hoy":
                 st.caption("Esta recomendación ya fue aplicada hoy. Los cambios quedan registrados en la auditoría V7.1.")
             else:
                 if st.button("🧠 Aplicar adaptación a los próximos 7 días", type="primary", use_container_width=True):
-                    ok, msg = apply_adaptation(coach, date.today())
+                    ok, msg = apply_adaptation(coach, rcp_today())
                     (st.success if ok else st.error)(msg)
                     if ok:
                         st.rerun()
 
     # V7.2 · Replanificación de una sesión omitida explícitamente registrada.
-    if REPLAN_READY and selected_day == date.today():
-        replan = replan_snapshot(date.today())
+    if REPLAN_READY and selected_day == rcp_today():
+        replan = replan_snapshot(rcp_today())
         if replan:
             event = replan.get("event") or {}
             missed = event.get("session") or {}
             missed_day = event.get("date")
             metrics = replan.get("metrics") or {}
-            st.markdown("### 🔄 Replanificación V7.2")
+            st.markdown("### 🔄 Replanificación V7.2.2")
             with st.container(border=True):
+                _planned_ahead = bool((replan.get("event") or {}).get("planned_ahead"))
+                _event_label = "Ausencia planificada" if _planned_ahead else "Sesión perdida"
                 st.caption(
-                    f"Sesión perdida: {missed_day.strftime('%d/%m') if missed_day else '—'} · "
+                    f"{_event_label}: {missed_day.strftime('%d/%m') if missed_day else '—'} · "
                     f"{missed.get('workout_name') or '—'} · Motivo: {metrics.get('missed_reason') or 'No informado'}"
                 )
                 st.markdown(f"**{replan_decision_label(replan.get('decision'))}**")
@@ -5798,7 +5998,7 @@ if current_page == "Hoy":
                         set_page("Evaluación")
                         st.rerun()
                     if c2.button("✅ Registrar recomendación", use_container_width=True):
-                        ok, msg = apply_replan(replan, date.today())
+                        ok, msg = apply_replan(replan, rcp_today())
                         (st.success if ok else st.error)(msg)
                         if ok:
                             st.rerun()
@@ -5808,22 +6008,22 @@ if current_page == "Hoy":
                         set_page("Objetivo")
                         st.rerun()
                     if c2.button("✅ Registrar sin mover", use_container_width=True):
-                        ok, msg = apply_replan(replan, date.today())
+                        ok, msg = apply_replan(replan, rcp_today())
                         (st.success if ok else st.error)(msg)
                         if ok:
                             st.rerun()
                 else:
                     if st.button("🔄 Aplicar propuesta V7.2", use_container_width=True, type="primary"):
-                        ok, msg = apply_replan(replan, date.today())
+                        ok, msg = apply_replan(replan, rcp_today())
                         (st.success if ok else st.error)(msg)
                         if ok:
                             st.rerun()
-    elif ADAPTIVE_READY and not REPLAN_READY and selected_day == date.today():
+    elif ADAPTIVE_READY and not REPLAN_READY and selected_day == rcp_today():
         st.caption("🔄 Replanificación V7.2 pendiente de activar en Supabase.")
 
     # Resumen semanal
     st.markdown("### Esta semana")
-    snap = week_snapshot(date.today())
+    snap = week_snapshot(rcp_today())
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Plan", f"{snap['planned_km']:.1f} km")
     s2.metric("Real", f"{snap['real_km']:.1f} km")
@@ -5843,7 +6043,7 @@ if current_page == "Hoy":
     # Vista rápida de 4 semanas
     weekly_all = all_weekly_stats()
     if weekly_all:
-        today_monday, _ = week_bounds(date.today())
+        today_monday, _ = week_bounds(rcp_today())
         eligible = [w for w in weekly_all if w["start"] <= today_monday]
         preview = (eligible[-4:] if eligible else weekly_all[:4])
         quick_values = []
@@ -5876,7 +6076,7 @@ if current_page == "Hoy":
     st.markdown("### Próximos entrenamientos")
     upcoming = [
         p for p in PLAN
-        if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+        if (d := parse_date_safe(p.get("session_date"))) and d >= rcp_today()
     ][:4]
     if not upcoming:
         st.info("No quedan sesiones futuras en el plan activo.")
@@ -5962,7 +6162,7 @@ elif current_page == "Progreso":
         index=1,
     )
 
-    current_monday, _ = week_bounds(date.today())
+    current_monday, _ = week_bounds(rcp_today())
     past_current = [w for w in weekly_all if w["start"] <= current_monday]
     if period == "Últimas 4 semanas":
         weekly_view = past_current[-4:] if past_current else weekly_all[:4]
@@ -6304,7 +6504,7 @@ elif current_page == "Progreso":
     # 8 · V7.2 Replanificación
     if REPLAN_READY:
         st.divider()
-        st.markdown("## 🔄 Replanificación V7.2")
+        st.markdown("## 🔄 Replanificación V7.2.2")
         if REPLANS:
             rows = []
             for r in REPLANS[:20]:
@@ -6324,7 +6524,7 @@ elif current_page == "Progreso":
                     if ok:
                         st.rerun()
         else:
-            st.info("Todavía no hay replanificaciones. Solo se crean cuando una sesión se registra como OMITIDA y V7.2 propone una acción.")
+            st.info("Todavía no hay replanificaciones. Se crean cuando una sesión se registra como OMITIDA —incluidas ausencias futuras conocidas— y V7.2.2 propone una acción.")
 
 
 # ============================================================
@@ -6412,7 +6612,7 @@ elif current_page == "Registro":
         st.info("Selecciona en la barra lateral una fecha que tenga entrenamiento programado.")
         nearby = [
             p for p in PLAN
-            if (d := parse_date_safe(p.get("session_date"))) and d >= date.today()
+            if (d := parse_date_safe(p.get("session_date"))) and d >= rcp_today()
         ][:5]
         if nearby:
             st.markdown("### Próximas sesiones")
@@ -6429,13 +6629,22 @@ elif current_page == "Registro":
         existing = LOG_BY_DATE.get(selected_day.isoformat(), {})
         with st.container(border=True):
             st.caption(f"{workout_kind(session).upper()} · SEMANA {session.get('week_no')}")
-            st.markdown(f"## {session['workout_name']}")
+            st.markdown(f"## {session_display_name(session)}")
             r1, r2, r3 = st.columns(3)
             r1.metric("Plan", f"{float(session.get('planned_km') or 0):g} km")
             r2.metric("Objetivo", str(session.get("target") or "Por esfuerzo"))
             r3.metric("Estado", status_label_for_date(selected_day).split(" ", 1)[-1])
             with st.expander("📋 Instrucciones"):
                 st.write(session.get("description") or "Sin instrucciones adicionales.")
+
+        if existing and str(existing.get("status") or "").upper() == "OMITIDO" and selected_day > rcp_today():
+            st.warning(f"📅 Ausencia planificada para {selected_day.strftime('%d/%m/%Y')}. Puedes cancelarla antes de esa fecha.")
+            if st.button("↩️ Cancelar ausencia planificada", type="primary", use_container_width=True, key=f"cancel_planned_absence_{selected_day.isoformat()}"):
+                ok, msg = cancel_planned_absence(existing, session)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.session_state["rcp_saved_notice"] = msg
+                    st.rerun()
 
         with st.form("log_form"):
             st.markdown("### ¿Cómo salió?")
@@ -6521,16 +6730,25 @@ elif current_page == "Registro":
                     "notes": notes.strip(),
                 })
                 if status == "OMITIDO" and REPLAN_READY:
-                    st.success("Sesión omitida registrada. V7.2 evaluará si conviene replanificarla sin acumular carga.")
-                    set_page("Hoy", date.today())
+                    if selected_day > rcp_today():
+                        st.session_state["rcp_saved_notice"] = (
+                            f"Ausencia planificada del {selected_day.strftime('%d/%m')} guardada ✅. "
+                            "V7.2.2 ya puede evaluarla desde hoy."
+                        )
+                    else:
+                        st.session_state["rcp_saved_notice"] = (
+                            f"Sesión del {selected_day.strftime('%d/%m')} marcada como OMITIDA ✅. "
+                            "V7.2.2 evaluará si conviene replanificarla sin acumular carga."
+                        )
+                    set_page("Hoy", rcp_today())
                 else:
-                    st.success("Entrenamiento guardado ✅")
+                    st.session_state["rcp_saved_notice"] = "Entrenamiento guardado ✅"
                     set_page("Hoy", selected_day)
                 st.rerun()
 
         if existing:
             st.divider()
-            st.caption("Puedes eliminar un registro erróneo sin modificar la sesión planificada.")
+            st.caption("Puedes eliminar un registro erróneo. Para una ausencia futura usa ‘Cancelar ausencia planificada’. ")
             if st.button(
                 "🗑️ Eliminar registro de esta fecha",
                 key=f"delete_log_{selected_day.isoformat()}",
