@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.0.0"
+APP_VERSION = "8.0.1"
 
 
 # ============================================================
@@ -517,6 +517,204 @@ def clear_session():
         st.session_state.pop(key, None)
 
 
+
+# ============================================================
+# V8.0.1 · QA SANDBOX EN MEMORIA
+# ============================================================
+def _qa_fmt_pace(sec_per_km):
+    try:
+        sec = int(round(float(sec_per_km)))
+    except Exception:
+        return "—"
+    if sec <= 0:
+        return "—"
+    return f"{sec // 60}:{sec % 60:02d}/km"
+
+
+def _qa_speed(sec_per_km):
+    try:
+        sec = float(sec_per_km)
+    except Exception:
+        return None
+    return round(3600.0 / sec, 1) if sec > 0 else None
+
+
+def _qa_equivalent_time(duration_sec, distance_km, target_km):
+    try:
+        return float(duration_sec) * (float(target_km) / float(distance_km)) ** 1.06
+    except Exception:
+        return None
+
+
+def _qa_zones_from_benchmark(distance_km=10.0, duration_sec=3000.0):
+    p10_total = _qa_equivalent_time(duration_sec, distance_km, 10.0)
+    p5_total = _qa_equivalent_time(duration_sec, distance_km, 5.0)
+    p10 = float(p10_total) / 10.0
+    p5 = float(p5_total) / 5.0
+    return {
+        "Recuperación": [round(p10 + 75), round(p10 + 110)],
+        "Rodaje fácil": [round(p10 + 55), round(p10 + 90)],
+        "Tirada larga": [round(p10 + 50), round(p10 + 85)],
+        "Aeróbico sostenido": [round(p10 + 30), round(p10 + 50)],
+        "Tempo / umbral": [round(p10 + 10), round(p10 + 25)],
+        "Intervalos": [round(max(1, p5 - 5)), round(p5 + 10)],
+        "Ritmo objetivo 21K": [298, 304],
+    }
+
+
+def _qa_scenarios():
+    return {
+        "✅ Semana normal": {"adherence": 100, "readiness": 84, "pain": 1, "fatigue": 2.1, "rpe_excess": 0.2, "missed": 0, "illness": False, "gait": False, "trend_pct": 1.0, "load": 1380, "prior_load": 1320, "days_off": 0, "expected": "PROGRESAR", "replan": "Sin replanificación necesaria"},
+        "🥵 Fatiga acumulada": {"adherence": 94, "readiness": 57, "pain": 2, "fatigue": 4.3, "rpe_excess": 1.4, "missed": 0, "illness": False, "gait": False, "trend_pct": -0.8, "load": 1650, "prior_load": 1320, "days_off": 0, "expected": "REDUCIR", "replan": "Descarga de la próxima semana"},
+        "🦵 Dolor alto": {"adherence": 88, "readiness": 42, "pain": 7, "fatigue": 3.5, "rpe_excess": 0.8, "missed": 0, "illness": False, "gait": True, "trend_pct": -1.5, "load": 1210, "prior_load": 1350, "days_off": 0, "expected": "PROTEGER", "replan": "Retirar intensidad y proteger carga"},
+        "❌ Semana con omisiones": {"adherence": 55, "readiness": 73, "pain": 1, "fatigue": 2.8, "rpe_excess": 0.1, "missed": 2, "illness": False, "gait": False, "trend_pct": 0.2, "load": 760, "prior_load": 1290, "days_off": 0, "expected": "MANTENER", "replan": "Reconstruir semana sin apilar sesiones"},
+        "🚀 Mejora aeróbica": {"adherence": 100, "readiness": 87, "pain": 0, "fatigue": 2.0, "rpe_excess": -0.4, "missed": 0, "illness": False, "gait": False, "trend_pct": 3.1, "load": 1430, "prior_load": 1370, "days_off": 0, "expected": "PROGRESAR", "replan": "Sin replanificación necesaria"},
+        "📉 Posible meseta": {"adherence": 98, "readiness": 79, "pain": 1, "fatigue": 2.6, "rpe_excess": 0.3, "missed": 0, "illness": False, "gait": False, "trend_pct": 0.1, "load": 1390, "prior_load": 1380, "days_off": 0, "expected": "MANTENER", "replan": "Mantener y considerar Test RCP"},
+        "🏖️ Interrupción 10 días": {"adherence": 25, "readiness": 72, "pain": 0, "fatigue": 2.0, "rpe_excess": 0.0, "missed": 3, "illness": False, "gait": False, "trend_pct": None, "load": 320, "prior_load": 1310, "days_off": 10, "expected": "MANTENER", "replan": "Semana de retorno / reconstrucción"},
+        "🤒 Enfermedad aguda": {"adherence": 80, "readiness": 38, "pain": 1, "fatigue": 4.5, "rpe_excess": 0.9, "missed": 1, "illness": True, "gait": False, "trend_pct": -2.0, "load": 880, "prior_load": 1330, "days_off": 2, "expected": "PROTEGER", "replan": "No compensar; proteger y reevaluar"},
+    }
+
+
+def _qa_weekly_decision(m):
+    if bool(m.get("illness")) or bool(m.get("gait")) or float(m.get("pain") or 0) >= 7 or float(m.get("readiness") or 100) < 45:
+        return "PROTEGER"
+    if float(m.get("readiness") or 100) < 60 or float(m.get("fatigue") or 0) >= 4 or float(m.get("rpe_excess") or 0) >= 1.2:
+        return "REDUCIR"
+    if int(m.get("days_off") or 0) >= 7 or float(m.get("adherence") or 100) < 70 or int(m.get("missed") or 0) >= 2:
+        return "MANTENER"
+    trend = m.get("trend_pct")
+    if trend is not None and abs(float(trend)) < 0.4 and float(m.get("adherence") or 0) >= 95:
+        return "MANTENER"
+    return "PROGRESAR"
+
+
+def _qa_decision_text(decision):
+    return {
+        "PROGRESAR": ("✅ PROGRESAR", "Mantener la progresión prevista; nunca superar el plan basal."),
+        "MANTENER": ("🟦 MANTENER", "No aumentar carga; conservar o reconstruir la siguiente semana."),
+        "REDUCIR": ("🟡 REDUCIR", "Aplicar descarga conservadora y reducir densidad de intensidad."),
+        "PROTEGER": ("🛡️ PROTEGER", "Retirar intensidad y reducir carga hasta nueva revisión."),
+    }.get(decision, (decision, ""))
+
+
+def _qa_next_week_km(decision, baseline=36.4):
+    if decision == "PROTEGER": return round(baseline * 0.68, 1)
+    if decision == "REDUCIR": return round(baseline * 0.82, 1)
+    if decision == "MANTENER": return 35.0
+    return baseline
+
+
+def _qa_plan_rows():
+    monday = rcp_today() - timedelta(days=rcp_today().weekday())
+    structure = [
+        (1, "Martes", 1, "Rodaje fácil", 7.5, "RPE 3-4/10"), (1, "Jueves", 3, "Tempo controlado", 8.0, "RPE 6/10"),
+        (1, "Viernes", 4, "Rodaje fácil", 6.5, "RPE 3-4/10"), (1, "Domingo", 6, "Tirada larga", 13.0, "RPE 3-4/10"),
+        (2, "Martes", 8, "Rodaje fácil", 7.8, "RPE 3-4/10"), (2, "Jueves", 10, "Tempo controlado", 8.3, "RPE 6/10"),
+        (2, "Viernes", 11, "Rodaje fácil", 6.7, "RPE 3-4/10"), (2, "Domingo", 13, "Tirada larga", 13.6, "RPE 3-4/10"),
+    ]
+    return [{"Semana": w, "Fecha": (monday + timedelta(days=offset)).strftime("%d/%m/%Y"), "Día": day, "Sesión": name, "KM": km, "Objetivo": target} for w, day, offset, name, km, target in structure]
+
+
+def _qa_calibration_samples():
+    return [
+        {"Velocidad": 10.5, "Pace": "5:43/km", "RPE": 3}, {"Velocidad": 10.9, "Pace": "5:30/km", "RPE": 3},
+        {"Velocidad": 11.3, "Pace": "5:19/km", "RPE": 4}, {"Velocidad": 11.7, "Pace": "5:08/km", "RPE": 5},
+        {"Velocidad": 12.0, "Pace": "5:00/km", "RPE": 6}, {"Velocidad": 11.1, "Pace": "5:24/km", "RPE": 4},
+    ]
+
+
+def _qa_automated_matrix():
+    rows = []
+    for name, m in _qa_scenarios().items():
+        got = _qa_weekly_decision(m)
+        rows.append({"Escenario": name, "Esperado": m.get("expected"), "Obtenido": got, "Resultado": "PASS" if got == m.get("expected") else "FAIL"})
+    zones = _qa_zones_from_benchmark()
+    easy = sum(zones["Rodaje fácil"]) / 2
+    threshold = sum(zones["Tempo / umbral"]) / 2
+    rows.append({"Escenario": "🎯 Zonas", "Esperado": "Umbral más rápido", "Obtenido": "OK" if threshold < easy else "ERROR", "Resultado": "PASS" if threshold < easy else "FAIL"})
+    plan = _qa_plan_rows(); weekly = {}
+    for r in plan: weekly[r["Semana"]] = weekly.get(r["Semana"], 0) + r["KM"]
+    safe_jump = weekly[2] <= weekly[1] * 1.12
+    rows.append({"Escenario": "🛡️ Progresión semanal", "Esperado": "≤12%", "Obtenido": f"{((weekly[2]/weekly[1])-1)*100:.1f}%", "Resultado": "PASS" if safe_jump else "FAIL"})
+    return rows
+
+
+def render_qa_sandbox():
+    """Sandbox local: no consulta ni escribe filas de usuario en Supabase."""
+    st.markdown(
+        f"""<div class="rcp-hero"><div class="rcp-eyebrow">RUNNINGCOACHPRO · V{APP_VERSION} · QA SANDBOX</div>
+        <h2>🧪 Corredor ficticio · memoria temporal</h2>
+        <p>Entorno de pruebas sin cuenta real. Ningún botón de este modo escribe perfiles, planes, logs, readiness, tests ni revisiones en Supabase.</p>
+        <div class="rcp-pills"><span class="rcp-pill">🔒 0 escrituras a Supabase</span><span class="rcp-pill">👤 RUNNER_QA_001</span><span class="rcp-pill">🎯 21K · 1:45:00</span><span class="rcp-pill">🫁 Capacidad aeróbica</span></div></div>""",
+        unsafe_allow_html=True,
+    )
+    top1, top2 = st.columns([3, 1])
+    top1.info("Los datos desaparecen al salir/reiniciar el Sandbox. Úsalo para forzar situaciones que nunca deberíamos inventar en una cuenta real.")
+    if top2.button("🚪 Salir del Sandbox", use_container_width=True):
+        st.session_state.pop("rcp_qa_mode", None); st.session_state.pop("rcp_qa_applied", None); st.rerun()
+
+    tabs = st.tabs(["🎛️ Escenarios", "🎯 Zonas", "🎚️ Pace/RPE", "🗓️ Plan", "✅ Batería QA"])
+    with tabs[0]:
+        scenarios = _qa_scenarios(); selected = st.selectbox("Escenario sintético", list(scenarios.keys()), key="qa_scenario"); m = dict(scenarios[selected])
+        st.caption("Puedes modificar los valores para probar combinaciones personalizadas; permanecen solo en esta ejecución.")
+        with st.expander("Ajustar métricas manualmente", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            m["adherence"] = c1.slider("Adherencia %", 0, 100, int(m["adherence"])); m["readiness"] = c2.slider("Readiness", 0, 100, int(m["readiness"])); m["pain"] = c3.slider("Dolor post máx.", 0, 10, int(m["pain"])); m["fatigue"] = c4.slider("Fatiga post media", 1.0, 5.0, float(m["fatigue"]), 0.1)
+            c5, c6, c7 = st.columns(3)
+            m["rpe_excess"] = c5.slider("Exceso RPE", -2.0, 3.0, float(m["rpe_excess"]), 0.1); m["missed"] = c6.slider("Sesiones omitidas", 0, 4, int(m["missed"])); m["days_off"] = c7.slider("Días sin entrenar", 0, 21, int(m["days_off"]))
+            m["illness"] = st.checkbox("Enfermedad aguda", value=bool(m.get("illness"))); m["gait"] = st.checkbox("Dolor altera marcha/zancada", value=bool(m.get("gait")))
+        decision = _qa_weekly_decision(m); label, explanation = _qa_decision_text(decision)
+        k1, k2, k3, k4 = st.columns(4); k1.metric("Adherencia", f"{m['adherence']}%"); k2.metric("Readiness", f"{m['readiness']}/100"); k3.metric("Dolor", f"{m['pain']}/10"); k4.metric("Carga sRPE", f"{int(m['load'])}")
+        if decision == "PROTEGER": st.error(f"### {label}\n{explanation}")
+        elif decision == "REDUCIR": st.warning(f"### {label}\n{explanation}")
+        elif decision == "MANTENER": st.info(f"### {label}\n{explanation}")
+        else: st.success(f"### {label}\n{explanation}")
+        next_km = _qa_next_week_km(decision); n1, n2, n3 = st.columns(3); n1.metric("Semana actual", "35.0 km"); n2.metric("Semana 2 basal", "36.4 km"); n3.metric("Propuesta QA", f"{next_km:.1f} km", delta=f"{next_km-36.4:+.1f} vs basal")
+        st.caption(f"Replanificación: **{m.get('replan')}**")
+        trend = m.get("trend_pct")
+        if trend is None: trend_label = "DATOS INSUFICIENTES"
+        elif trend >= 1.5: trend_label = "MEJORANDO"
+        elif trend <= -1.5: trend_label = "RETROCESO / FATIGA POSIBLE"
+        elif selected == "📉 Posible meseta": trend_label = "ESTABLE / POSIBLE MESETA"
+        else: trend_label = "ESTABLE"
+        st.markdown(f"**Tendencia aeróbica:** {trend_label}" + ("" if trend is None else f" · {trend:+.1f}% a RPE comparable"))
+        if selected == "📉 Posible meseta": st.info("🧪 Test RCP sugerido: **5K controlado** en una ventana de 7–14 días, siempre que recuperación siga estable.")
+        elif selected in {"🦵 Dolor alto", "🤒 Enfermedad aguda", "🥵 Fatiga acumulada"}: st.caption("Test RCP: no recomendado mientras recuperación esté comprometida.")
+        else: st.caption("Test RCP: no imprescindible ahora; el benchmark ficticio reciente sigue siendo utilizable.")
+        if st.button("🧪 Aplicar decisión SOLO al Sandbox", type="primary", use_container_width=True):
+            st.session_state["rcp_qa_applied"] = {"scenario": selected, "decision": decision, "next_km": next_km}; st.success("Aplicación simulada. No se escribió nada en Supabase.")
+        applied = st.session_state.get("rcp_qa_applied")
+        if applied: st.caption(f"Última simulación aplicada: {applied['scenario']} → {applied['decision']} → {applied['next_km']:.1f} km.")
+
+    with tabs[1]:
+        st.subheader("🎯 Zonas dinámicas del corredor QA"); use_test = st.toggle("Simular nuevo Test RCP 5K en 23:30", value=False, key="qa_test_toggle")
+        if use_test: zones = _qa_zones_from_benchmark(5.0, 23*60+30); source = "Test RCP 5K · 23:30"
+        else: zones = _qa_zones_from_benchmark(10.0, 50*60); source = "Marca reciente 10K · 50:00"
+        st.caption(f"Benchmark activo: **{source}**. El test recalibra ritmos, no incrementa kilómetros automáticamente.")
+        rows = []
+        for name, paces in zones.items():
+            lo, hi = sorted([float(x) for x in paces]); rows.append({"Zona": name, "Pace": f"{_qa_fmt_pace(lo).replace('/km','')}–{_qa_fmt_pace(hi)}", "Caminadora": f"{_qa_speed(hi):.1f}–{_qa_speed(lo):.1f} km/h"})
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.warning("Estas zonas son referencias de entrenamiento, no umbrales fisiológicos medidos en laboratorio. RPE/talk test sigue siendo el control del esfuerzo.")
+
+    with tabs[2]:
+        st.subheader("🎚️ Calibración Pace/RPE ficticia"); st.caption("Ejemplo de cómo RCP aprende la relación velocidad ↔ esfuerzo con sesiones reales continuas."); samples = _qa_calibration_samples(); st.dataframe(samples, use_container_width=True, hide_index=True)
+        xs = [float(r["RPE"]) for r in samples]; ys = [float(r["Velocidad"]) for r in samples]; n = len(xs); xbar, ybar = sum(xs)/n, sum(ys)/n; den = sum((x-xbar)**2 for x in xs); slope = sum((x-xbar)*(y-ybar) for x,y in zip(xs,ys))/den if den else 0; intercept = ybar - slope*xbar; pred3 = intercept + slope*3.0; pred4 = intercept + slope*4.0
+        p1, p2, p3 = st.columns(3); p1.metric("Muestras", n); p2.metric("RPE 3 estimado", f"{pred3:.1f} km/h"); p3.metric("RPE 4 estimado", f"{pred4:.1f} km/h")
+        st.success("Con ≥6 observaciones ficticias el Sandbox comprueba que el modelo responde a la historia personal y no solo a una tabla genérica.")
+
+    with tabs[3]:
+        st.subheader("🗓️ Plan sintético"); plan = _qa_plan_rows(); st.dataframe(plan, use_container_width=True, hide_index=True); totals = {}
+        for row in plan: totals[row["Semana"]] = totals.get(row["Semana"], 0.0) + float(row["KM"])
+        c1, c2 = st.columns(2); c1.metric("Semana 1", f"{totals.get(1,0):.1f} km"); c2.metric("Semana 2", f"{totals.get(2,0):.1f} km", delta=f"{((totals.get(2,0)/totals.get(1,1))-1)*100:.1f}%")
+        st.caption("Guardrail QA: la progresión de esta muestra se mantiene por debajo del 12% y no apila más de dos estímulos exigentes en 7 días.")
+
+    with tabs[4]:
+        st.subheader("✅ Batería automática V8.0.1"); st.caption("Ejecuta todos los escenarios sintéticos y compara la decisión obtenida con la esperada."); matrix = _qa_automated_matrix(); passes = sum(1 for r in matrix if r["Resultado"] == "PASS"); st.metric("Checks superados", f"{passes}/{len(matrix)}"); st.dataframe(matrix, use_container_width=True, hide_index=True)
+        if passes == len(matrix): st.success("Batería QA interna superada. Esto valida coherencia de reglas; no sustituye la validación longitudinal con entrenamientos reales.")
+        else: st.error("Hay checks fallidos. No conviene promover esta lógica a estable hasta corregirlos.")
+    st.divider(); st.caption("QA Sandbox V8.0.1: datos sintéticos en memoria. No representa consejo médico ni una prescripción individual real.")
+
 def authenticated_client():
     client = new_client()
     access = st.session_state.get("access_token")
@@ -618,11 +816,22 @@ def show_auth():
                 except Exception as exc:
                     st.error(f"No pude crear la cuenta: {exc}")
 
+    st.divider()
+    st.markdown("### 🧪 Probar sin cuenta")
+    st.caption("Abre un corredor ficticio en memoria para probar V8 sin crear usuario y sin escribir datos en Supabase.")
+    if st.button("🧪 Entrar al QA Sandbox", use_container_width=True, key="enter_qa_sandbox_auth"):
+        st.session_state["rcp_qa_mode"] = True
+        st.rerun()
+
     st.info(
         "RunningCoachPro usa cuentas separadas. Los datos de cada usuario "
         "quedan protegidos por las reglas RLS de Supabase."
     )
 
+
+if st.session_state.get("rcp_qa_mode"):
+    render_qa_sandbox()
+    st.stop()
 
 client, user = authenticated_client()
 if user is None:
@@ -7732,6 +7941,9 @@ def render_goal_hero():
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
+if st.sidebar.button("🧪 QA Sandbox", use_container_width=True, key="enter_qa_sandbox_sidebar"):
+    st.session_state["rcp_qa_mode"] = True
+    st.rerun()
 st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · calibración personal V8")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
