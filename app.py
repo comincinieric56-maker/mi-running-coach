@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.6.3"
+APP_VERSION = "7.6.4"
 
 
 # ============================================================
@@ -705,6 +705,226 @@ def profile_v763_storage_ready():
         return False
 
 
+def pace_rpe_calibration_storage_ready():
+    """Comprueba V7.6.4: superficie realmente utilizada en cada registro."""
+    try:
+        (
+            client.table("rc_workout_logs")
+            .select("id,training_surface_used")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+# Cache de una sola ejecución de Streamlit; evita repetir consultas al dibujar muchas sesiones.
+_PACE_RPE_CAL_CACHE = {}
+
+
+def _surface_code(value):
+    raw = str(value or "").upper().strip()
+    return raw if raw in {"EXTERIOR", "CAMINADORA"} else None
+
+
+def pace_rpe_calibration_samples(surface="CAMINADORA", days=120):
+    """Obtiene observaciones reales pace/RPE elegibles de los últimos días.
+
+    Para calibración continua excluye sesiones donde el pace medio de toda la sesión
+    no representa bien la intensidad principal (intervalos, umbral y carrera).
+    """
+    surface = _surface_code(surface) or "CAMINADORA"
+    key = (surface, int(days), rcp_today().isoformat())
+    if key in _PACE_RPE_CAL_CACHE:
+        return _PACE_RPE_CAL_CACHE[key]
+
+    if not pace_rpe_calibration_storage_ready():
+        _PACE_RPE_CAL_CACHE[key] = []
+        return []
+
+    start_day = rcp_today() - timedelta(days=int(days))
+    try:
+        logs = (
+            client.table("rc_workout_logs")
+            .select(
+                "id,plan_id,plan_session_id,session_date,actual_km,actual_duration_sec,"
+                "rpe,status,post_pain,post_fatigue,training_surface_used"
+            )
+            .eq("user_id", USER_ID)
+            .gte("session_date", start_day.isoformat())
+            .eq("training_surface_used", surface)
+            .order("session_date", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        sessions = (
+            client.table("rc_plan_sessions")
+            .select("id,session_date,workout_type,workout_name,target,description")
+            .eq("user_id", USER_ID)
+            .gte("session_date", start_day.isoformat())
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        _PACE_RPE_CAL_CACHE[key] = []
+        return []
+
+    session_by_id = {int(s["id"]): s for s in sessions if s.get("id") is not None}
+    out = []
+    for log in logs:
+        status = str(log.get("status") or "").upper()
+        if status not in {"COMPLETADO", "MODIFICADO"}:
+            continue
+        try:
+            km = float(log.get("actual_km") or 0)
+            sec = float(log.get("actual_duration_sec") or 0)
+            rpe = float(log.get("rpe"))
+        except Exception:
+            continue
+        if km < 2.0 or sec < 600 or not (1 <= rpe <= 10):
+            continue
+        speed = 3600.0 * km / sec
+        if not (5.0 <= speed <= 22.0):
+            continue
+        if log.get("post_pain") is not None and int(log.get("post_pain") or 0) >= 5:
+            continue
+
+        session = session_by_id.get(int(log.get("plan_session_id") or 0), {})
+        zone = _session_zone_key(session)
+        if zone in {"interval", "threshold", "race"}:
+            continue
+
+        session_day = parse_date_safe(log.get("session_date"))
+        age_days = max(0, (rcp_today() - session_day).days) if session_day else int(days)
+        recency_weight = 0.5 ** (age_days / 45.0)
+        type_weight = {"recovery": 1.0, "easy": 1.0, "steady": 0.9, "long": 0.82}.get(zone, 0.9)
+        status_weight = 0.85 if status == "MODIFICADO" else 1.0
+        fatigue_weight = 0.9 if int(log.get("post_fatigue") or 0) >= 4 else 1.0
+        weight = recency_weight * type_weight * status_weight * fatigue_weight
+
+        out.append({
+            "date": session_day,
+            "speed_kmh": speed,
+            "pace_sec_km": 3600.0 / speed,
+            "rpe": rpe,
+            "zone": zone,
+            "status": status,
+            "weight": max(0.05, float(weight)),
+        })
+
+    _PACE_RPE_CAL_CACHE[key] = out
+    return out
+
+
+def _weighted_linear_speed_model(samples):
+    """Modelo lineal robusto simple speed ~ RPE con pendiente acotada."""
+    if not samples:
+        return None
+    sw = sum(float(s.get("weight") or 1.0) for s in samples)
+    if sw <= 0:
+        return None
+    mean_x = sum(float(s["rpe"]) * float(s.get("weight") or 1.0) for s in samples) / sw
+    mean_y = sum(float(s["speed_kmh"]) * float(s.get("weight") or 1.0) for s in samples) / sw
+    unique_rpe = {round(float(s["rpe"]), 1) for s in samples}
+    if len(samples) >= 3 and len(unique_rpe) >= 2:
+        var_x = sum(float(s.get("weight") or 1.0) * (float(s["rpe"]) - mean_x) ** 2 for s in samples)
+        cov_xy = sum(
+            float(s.get("weight") or 1.0)
+            * (float(s["rpe"]) - mean_x)
+            * (float(s["speed_kmh"]) - mean_y)
+            for s in samples
+        )
+        learned = cov_xy / var_x if var_x > 1e-9 else 0.35
+        slope = max(0.15, min(0.90, learned))
+    else:
+        slope = 0.35
+    intercept = mean_y - slope * mean_x
+    return intercept, slope
+
+
+def personal_pace_rpe_guidance(session, surface="CAMINADORA"):
+    """Predicción personal para una sesión prescrita por RPE.
+
+    Devuelve None si aún no existe historial utilizable. RPE sigue siendo el control
+    principal: la velocidad es un punto de partida aprendido, no una obligación.
+    """
+    rpe_range = _target_rpe_range((session or {}).get("target"))
+    if not rpe_range:
+        return None
+
+    samples = pace_rpe_calibration_samples(surface=surface, days=120)
+    if not samples:
+        return None
+
+    lo_rpe, hi_rpe = rpe_range
+    mid = (lo_rpe + hi_rpe) / 2.0
+    relevant = [s for s in samples if abs(float(s["rpe"]) - mid) <= 2.5] or samples[:]
+    relevant = sorted(
+        relevant,
+        key=lambda s: (
+            abs(float(s["rpe"]) - mid),
+            -(s["date"].toordinal() if s.get("date") else 0),
+        ),
+    )[:12]
+
+    model = _weighted_linear_speed_model(relevant)
+    if not model:
+        return None
+    intercept, slope = model
+    speed_lo = intercept + slope * lo_rpe
+    speed_hi = intercept + slope * hi_rpe
+    speed_lo, speed_hi = sorted((speed_lo, speed_hi))
+
+    n = len(relevant)
+    margin = 0.30 if n <= 2 else (0.20 if n <= 5 else 0.10)
+    speed_lo = max(5.0, speed_lo - margin)
+    speed_hi = min(22.0, speed_hi + margin)
+
+    obs_speeds = [float(s["speed_kmh"]) for s in relevant]
+    speed_lo = max(min(obs_speeds) - 1.2, speed_lo)
+    speed_hi = min(max(obs_speeds) + 1.2, speed_hi)
+    if speed_hi < speed_lo:
+        speed_hi = speed_lo
+
+    speed_lo = round(speed_lo * 10) / 10.0
+    speed_hi = round(speed_hi * 10) / 10.0
+    paces = sorted([3600.0 / speed_lo, 3600.0 / speed_hi])
+
+    confidence = "provisional" if n <= 2 else ("media" if n <= 5 else "alta")
+    return {
+        "speed": f"{speed_lo:.1f} km/h" if abs(speed_hi-speed_lo) < 0.05 else f"{speed_lo:.1f}-{speed_hi:.1f} km/h",
+        "pace": _pace_text_from_seconds(paces),
+        "repeats": [],
+        "source": f"calibración personal · {n} sesión{'es' if n != 1 else ''}",
+        "confidence": confidence,
+        "sample_count": n,
+        "note": (
+            f"Calibración personal ({confidence}). Empieza en la parte baja del rango; tras 10-15 min "
+            "ajusta ±0.2 km/h si el RPE queda por debajo o por encima del objetivo. El RPE manda."
+        ),
+    }
+
+
+def pace_rpe_calibration_summary(surface="CAMINADORA"):
+    samples = pace_rpe_calibration_samples(surface=surface, days=120)
+    if not samples:
+        return {"count": 0, "samples": []}
+    speeds = [float(s["speed_kmh"]) for s in samples]
+    rpes = [float(s["rpe"]) for s in samples]
+    return {
+        "count": len(samples),
+        "min_speed": min(speeds),
+        "max_speed": max(speeds),
+        "min_rpe": min(rpes),
+        "max_rpe": max(rpes),
+        "samples": samples,
+    }
+
+
 def training_surface_preference(profile_row=None):
     """EXTERIOR / CAMINADORA / AMBOS. Los perfiles antiguos se comportan como AMBOS."""
     value = str((profile_row or {}).get("training_surface_preference") or "AMBOS").upper().strip()
@@ -916,6 +1136,10 @@ def get_unassigned_logs():
 
 def save_log(payload):
     payload = dict(payload)
+    # Compatibilidad: si el usuario aún no ejecutó la migración V7.6.4,
+    # no enviamos una columna inexistente a PostgREST.
+    if "training_surface_used" in payload and not pace_rpe_calibration_storage_ready():
+        payload.pop("training_surface_used", None)
     active_plan = get_active_plan_record()
     plan_id = payload.get("plan_id") or (active_plan or {}).get("id")
     if not plan_id:
@@ -1585,7 +1809,8 @@ def _session_zone_key(session):
 def treadmill_guidance(session, goal_row=None, assessment=None):
     """Referencia cuantitativa para caminadora.
 
-    Prioridad: pace explícito de la sesión > marca reciente utilizable > meta + RPE.
+    Prioridad V7.6.4:
+    pace explícito > calibración personal pace/RPE > marca reciente > meta + RPE.
     La referencia secundaria nunca modifica la prescripción: manda el RPE/talk test.
     """
     session = session or {}
@@ -1602,7 +1827,14 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
             "note": "Equivalencia directa del pace prescrito; la inclinación se ajusta por separado.",
         }
 
-    # Si el plan antiguo quedó guardado solo con RPE pero hoy existe una marca reciente
+    # V7.6.4 · Si la sesión está prescrita por RPE, aprende primero de sesiones reales
+    # registradas en caminadora. No usa velocidad habitual declarada ni convierte costumbre
+    # en prescripción; usa la relación observada velocidad↔RPE.
+    personal = personal_pace_rpe_guidance(session, surface="CAMINADORA")
+    if personal:
+        return personal
+
+    # Si aún no hay calibración personal suficiente pero existe una marca reciente
     # utilizable, recuperamos la zona correspondiente sin regenerar ni alterar el plan.
     try:
         profile = v7_pace_profile(assessment, goal_row)
@@ -6999,7 +7231,7 @@ def render_goal_hero():
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
-st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · V7.6.1")
+st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · V7.6.4 personal")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
 st.sidebar.caption(f"🕒 {rcp_timezone_name()} · hoy {rcp_today().strftime('%d/%m/%Y')}")
@@ -8921,6 +9153,34 @@ elif current_page == "Registro":
             avg_hr = h1.number_input("FC media (opcional)", 0, 230, int(existing.get("avg_hr") or 0))
             max_hr = h2.number_input("FC máxima (opcional)", 0, 240, int(existing.get("max_hr") or 0))
 
+            # V7.6.4 · La calibración aprende solo si sabemos dónde se realizó la sesión.
+            _surface_log_options = ["No informada", "Exterior", "Caminadora"]
+            _saved_surface = _surface_code(existing.get("training_surface_used"))
+            _pref_surface = training_surface_preference(profile)
+            if _saved_surface == "EXTERIOR":
+                _surface_log_default = "Exterior"
+            elif _saved_surface == "CAMINADORA":
+                _surface_log_default = "Caminadora"
+            elif _pref_surface == "EXTERIOR":
+                _surface_log_default = "Exterior"
+            elif _pref_surface == "CAMINADORA":
+                _surface_log_default = "Caminadora"
+            else:
+                _surface_log_default = "No informada"
+
+            training_surface_used_ui = st.selectbox(
+                "Superficie realizada",
+                _surface_log_options,
+                index=_surface_log_options.index(_surface_log_default),
+                help=(
+                    "V7.6.4 usa este dato para aprender tu relación real velocidad↔RPE. "
+                    "Si eliges Caminadora y registras distancia, tiempo y RPE, esa sesión puede calibrar velocidades futuras."
+                ),
+                disabled=not pace_rpe_calibration_storage_ready(),
+            )
+            if not pace_rpe_calibration_storage_ready():
+                st.caption("Activa V7.6.4 en Supabase para registrar la superficie y habilitar la calibración personal.")
+
             if ADAPTIVE_READY:
                 st.markdown("#### Recuperación post-sesión")
                 a1, a2 = st.columns(2)
@@ -8978,6 +9238,11 @@ elif current_page == "Registro":
                     "avg_hr": int(avg_hr) if avg_hr else None,
                     "max_hr": int(max_hr) if max_hr else None,
                     "status": status,
+                    "training_surface_used": (
+                        {"Exterior": "EXTERIOR", "Caminadora": "CAMINADORA"}.get(training_surface_used_ui)
+                        if pace_rpe_calibration_storage_ready() and status != "OMITIDO"
+                        else None
+                    ),
                     "post_pain": int(post_pain) if ADAPTIVE_READY and status != "OMITIDO" else None,
                     "post_fatigue": int(post_fatigue) if ADAPTIVE_READY and status != "OMITIDO" else None,
                     "perceived_difficulty": perceived_difficulty if ADAPTIVE_READY and status != "OMITIDO" else None,
@@ -9313,6 +9578,47 @@ elif current_page == "Perfil":
                     use_container_width=True,
                     hide_index=True,
                 )
+
+        st.markdown("### 🎚️ Calibración personal Pace/RPE")
+        st.caption(
+            "RCP aprende de sesiones reales en caminadora registradas con distancia, duración y RPE. "
+            "No interpreta una velocidad habitual como 'cómoda': aprende qué esfuerzo te produjo realmente."
+        )
+        if not pace_rpe_calibration_storage_ready():
+            st.warning(
+                "Calibración personal pendiente. Ejecuta `supabase_v7_6_4_pace_rpe_calibration.sql` "
+                "en Supabase y vuelve a cargar la app."
+            )
+        else:
+            _cal = pace_rpe_calibration_summary("CAMINADORA")
+            if int(_cal.get("count") or 0) == 0:
+                st.info(
+                    "Aún no hay sesiones elegibles para calibrar. Registra entrenamientos en **Caminadora** "
+                    "con KM reales, duración y RPE. Las sesiones continuas de rodaje/recuperación/larga "
+                    "alimentarán el modelo; intervalos y carreras se excluyen del pace medio."
+                )
+            else:
+                _cc1, _cc2, _cc3 = st.columns(3)
+                _cc1.metric("Sesiones aprendidas", int(_cal["count"]))
+                _cc2.metric(
+                    "Velocidad observada",
+                    f"{float(_cal['min_speed']):.1f}-{float(_cal['max_speed']):.1f} km/h"
+                )
+                _cc3.metric(
+                    "RPE observado",
+                    f"{float(_cal['min_rpe']):g}-{float(_cal['max_rpe']):g}/10"
+                )
+                _cal_rows = []
+                for _s in (_cal.get("samples") or [])[:8]:
+                    _cal_rows.append({
+                        "Fecha": _s["date"].strftime("%d/%m/%Y") if _s.get("date") else "—",
+                        "Velocidad": f"{float(_s['speed_kmh']):.1f} km/h",
+                        "Pace": pace_string(_s.get("pace_sec_km")),
+                        "RPE": f"{float(_s['rpe']):g}/10",
+                        "Tipo": str(_s.get("zone") or "").title(),
+                    })
+                with st.expander("Ver sesiones que están calibrando el modelo", expanded=False):
+                    st.dataframe(_cal_rows, use_container_width=True, hide_index=True)
 
     if LATEST_ASSESSMENT:
         st.markdown("### Perfil RCP vigente")
