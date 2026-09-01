@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "7.6.0"
+APP_VERSION = "7.6.1"
 
 
 # ============================================================
@@ -1347,6 +1347,115 @@ def pace_string(sec_per_km):
     sec = int(round(sec_per_km))
     mm, ss = divmod(sec, 60)
     return f"{mm}:{ss:02d} min/km"
+
+
+# ============================================================
+# V7.6.1 · TREADMILL CONVERTER
+# ============================================================
+def pace_seconds_to_kmh(sec_per_km):
+    """Convierte segundos/km a km/h. No aplica corrección automática por inclinación."""
+    try:
+        sec = float(sec_per_km)
+    except (TypeError, ValueError):
+        return None
+    if sec <= 0:
+        return None
+    return 3600.0 / sec
+
+
+def _target_pace_seconds(target):
+    """Extrae un pace único o rango desde textos tipo 5:20-5:35 min/km."""
+    raw = str(target or "")
+    m = re.search(
+        r"(?<!\d)(\d{1,2}):(\d{2})(?:\s*[-–—]\s*(\d{1,2}):(\d{2}))?\s*min/km",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return []
+    first = int(m.group(1)) * 60 + int(m.group(2))
+    if first <= 0 or int(m.group(2)) >= 60:
+        return []
+    values = [first]
+    if m.group(3) is not None:
+        second = int(m.group(3)) * 60 + int(m.group(4))
+        if second > 0 and int(m.group(4)) < 60:
+            values.append(second)
+    return values
+
+
+def treadmill_speed_text(target):
+    """Devuelve velocidad equivalente en cinta para el pace prescrito."""
+    paces = _target_pace_seconds(target)
+    if not paces:
+        return None
+    speeds = sorted([pace_seconds_to_kmh(p) for p in paces if pace_seconds_to_kmh(p) is not None])
+    if not speeds:
+        return None
+    if len(speeds) == 1 or abs(speeds[-1] - speeds[0]) < 0.05:
+        return f"{speeds[0]:.1f} km/h"
+    return f"{speeds[0]:.1f}-{speeds[-1]:.1f} km/h"
+
+
+def _format_duration_seconds(total_seconds):
+    total = int(round(float(total_seconds)))
+    hh, rem = divmod(total, 3600)
+    mm, ss = divmod(rem, 60)
+    if hh:
+        return f"{hh}:{mm:02d}:{ss:02d}"
+    return f"{mm}:{ss:02d}"
+
+
+def treadmill_repeat_text(session):
+    """Calcula tiempo por repetición cuando la sesión define repeticiones por distancia."""
+    paces = _target_pace_seconds((session or {}).get("target"))
+    if not paces:
+        return []
+    desc = str((session or {}).get("description") or "")
+    found = re.findall(
+        r"(?:\d+(?:\s*[-–—]\s*\d+)?)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(m|km)\b",
+        desc,
+        flags=re.IGNORECASE,
+    )
+    out, seen = [], set()
+    for raw_distance, unit in found:
+        try:
+            value = float(raw_distance.replace(",", "."))
+        except ValueError:
+            continue
+        distance_km = value / 1000.0 if unit.lower() == "m" else value
+        if distance_km <= 0 or distance_km > 5:
+            continue
+        key = round(distance_km, 4)
+        if key in seen:
+            continue
+        seen.add(key)
+        rep_seconds = sorted(int(round(p * distance_km)) for p in paces)
+        if unit.lower() == "m":
+            label = f"{int(value) if value.is_integer() else value:g} m"
+        else:
+            label = f"{value:g} km"
+        if len(rep_seconds) == 1 or rep_seconds[0] == rep_seconds[-1]:
+            out.append(f"{label}: {_format_duration_seconds(rep_seconds[0])} por repetición")
+        else:
+            out.append(
+                f"{label}: {_format_duration_seconds(rep_seconds[0])}-{_format_duration_seconds(rep_seconds[-1])} por repetición"
+            )
+        if len(out) >= 2:
+            break
+    return out
+
+
+def treadmill_guidance(session):
+    """Resumen listo para UI/PDF. Devuelve None si la sesión se prescribe solo por RPE."""
+    speed = treadmill_speed_text((session or {}).get("target"))
+    if not speed:
+        return None
+    return {
+        "speed": speed,
+        "repeats": treadmill_repeat_text(session),
+        "note": "Velocidad equivalente; la inclinación se ajusta por separado según contexto y tolerancia.",
+    }
 
 
 def next_monday(day):
@@ -6691,6 +6800,7 @@ def render_goal_hero():
 # Sidebar: contexto y utilidades, no navegación principal.
 st.sidebar.title("🏃 RunningCoachPro")
 st.sidebar.caption(f"V{APP_VERSION} · Multiusuario")
+st.sidebar.caption("🏃‍♂️ Pace ↔ caminadora · V7.6.1")
 st.sidebar.markdown(f"**{profile['display_name']}**")
 st.sidebar.caption(USER_EMAIL)
 st.sidebar.caption(f"🕒 {rcp_timezone_name()} · hoy {rcp_today().strftime('%d/%m/%Y')}")
@@ -7332,7 +7442,7 @@ def build_plan_pdf_bytes(
                 P(workout_kind(p)),
                 P(session_display_name(p)),
                 P(f"{float(p.get('planned_km') or 0):g}"),
-                P(p.get("target") or "Por esfuerzo"),
+                P((p.get("target") or "Por esfuerzo") + (f" | Cinta {(treadmill_guidance(p) or {}).get('speed')}" if treadmill_guidance(p) else "")),
                 P(status),
             ])
         ct = Table(compact, colWidths=[22*mm, 12*mm, 20*mm, 42*mm, 13*mm, 49*mm, 22*mm], repeatRows=1)
@@ -7406,7 +7516,13 @@ def build_plan_pdf_bytes(
                     f'<font color="{status_hex}"><b>{_pdf_esc(status)}</b></font></font>',
                     styles["RCPBody"],
                 )
-                target_box = Table([[Paragraph(f'<b>Objetivo</b><br/>{_pdf_esc(p.get("target") or "Por esfuerzo")}', styles["RCPBody"]) ]], colWidths=[130*mm])
+                _tm_pdf = treadmill_guidance(p)
+                _tm_pdf_line = ""
+                if _tm_pdf:
+                    _tm_pdf_line = f'<br/><font size="8" color="#475569"><b>Caminadora:</b> {_pdf_esc(_tm_pdf["speed"])}</font>'
+                    if _tm_pdf.get("repeats"):
+                        _tm_pdf_line += f'<br/><font size="7.5" color="#64748B">{_pdf_esc(" · ".join(_tm_pdf["repeats"]))}</font>'
+                target_box = Table([[Paragraph(f'<b>Objetivo</b><br/>{_pdf_esc(p.get("target") or "Por esfuerzo")}{_tm_pdf_line}', styles["RCPBody"]) ]], colWidths=[130*mm])
                 target_box.setStyle(TableStyle([
                     ("BACKGROUND", (0,0), (-1,-1), ksoft if visual else surface),
                     ("LINEBEFORE", (0,0), (0,-1), 3, kcolor),
@@ -7605,6 +7721,12 @@ if current_page == "Hoy":
             )
             st.markdown(f"## {today_session['workout_name']}")
             st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
+            _treadmill_today = treadmill_guidance(today_session)
+            if _treadmill_today:
+                _tm_extra = ""
+                if _treadmill_today.get("repeats"):
+                    _tm_extra = " · " + " · ".join(_treadmill_today["repeats"])
+                st.info(f"🏃‍♂️ **Caminadora:** {_treadmill_today['speed']}{_tm_extra}")
 
             a, b, c, dcol = st.columns(4)
             a.metric("Distancia", f"{float(today_session.get('planned_km') or 0):g} km")
@@ -7954,7 +8076,9 @@ elif current_page == "Semana":
             c1.caption(d.strftime("%d/%m"))
             if s:
                 c2.markdown(f"**{s['workout_name']}**")
-                c2.caption(f"{workout_kind(s)} · {s.get('target') or 'Por esfuerzo'}")
+                _tm_week = treadmill_guidance(s)
+                _tm_week_text = f" · Cinta {_tm_week['speed']}" if _tm_week else ""
+                c2.caption(f"{workout_kind(s)} · {s.get('target') or 'Por esfuerzo'}{_tm_week_text}")
                 c3.markdown(f"**{float(s.get('planned_km') or 0):g} km**")
                 c3.caption(status_label_for_date(d))
                 if c4.button("Abrir", key=f"week_open_{s['id']}", use_container_width=True):
@@ -8462,6 +8586,7 @@ elif current_page == "Plan":
             "Adaptación": str(p.get("adaptation_status") or "BASELINE").title() if ADAPTIVE_READY else "—",
             "Replanificación": str(p.get("replan_status") or "BASELINE").replace("_", " ").title() if REPLAN_READY else "—",
             "Objetivo": p.get("target"),
+            "Caminadora": (treadmill_guidance(p) or {}).get("speed") or "—",
             "Opcional": "Sí" if session_is_optional(p) else "No",
             "Estado": status,
         })
@@ -8482,6 +8607,12 @@ elif current_page == "Plan":
                 f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
             )
             st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
+            _tm_plan = treadmill_guidance(p)
+            if _tm_plan:
+                _tm_plan_extra = ""
+                if _tm_plan.get("repeats"):
+                    _tm_plan_extra = " · " + " · ".join(_tm_plan["repeats"])
+                st.info(f"🏃‍♂️ **Caminadora:** {_tm_plan['speed']}{_tm_plan_extra}")
             if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
                 st.info(f"🔄 Replanificada V7.2 · {str(p.get('replan_status') or '').replace('_', ' ').title()}")
             st.write(p.get("description") or "Sin instrucciones adicionales.")
@@ -8525,6 +8656,12 @@ elif current_page == "Registro":
             r1.metric("Plan", f"{float(session.get('planned_km') or 0):g} km")
             r2.metric("Objetivo", str(session.get("target") or "Por esfuerzo"))
             r3.metric("Estado", status_label_for_date(selected_day).split(" ", 1)[-1])
+            _tm_reg = treadmill_guidance(session)
+            if _tm_reg:
+                _tm_reg_extra = ""
+                if _tm_reg.get("repeats"):
+                    _tm_reg_extra = " · " + " · ".join(_tm_reg["repeats"])
+                st.caption(f"🏃‍♂️ Caminadora: **{_tm_reg['speed']}**{_tm_reg_extra}")
             with st.expander("📋 Instrucciones"):
                 st.write(session.get("description") or "Sin instrucciones adicionales.")
 
