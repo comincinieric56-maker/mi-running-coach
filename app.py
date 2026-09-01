@@ -99,7 +99,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "6.2"
+APP_VERSION = "6.3.1"
 
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     st.error(
@@ -125,7 +125,7 @@ RUN_DAYS = {
     6: [0, 1, 2, 3, 5, 6], # Lun/Mar/Mié/Jue/Sáb/Dom
 }
 
-ASSESSMENT_VERSION = "RCP-1.0"
+ASSESSMENT_VERSION = "RCP-1.1"
 RCP_LEVELS = ["INICIACIÓN", "PRINCIPIANTE", "INTERMEDIO", "AVANZADO"]
 RCP_GOALS = [
     "Empezar a correr",
@@ -158,6 +158,19 @@ CONTINUOUS_OPTIONS = {
     ">90 min": 100,
 }
 TIME_AVAILABLE_OPTIONS = ["30 min", "45 min", "60 min", "75 min", "90+ min"]
+
+PERFORMANCE_DISTANCE_KM = {
+    "1K": 1.0,
+    "1 milla": 1.60934,
+    "3K": 3.0,
+    "5K": 5.0,
+    "10K": 10.0,
+    "15K": 15.0,
+    "21K": 21.1,
+    "42K": 42.2,
+}
+PERFORMANCE_CONTEXTS = ["Carrera oficial", "Carrera no oficial", "Test", "Entrenamiento"]
+PERFORMANCE_TERRAINS = ["Plano/asfalto", "Ruta con desnivel", "Trail", "Cinta", "Otro"]
 
 # ============================================================
 # Autenticación Supabase
@@ -383,17 +396,95 @@ def get_latest_assessment():
 
 def save_assessment(payload):
     row = dict(payload)
+    now_iso = datetime.now(timezone.utc).isoformat()
     row["user_id"] = USER_ID
     row["assessment_version"] = ASSESSMENT_VERSION
+    row["status"] = "COMPLETED"
+    row["completed_at"] = now_iso
+    row["updated_at"] = now_iso
     return client.table("rc_assessments").insert(row).execute()
 
 
 def assessment_storage_ready():
+    """V6.3.1 exige la tabla de evaluaciones y las columnas de estado."""
     try:
-        client.table("rc_assessments").select("id").eq("user_id", USER_ID).limit(1).execute()
+        (
+            client.table("rc_assessments")
+            .select("id,status,completed_at,updated_at")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
         return True
     except Exception:
         return False
+
+
+def assessment_is_complete(assessment):
+    """
+    Gate central de onboarding.
+
+    No basta con que exista una fila: debe representar una evaluación terminada
+    y contener los campos mínimos necesarios para describir al corredor.
+    """
+    if not assessment or not isinstance(assessment, dict):
+        return False
+
+    status = str(assessment.get("status") or "COMPLETED").upper()
+    if status != "COMPLETED":
+        return False
+
+    if assessment.get("runner_score") is None:
+        return False
+    if str(assessment.get("runner_level") or "").upper() not in RCP_LEVELS:
+        return False
+    if not str(assessment.get("safety_status") or "").strip():
+        return False
+
+    answers = assessment.get("answers")
+    if not isinstance(answers, dict) or not answers:
+        return False
+
+    required_keys = [
+        "running_status",
+        "experience",
+        "active_weeks_8",
+        "current_days",
+        "weekly_km",
+        "long_run_km",
+        "continuous_min",
+        "quality_types",
+        "intense_sessions_per_week",
+        "strength_frequency",
+        "injury_last12m",
+        "current_pain",
+        "pain_changes_gait",
+        "available_days",
+        "preferred_long_day",
+        "weekday_time",
+        "weekend_time",
+    ]
+    if any(key not in answers for key in required_keys):
+        return False
+
+    available_days = answers.get("available_days") or []
+    if not isinstance(available_days, list) or len(available_days) < 1:
+        return False
+
+    return True
+
+
+def require_completed_assessment(show_message=True):
+    """Devuelve la evaluación vigente o None si el usuario aún no supera el gate."""
+    assessment = get_latest_assessment()
+    if assessment_is_complete(assessment):
+        return assessment
+
+    if show_message:
+        st.error(
+            "RunningCoachPro requiere una Evaluación RCP completa antes de crear o modificar un plan."
+        )
+    return None
 
 
 # ============================================================
@@ -634,63 +725,355 @@ def classify_runner(answers, score):
     return level
 
 
-def goal_readiness(answers, safety_status):
+def runner_level_display(level, score):
+    """Etiqueta de presentación. El nivel primario sigue siendo el dato canónico."""
+    level = str(level or "—").upper()
+    score = int(score or 0)
+    if level == "PRINCIPIANTE" and score >= 45:
+        return "PRINCIPIANTE ALTO"
+    if level == "INTERMEDIO" and score >= 80:
+        return "INTERMEDIO ALTO"
+    return level
+
+
+def level_limiter_message(answers, level, score):
+    """Explica por qué un score alto puede quedar limitado por reglas de experiencia."""
+    level = str(level or "").upper()
+    score = int(score or 0)
+    experience = str(answers.get("experience") or "Nunca")
+    active_weeks = int(answers.get("active_weeks_8") or 0)
+    current_days = int(answers.get("current_days") or 0)
+    weekly_km = float(answers.get("weekly_km") or 0)
+    long_km = float(answers.get("long_run_km") or 0)
+    quality_count = len(set(answers.get("quality_types") or []))
+
+    if level == "INTERMEDIO" and score >= 75:
+        missing = []
+        if experience not in ("1–2 años", ">2 años"):
+            missing.append(f"experiencia acumulada ({experience})")
+        if current_days < 5:
+            missing.append(f"frecuencia habitual ({current_days} días/sem)")
+        if weekly_km < 40:
+            missing.append(f"volumen estable ({weekly_km:g} km/sem)")
+        if long_km < 14:
+            missing.append(f"tirada larga ({long_km:g} km)")
+        if quality_count < 2:
+            missing.append("experiencia con al menos dos tipos de calidad")
+        if missing:
+            return "La clasificación AVANZADO queda limitada por " + ", ".join(missing) + "."
+
+    if level == "PRINCIPIANTE" and score >= 50:
+        if experience in ("1–3 meses",) or active_weeks < 6 or current_days <= 2:
+            return (
+                "La puntuación refleja una capacidad actual favorable, pero el historial reciente "
+                "todavía es corto para clasificarte como INTERMEDIO."
+            )
+
+    if level == "INICIACIÓN" and score >= 30:
+        return (
+            "La puntuación no anula las reglas de base mínima: primero se prioriza consistencia "
+            "y tolerancia a carrera continua."
+        )
+    return None
+
+
+def base_goal_readiness(answers, safety_status):
+    """Evalúa si la BASE ACTUAL permite iniciar el tipo de plan, sin mezclar calendario."""
     goal = str(answers.get("goal") or "Condición física")
     active_weeks = int(answers.get("active_weeks_8") or 0)
     weekly_km = float(answers.get("weekly_km") or 0)
     long_km = float(answers.get("long_run_km") or 0)
     continuous_min = int(answers.get("continuous_min") or 0)
-    race_date_text = answers.get("goal_race_date")
 
     if safety_status != "SIN ALERTAS DECLARADAS":
-        return "EVALUAR SEGURIDAD PRIMERO", ["El cribado de seguridad debe resolverse antes de progresar el entrenamiento."]
+        return "EVALUAR SEGURIDAD", [
+            "El cribado de seguridad debe resolverse antes de progresar el entrenamiento."
+        ]
 
     if goal in ("Empezar a correr", "Correr 30 min continuos", "Condición física", "Volver a correr tras una pausa"):
-        return "APTO PARA FASE ADAPTADA", ["El objetivo puede abordarse con una fase inicial ajustada a la capacidad actual."]
+        return "ADECUADA CON ADAPTACIÓN", [
+            "El objetivo puede abordarse con una fase inicial ajustada a tu capacidad actual."
+        ]
 
     if goal == "Mantener rendimiento":
         if active_weeks >= 4 and weekly_km > 0:
-            return "BASE ACTUAL UTILIZABLE", ["Existe actividad reciente suficiente para plantear mantenimiento individualizado."]
+            return "ADECUADA", ["Existe actividad reciente suficiente para plantear mantenimiento individualizado."]
         return "BASE PREVIA", ["Conviene reconstruir consistencia antes de un bloque de mantenimiento estructurado."]
 
     requirements = {
-        "5K": (4, 8, 3, 20, 6),
-        "10K": (4, 12, 5, 30, 8),
-        "21K": (6, 18, 8, 45, 10),
-        "42K": (8, 28, 14, 60, 16),
+        "5K": (4, 8, 3, 20),
+        "10K": (4, 12, 5, 30),
+        "21K": (6, 18, 8, 45),
+        "42K": (8, 28, 14, 60),
     }
     req = requirements.get(goal)
     if not req:
         return "REVISIÓN MANUAL", ["No hay reglas RCP definidas para este objetivo."]
 
-    req_weeks, req_km, req_long, req_cont, min_calendar_weeks = req
+    req_weeks, req_km, req_long, req_cont = req
     missing = []
     if active_weeks < req_weeks:
         missing.append(f"consistencia reciente ({active_weeks}/8 semanas)")
     if weekly_km < req_km:
-        missing.append(f"volumen actual ({weekly_km:g} km/sem)")
+        missing.append(f"volumen actual ({weekly_km:g} km/sem; referencia RCP ≥{req_km})")
     if long_km < req_long:
-        missing.append(f"tirada larga actual ({long_km:g} km)")
+        missing.append(f"tirada larga actual ({long_km:g} km; referencia RCP ≥{req_long})")
     if continuous_min < req_cont:
-        missing.append(f"carrera continua ({continuous_min} min)")
+        missing.append(f"carrera continua ({continuous_min} min; referencia RCP ≥{req_cont})")
 
-    calendar_short = False
-    if race_date_text:
+    if not missing:
+        return "ADECUADA", ["La base declarada cumple los umbrales internos RCP para iniciar este tipo de plan."]
+    if len(missing) <= 2:
+        return "BASE PREVIA", missing
+    return "INSUFICIENTE", missing
+
+
+def calendar_goal_readiness(answers, safety_status):
+    """Evalúa el tiempo disponible hasta la fecha objetivo, de forma separada de la base."""
+    if safety_status != "SIN ALERTAS DECLARADAS":
+        return "EVALUAR SEGURIDAD", ["Primero debe resolverse el cribado de seguridad."]
+
+    goal = str(answers.get("goal") or "Condición física")
+    has_race = bool(answers.get("has_goal_race"))
+    race_date_text = answers.get("goal_race_date")
+    goal_style = str(answers.get("goal_style") or "Terminar")
+
+    if goal not in GOAL_KM or GOAL_KM.get(goal) is None:
+        return "NO APLICA", ["Este objetivo no requiere una fecha de carrera para poder comenzar."]
+    if not has_race or not race_date_text:
+        return "SIN FECHA", ["No se declaró una fecha objetivo; el plan podrá trabajar por bloques abiertos."]
+
+    try:
+        race_day = date.fromisoformat(str(race_date_text))
+    except Exception:
+        return "FECHA INVÁLIDA", ["No fue posible interpretar la fecha objetivo."]
+
+    days_left = (race_day - date.today()).days
+    weeks_left = max(0.0, days_left / 7)
+    if days_left <= 0:
+        return "INSUFICIENTE", ["La fecha objetivo ya ocurrió o corresponde al día actual."]
+
+    # Umbrales internos de calendario. Son guardrails del motor RCP, no normas universales.
+    base_min_weeks = {"5K": 4, "10K": 6, "21K": 8, "42K": 12}.get(goal, 4)
+    performance_extra = 2 if goal_style in ("Mejorar mi marca", "Buscar una marca concreta") else 0
+    recommended = base_min_weeks + performance_extra
+
+    if weeks_left >= recommended:
+        return "SUFICIENTE", [f"Quedan {weeks_left:.1f} semanas; referencia interna RCP ≥{recommended} para este objetivo."]
+    if weeks_left >= max(3, recommended - 2):
+        return "AJUSTADA", [
+            f"Quedan {weeks_left:.1f} semanas. El calendario es corto para la referencia interna RCP de {recommended} semanas; "
+            "el motor deberá limitar la progresión y priorizar continuidad."
+        ]
+    return "INSUFICIENTE", [
+        f"Quedan {weeks_left:.1f} semanas; la referencia interna RCP para este objetivo es aproximadamente {recommended} semanas."
+    ]
+
+
+def performance_distance_km(label, custom_km=None):
+    if str(label) == "Otra":
         try:
-            race_day = date.fromisoformat(str(race_date_text))
-            weeks_left = max(0, (race_day - date.today()).days / 7)
-            if weeks_left < min_calendar_weeks:
-                calendar_short = True
-                missing.append(f"tiempo hasta la carrera ({weeks_left:.1f} semanas; referencia RCP ≥{min_calendar_weeks})")
+            value = float(custom_km or 0)
+            return value if value > 0 else None
+        except Exception:
+            return None
+    return PERFORMANCE_DISTANCE_KM.get(str(label))
+
+
+def estimate_equivalent_time(source_seconds, source_km, target_km, exponent=1.06):
+    """Equivalencia orientativa con modelo de potencia; no sustituye un test fisiológico."""
+    if not source_seconds or not source_km or not target_km:
+        return None
+    if float(source_km) <= 0 or float(target_km) <= 0:
+        return None
+    return int(round(float(source_seconds) * (float(target_km) / float(source_km)) ** exponent))
+
+
+def performance_summary(answers):
+    """Resume rendimiento reciente y equivalencias para alimentar el futuro motor V7."""
+    has_mark = bool(answers.get("race_or_test_recent"))
+    if not has_mark:
+        return {
+            "status": "SIN MARCA RECIENTE",
+            "usable": False,
+            "message": "Los ritmos iniciales deberán apoyarse en RPE/talk test hasta disponer de una marca fiable.",
+        }
+
+    distance_label = str(answers.get("recent_mark_distance") or "")
+    source_km = performance_distance_km(distance_label, answers.get("recent_mark_custom_km"))
+    source_seconds = parse_hms(answers.get("recent_mark_time"))
+    mark_date_text = answers.get("recent_mark_date")
+
+    if not source_km or not source_seconds:
+        return {
+            "status": "MARCA INCOMPLETA",
+            "usable": False,
+            "message": "Se declaró una carrera/test reciente, pero faltan distancia o tiempo válidos.",
+        }
+
+    age_days = None
+    if mark_date_text:
+        try:
+            age_days = max(0, (date.today() - date.fromisoformat(str(mark_date_text))).days)
+        except Exception:
+            age_days = None
+
+    usable = age_days is None or age_days <= 120
+    status = "DISPONIBLE" if usable else "MARCA ANTIGUA"
+    goal = str(answers.get("goal") or "")
+    goal_km = GOAL_KM.get(goal)
+    estimated_goal_seconds = (
+        estimate_equivalent_time(source_seconds, source_km, goal_km)
+        if usable and goal_km else None
+    )
+    target_seconds = parse_hms(answers.get("goal_target_time"))
+
+    gap_pct = None
+    target_demand = None
+    if estimated_goal_seconds and target_seconds:
+        gap_pct = round((estimated_goal_seconds - target_seconds) / estimated_goal_seconds * 100, 1)
+        if gap_pct <= 0:
+            target_demand = "COMPATIBLE CON LA MARCA ACTUAL"
+        elif gap_pct <= 2:
+            target_demand = "PROGRESIÓN PEQUEÑA"
+        elif gap_pct <= 5:
+            target_demand = "OBJETIVO EXIGENTE"
+        else:
+            target_demand = "OBJETIVO MUY EXIGENTE"
+
+    equivalents = {}
+    if usable:
+        for label, km in [("5K", 5.0), ("10K", 10.0), ("21K", 21.1), ("42K", 42.2)]:
+            eq = estimate_equivalent_time(source_seconds, source_km, km)
+            if eq:
+                equivalents[label] = eq
+
+    return {
+        "status": status,
+        "usable": bool(usable),
+        "source_distance_label": distance_label,
+        "source_distance_km": round(float(source_km), 3),
+        "source_time_sec": int(source_seconds),
+        "source_time": fmt_time(source_seconds),
+        "source_pace": fmt_pace(source_seconds, source_km),
+        "date": mark_date_text,
+        "age_days": age_days,
+        "context": answers.get("recent_mark_context"),
+        "terrain": answers.get("recent_mark_terrain"),
+        "rpe": answers.get("recent_mark_rpe"),
+        "equivalents_sec": equivalents,
+        "estimated_goal_sec": estimated_goal_seconds,
+        "estimated_goal_time": fmt_time(estimated_goal_seconds) if estimated_goal_seconds else None,
+        "target_time_sec": target_seconds,
+        "target_time": fmt_time(target_seconds) if target_seconds else None,
+        "required_improvement_pct": gap_pct,
+        "target_demand": target_demand,
+        "message": (
+            "Marca reciente utilizable como referencia orientativa."
+            if usable else
+            "La marca tiene más de 120 días; se conserva como antecedente, pero no se usará automáticamente para prescribir ritmos."
+        ),
+    }
+
+
+def goal_readiness(answers, safety_status):
+    """Resultado global compatible con la columna legacy goal_readiness."""
+    base_status, base_reasons = base_goal_readiness(answers, safety_status)
+    calendar_status, calendar_reasons = calendar_goal_readiness(answers, safety_status)
+
+    if safety_status != "SIN ALERTAS DECLARADAS":
+        return "EVALUAR SEGURIDAD PRIMERO", base_reasons
+    if base_status in ("INSUFICIENTE", "EVALUAR SEGURIDAD"):
+        return "BASE INSUFICIENTE", base_reasons
+    if calendar_status == "INSUFICIENTE":
+        return "TIEMPO LIMITADO", calendar_reasons
+    if base_status == "BASE PREVIA":
+        return "NECESITA FASE DE BASE", base_reasons
+    return "PREPARACIÓN ADECUADA", base_reasons
+
+
+def build_runner_profile(answers, safety_status, safety_message, score, level, components):
+    """Snapshot técnico estable que será la entrada del Plan Engine V7."""
+    base_status, base_reasons = base_goal_readiness(answers, safety_status)
+    calendar_status, calendar_reasons = calendar_goal_readiness(answers, safety_status)
+    perf = performance_summary(answers)
+    limiter = level_limiter_message(answers, level, score)
+
+    progression_mode = "ESTÁNDAR"
+    experience = str(answers.get("experience") or "Nunca")
+    current_pain = int(answers.get("current_pain") or 0)
+    if experience in ("Nunca", "<1 mes", "1–3 meses", "3–6 meses") or bool(answers.get("injury_last12m")):
+        progression_mode = "CONSERVADORA"
+    if current_pain >= 4 or bool(answers.get("pain_changes_gait")) or safety_status != "SIN ALERTAS DECLARADAS":
+        progression_mode = "RESTRINGIDA"
+
+    goal_date = answers.get("goal_race_date") if answers.get("has_goal_race") else None
+    weeks_to_goal = None
+    if goal_date:
+        try:
+            weeks_to_goal = round(max(0, (date.fromisoformat(str(goal_date)) - date.today()).days) / 7, 1)
         except Exception:
             pass
 
-    if not missing:
-        return "PREPARACIÓN ADECUADA", ["La base declarada cumple los umbrales internos RCP para iniciar este tipo de plan."]
-    if len(missing) <= 2 and not calendar_short:
-        return "NECESITA FASE DE BASE", missing
-    return "OBJETIVO AGRESIVO PARA LA BASE ACTUAL", missing
-
+    return {
+        "schema_version": "RCP-RUNNER-PROFILE-1.0",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "classification": {
+            "level": str(level).upper(),
+            "level_display": runner_level_display(level, score),
+            "score": int(score),
+            "limiter": limiter,
+            "components": components,
+        },
+        "safety": {
+            "status": safety_status,
+            "message": safety_message,
+        },
+        "experience": {
+            "running_status": answers.get("running_status"),
+            "experience": answers.get("experience"),
+            "active_weeks_8": int(answers.get("active_weeks_8") or 0),
+            "quality_types": answers.get("quality_types") or [],
+            "intense_sessions_per_week": int(answers.get("intense_sessions_per_week") or 0),
+            "strength_frequency": answers.get("strength_frequency"),
+        },
+        "training_base": {
+            "current_days": int(answers.get("current_days") or 0),
+            "weekly_km": float(answers.get("weekly_km") or 0),
+            "weekly_km_detail": answers.get("weekly_km_detail") or [],
+            "long_run_km": float(answers.get("long_run_km") or 0),
+            "continuous_min": int(answers.get("continuous_min") or 0),
+        },
+        "tolerance": {
+            "injury_last12m": bool(answers.get("injury_last12m")),
+            "current_pain": int(answers.get("current_pain") or 0),
+            "pain_changes_gait": bool(answers.get("pain_changes_gait")),
+            "injury_areas": answers.get("injury_areas") or [],
+            "progression_mode": progression_mode,
+        },
+        "availability": {
+            "days": answers.get("available_days") or [],
+            "preferred_long_day": answers.get("preferred_long_day"),
+            "no_intensity_days": answers.get("no_intensity_days") or [],
+            "weekday_time": answers.get("weekday_time"),
+            "weekend_time": answers.get("weekend_time"),
+        },
+        "goal": {
+            "type": answers.get("goal"),
+            "style": answers.get("goal_style"),
+            "date": goal_date,
+            "weeks_to_goal": weeks_to_goal,
+            "target_time": answers.get("goal_target_time") or None,
+            "target_time_sec": parse_hms(answers.get("goal_target_time")),
+        },
+        "readiness": {
+            "base": base_status,
+            "base_reasons": base_reasons,
+            "calendar": calendar_status,
+            "calendar_reasons": calendar_reasons,
+        },
+        "performance": perf,
+    }
 
 def assessment_explanation(answers, components, level):
     positives = []
@@ -793,6 +1176,13 @@ def tempo_workout(level, week_no, target_pace):
 
 
 def generate_plan(profile):
+    # Segunda barrera: incluso si la navegación fallara, el motor legacy no
+    # puede generar un plan para un usuario sin evaluación RCP completa.
+    if require_completed_assessment(show_message=False) is None:
+        raise PermissionError(
+            "Se requiere una Evaluación RCP completa antes de generar un plan."
+        )
+
     goal = profile["goal"]
     level = profile["level"]
     days = int(profile["days_per_week"])
@@ -981,6 +1371,22 @@ def _option_index(options, value, fallback=0):
         return fallback
 
 
+def _readiness_compact(status):
+    mapping = {
+        "ADECUADA": "🟢 ADECUADA",
+        "ADECUADA CON ADAPTACIÓN": "🟢 ADAPTADA",
+        "BASE PREVIA": "🟡 BASE PREVIA",
+        "INSUFICIENTE": "🔴 INSUFICIENTE",
+        "EVALUAR SEGURIDAD": "🔴 REVISAR",
+        "SUFICIENTE": "🟢 SUFICIENTE",
+        "AJUSTADA": "🟡 AJUSTADA",
+        "SIN FECHA": "⚪ SIN FECHA",
+        "NO APLICA": "⚪ NO APLICA",
+        "FECHA INVÁLIDA": "🔴 REVISAR",
+    }
+    return mapping.get(str(status or "").upper(), str(status or "—"))
+
+
 def show_assessment_result(assessment):
     if not assessment:
         return
@@ -988,16 +1394,44 @@ def show_assessment_result(assessment):
     score = int(assessment.get("runner_score") or 0)
     level = str(assessment.get("runner_level") or "—")
     safety = str(assessment.get("safety_status") or "—")
-    readiness = str(assessment.get("goal_readiness") or "—")
     goal = str(assessment.get("goal") or "—")
+    answers = assessment.get("answers") or {}
     explanation = assessment.get("explanation") or {}
+    components = explanation.get("components") or {}
+
+    runner_profile = explanation.get("runner_profile")
+    if not runner_profile:
+        # Compatibilidad con evaluaciones RCP-1.0 guardadas antes de V6.3.
+        runner_profile = build_runner_profile(
+            answers,
+            safety,
+            assessment.get("safety_message") or "",
+            score,
+            level,
+            components,
+        )
+
+    classification = runner_profile.get("classification") or {}
+    readiness = runner_profile.get("readiness") or {}
+    performance = runner_profile.get("performance") or {}
+    goal_profile = runner_profile.get("goal") or {}
+    training_base = runner_profile.get("training_base") or {}
+    tolerance = runner_profile.get("tolerance") or {}
+
+    level_display = classification.get("level_display") or runner_level_display(level, score)
+    base_status = readiness.get("base") or "—"
+    calendar_status = readiness.get("calendar") or "—"
 
     st.markdown("### Tu perfil RCP")
     a, b, c, d = st.columns(4)
-    a.metric("Nivel RCP", level.title())
-    b.metric("Runner Score", f"{score}/100")
-    c.metric("Objetivo evaluado", goal)
-    d.metric("Preparación", readiness.title())
+    a.metric("Nivel RCP", str(level_display).title())
+    b.metric("Capacidad de entrenamiento", f"{score}/100")
+    c.metric("Objetivo", goal)
+    d.metric("Base objetivo", _readiness_compact(base_status))
+
+    limiter = classification.get("limiter")
+    if limiter:
+        st.info(f"**Principal limitante de clasificación:** {limiter}")
 
     if safety == "SIN ALERTAS DECLARADAS":
         st.success(f"**Cribado de seguridad:** {safety}. {assessment.get('safety_message') or ''}")
@@ -1006,30 +1440,83 @@ def show_assessment_result(assessment):
     else:
         st.error(f"**Cribado de seguridad:** {safety}. {assessment.get('safety_message') or ''}")
 
-    reasons = explanation.get("reasons") or []
-    strengths = explanation.get("strengths") or []
-    development = explanation.get("development") or []
-    components = explanation.get("components") or {}
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("KM/sem actuales", f"{float(training_base.get('weekly_km') or 0):g}")
+    p2.metric("Días/sem", int(training_base.get("current_days") or 0))
+    p3.metric("Tirada larga", f"{float(training_base.get('long_run_km') or 0):g} km")
+    p4.metric("Carrera continua", f"{int(training_base.get('continuous_min') or 0)} min")
 
     left, right = st.columns(2)
     with left:
-        st.markdown("#### ¿Por qué este nivel?")
-        for item in reasons:
-            st.write(f"• {item}")
+        st.markdown("#### Perfil de entrenamiento")
+        st.write(f"• Experiencia: {answers.get('experience') or '—'}")
+        st.write(f"• Progresión inicial RCP: **{tolerance.get('progression_mode') or '—'}**")
+        available = (runner_profile.get("availability") or {}).get("days") or []
+        st.write(f"• Días disponibles: {', '.join(available) if available else '—'}")
+
+        strengths = explanation.get("strengths") or []
         if strengths:
             st.markdown("#### Fortalezas actuales")
             for item in strengths:
                 st.write(f"• {item}")
-    with right:
+
+        development = explanation.get("development") or []
         if development:
             st.markdown("#### Áreas a desarrollar")
             for item in development:
                 st.write(f"• {item}")
-        readiness_reasons = assessment.get("readiness_reasons") or []
-        if readiness_reasons:
-            st.markdown("#### Preparación para el objetivo")
-            for item in readiness_reasons:
-                st.write(f"• {item}")
+
+    with right:
+        st.markdown("#### Preparación para el objetivo")
+        st.write(f"**Base para {goal}:** {_readiness_compact(base_status)}")
+        for item in readiness.get("base_reasons") or []:
+            st.write(f"• {item}")
+
+        st.write(f"**Calendario:** {_readiness_compact(calendar_status)}")
+        if goal_profile.get("date"):
+            st.write(
+                f"• Fecha objetivo: {goal_profile.get('date')} · "
+                f"{goal_profile.get('weeks_to_goal') if goal_profile.get('weeks_to_goal') is not None else '—'} semanas"
+            )
+        for item in readiness.get("calendar_reasons") or []:
+            st.write(f"• {item}")
+
+        st.markdown("#### Rendimiento actual")
+        perf_status = str(performance.get("status") or "SIN MARCA RECIENTE")
+        st.write(f"**{perf_status}**")
+        if performance.get("source_time"):
+            st.write(
+                f"• Referencia: {performance.get('source_distance_label')} en {performance.get('source_time')} "
+                f"({performance.get('source_pace')})"
+            )
+        if performance.get("estimated_goal_time") and goal in GOAL_KM:
+            st.write(f"• Equivalencia orientativa {goal}: **{performance.get('estimated_goal_time')}**")
+        if performance.get("target_time"):
+            st.write(f"• Marca objetivo declarada: **{performance.get('target_time')}**")
+        if performance.get("target_demand"):
+            gap = performance.get("required_improvement_pct")
+            gap_text = f" · mejora estimada {gap:.1f}%" if isinstance(gap, (int, float)) and gap > 0 else ""
+            st.write(f"• Demanda del objetivo: **{performance.get('target_demand')}**{gap_text}")
+        if performance.get("message"):
+            st.caption(performance.get("message"))
+
+    equivalents = performance.get("equivalents_sec") or {}
+    if equivalents and performance.get("usable"):
+        with st.expander("Ver equivalencias orientativas de rendimiento"):
+            rows = []
+            for distance_name in ["5K", "10K", "21K", "42K"]:
+                sec = equivalents.get(distance_name)
+                if sec:
+                    rows.append({
+                        "Distancia": distance_name,
+                        "Tiempo equivalente": fmt_time(sec),
+                        "Ritmo equivalente": fmt_pace(sec, GOAL_KM[distance_name]),
+                    })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.caption(
+                "Equivalencias matemáticas orientativas basadas en una marca reciente. "
+                "No son una predicción garantizada ni una medición fisiológica."
+            )
 
     if components:
         with st.expander("Ver composición del Runner Score"):
@@ -1037,9 +1524,11 @@ def show_assessment_result(assessment):
             st.dataframe(score_rows, use_container_width=True, hide_index=True)
             st.caption(
                 "El Runner Score es un índice interno RCP de experiencia y tolerancia de entrenamiento; "
-                "no es una escala médica ni una medida de talento o velocidad."
+                "no es una escala médica ni una medida de talento o velocidad. El nivel final también aplica reglas de experiencia mínima."
             )
 
+    with st.expander("Ver perfil técnico que usará el futuro Plan Engine V7"):
+        st.json(runner_profile)
 
 def assessment_form(existing_assessment=None, onboarding=False):
     existing_answers = (existing_assessment or {}).get("answers") or {}
@@ -1180,6 +1669,61 @@ def assessment_form(existing_assessment=None, onboarding=False):
             help="Una carrera o test reciente aporta evidencia de experiencia competitiva, pero no define por sí sola tu nivel.",
         )
 
+        st.markdown("#### Marca reciente · opcional")
+        st.caption(
+            "Si marcaste carrera/test reciente, completa estos datos. RunningCoachPro la usará como referencia de rendimiento; "
+            "si no tienes una marca fiable, los ritmos futuros podrán iniciarse por RPE/talk test."
+        )
+        pm1, pm2, pm3 = st.columns(3)
+        recent_distance_options = list(PERFORMANCE_DISTANCE_KM.keys()) + ["Otra"]
+        recent_mark_distance = pm1.selectbox(
+            "Distancia de la marca",
+            recent_distance_options,
+            index=_option_index(recent_distance_options, existing_answers.get("recent_mark_distance"), 4),
+        )
+        recent_mark_custom_km = pm2.number_input(
+            "KM si elegiste ‘Otra’",
+            min_value=0.0,
+            max_value=200.0,
+            value=float(existing_answers.get("recent_mark_custom_km") or 0.0),
+            step=0.1,
+        )
+        recent_mark_time = pm3.text_input(
+            "Tiempo de la marca",
+            value=str(existing_answers.get("recent_mark_time") or ""),
+            placeholder="Ej. 49:30 o 1:47:12",
+            help="Formato MM:SS o HH:MM:SS.",
+        )
+
+        default_mark_date = date.today() - timedelta(days=30)
+        if existing_answers.get("recent_mark_date"):
+            try:
+                default_mark_date = date.fromisoformat(str(existing_answers["recent_mark_date"]))
+            except Exception:
+                pass
+        pm4, pm5, pm6 = st.columns(3)
+        recent_mark_date = pm4.date_input(
+            "Fecha de la marca",
+            value=default_mark_date,
+            min_value=date.today() - timedelta(days=730),
+            max_value=date.today(),
+        )
+        recent_mark_context = pm5.selectbox(
+            "Tipo de registro",
+            PERFORMANCE_CONTEXTS,
+            index=_option_index(PERFORMANCE_CONTEXTS, existing_answers.get("recent_mark_context"), 0),
+        )
+        recent_mark_terrain = pm6.selectbox(
+            "Terreno",
+            PERFORMANCE_TERRAINS,
+            index=_option_index(PERFORMANCE_TERRAINS, existing_answers.get("recent_mark_terrain"), 0),
+        )
+        recent_mark_rpe = st.slider(
+            "RPE de esa carrera/test (1–10)",
+            1, 10,
+            int(existing_answers.get("recent_mark_rpe") or 8),
+        )
+
         st.markdown("### 4 · Lesiones y tolerancia actual")
         i1, i2, i3 = st.columns(3)
         injury_last12m = i1.checkbox(
@@ -1259,6 +1803,15 @@ def assessment_form(existing_assessment=None, onboarding=False):
             min_value=date.today() + timedelta(days=1),
             max_value=date.today() + timedelta(days=730),
         )
+        goal_target_time = st.text_input(
+            "Marca objetivo (opcional)",
+            value=str(existing_answers.get("goal_target_time") or ""),
+            placeholder="Ej. 45:00 o 1:45:00",
+            help=(
+                "Úsala si quieres buscar una marca concreta. Formato MM:SS o HH:MM:SS. "
+                "La app comparará esta meta con una marca reciente si existe."
+            ),
+        )
 
         accepted = st.checkbox(
             "Confirmo que respondí según mi situación actual y entiendo que esta evaluación no diagnostica ni reemplaza una valoración profesional.",
@@ -1276,6 +1829,29 @@ def assessment_form(existing_assessment=None, onboarding=False):
         return False
     if not available_days:
         st.error("Selecciona al menos un día disponible para entrenar.")
+        return False
+
+    if race_or_test:
+        recent_km = performance_distance_km(recent_mark_distance, recent_mark_custom_km)
+        recent_seconds = parse_hms(recent_mark_time)
+        if not recent_km:
+            st.error("Si declaras una carrera/test reciente, indica una distancia válida.")
+            return False
+        if not recent_seconds:
+            st.error("Si declaras una carrera/test reciente, escribe un tiempo válido (MM:SS o HH:MM:SS).")
+            return False
+
+    target_seconds_check = parse_hms(goal_target_time) if str(goal_target_time).strip() else None
+    if str(goal_target_time).strip() and not target_seconds_check:
+        st.error("La marca objetivo no tiene un formato válido. Usa MM:SS o HH:MM:SS.")
+        return False
+    if (
+        goal_style == "Buscar una marca concreta"
+        and goal in GOAL_KM
+        and GOAL_KM.get(goal) is not None
+        and not target_seconds_check
+    ):
+        st.error("Para ‘Buscar una marca concreta’ debes indicar la marca objetivo.")
         return False
 
     weekly_detail = [float(week1), float(week2), float(week3), float(week4)]
@@ -1306,6 +1882,13 @@ def assessment_form(existing_assessment=None, onboarding=False):
         "intense_sessions_per_week": int(intense_sessions),
         "strength_frequency": strength_frequency,
         "race_or_test_recent": bool(race_or_test),
+        "recent_mark_distance": recent_mark_distance if race_or_test else None,
+        "recent_mark_custom_km": float(recent_mark_custom_km) if race_or_test else None,
+        "recent_mark_time": str(recent_mark_time).strip() if race_or_test else None,
+        "recent_mark_date": recent_mark_date.isoformat() if race_or_test else None,
+        "recent_mark_context": recent_mark_context if race_or_test else None,
+        "recent_mark_terrain": recent_mark_terrain if race_or_test else None,
+        "recent_mark_rpe": int(recent_mark_rpe) if race_or_test else None,
         "injury_last12m": bool(injury_last12m),
         "current_pain": int(current_pain),
         "pain_changes_gait": bool(pain_changes_gait),
@@ -1319,6 +1902,7 @@ def assessment_form(existing_assessment=None, onboarding=False):
         "goal_style": goal_style,
         "has_goal_race": bool(has_goal_race),
         "goal_race_date": goal_race_date.isoformat() if has_goal_race else None,
+        "goal_target_time": str(goal_target_time).strip() or None,
     }
 
     safety_status, safety_message = evaluate_safety(answers)
@@ -1326,6 +1910,17 @@ def assessment_form(existing_assessment=None, onboarding=False):
     runner_level = classify_runner(answers, runner_score)
     readiness, readiness_reasons = goal_readiness(answers, safety_status)
     explanation = assessment_explanation(answers, components, runner_level)
+    runner_profile = build_runner_profile(
+        answers,
+        safety_status,
+        safety_message,
+        runner_score,
+        runner_level,
+        components,
+    )
+    explanation["runner_profile"] = runner_profile
+    explanation["level_display"] = runner_profile["classification"]["level_display"]
+    explanation["limiter"] = runner_profile["classification"].get("limiter")
 
     payload = {
         "safety_status": safety_status,
@@ -1352,7 +1947,10 @@ def assessment_form(existing_assessment=None, onboarding=False):
         )
         return False
 
-    st.success(f"Evaluación guardada · Nivel RCP: {runner_level.title()} · {runner_score}/100")
+    st.success(
+        f"Evaluación guardada · Nivel RCP: {runner_profile['classification']['level_display'].title()} · "
+        f"{runner_score}/100"
+    )
     st.rerun()
     return True
 
@@ -1502,8 +2100,15 @@ def profile_form(existing=None, assessed_level=None):
         "current_time_sec": current_seconds,
     }
 
+    if require_completed_assessment() is None:
+        return False
+
     save_profile(profile)
-    generated = generate_plan(profile)
+    try:
+        generated = generate_plan(profile)
+    except PermissionError as exc:
+        st.error(str(exc))
+        return False
     replace_plan(generated)
 
     st.success(f"Plan creado: {len(generated)} sesiones.")
@@ -1514,32 +2119,49 @@ def profile_form(existing=None, assessed_level=None):
 profile = get_profile()
 ASSESSMENT_READY = assessment_storage_ready()
 LATEST_ASSESSMENT = get_latest_assessment() if ASSESSMENT_READY else None
+ASSESSMENT_COMPLETE = assessment_is_complete(LATEST_ASSESSMENT) if ASSESSMENT_READY else False
 
-if not profile:
+# ============================================================
+# V6.3.1 · GATE OBLIGATORIO DE ONBOARDING
+# ============================================================
+# Se ejecuta inmediatamente después de autenticar al usuario y ANTES de
+# cargar Dashboard, plan, registros o configuración legacy.
+if not ASSESSMENT_READY:
+    st.title("🏃 RunningCoachPro")
+    st.error("Falta activar el gate de Evaluación RCP de V6.3.1 en Supabase.")
+    st.write(
+        "Ejecuta **supabase_v6_3_1_onboarding.sql** en Supabase → SQL Editor y vuelve a cargar la app."
+    )
+    st.caption(
+        "Por seguridad de la lógica de prescripción, V6.3.1 ya no permite saltarse la evaluación usando el generador legacy."
+    )
+    st.stop()
+
+if not ASSESSMENT_COMPLETE:
     st.title("🏃 Bienvenido a RunningCoachPro")
     st.write(f"Cuenta: **{USER_EMAIL}**")
+    st.info(
+        "Antes de acceder al plan y al Dashboard debes completar tu Evaluación RCP. "
+        "La app utilizará esta información para conocer tu experiencia, carga actual, tolerancia y disponibilidad."
+    )
+    st.markdown(
+        "**Acceso temporalmente bloqueado hasta completar la evaluación:** "
+        "Hoy · Semana · Progreso · Plan · Registro · creación/regeneración de plan."
+    )
+    assessment_form(existing_assessment=LATEST_ASSESSMENT, onboarding=True)
+    st.stop()
 
-    if ASSESSMENT_READY and not LATEST_ASSESSMENT:
-        st.info(
-            "Antes de crear tu primer plan, RunningCoachPro evaluará tu experiencia, "
-            "base actual, disponibilidad y objetivo."
-        )
-        assessment_form(onboarding=True)
-    elif ASSESSMENT_READY and LATEST_ASSESSMENT:
-        show_assessment_result(LATEST_ASSESSMENT)
-        st.divider()
-        st.markdown("### Crear el plan actual")
-        st.caption(
-            "En V6.2 la evaluación ya determina tu nivel. El generador adaptativo completo "
-            "se conectará en la siguiente fase; por ahora se conserva el generador V6 para no romper la app."
-        )
-        profile_form(assessed_level=LATEST_ASSESSMENT.get("runner_level"))
-    else:
-        st.warning(
-            "El módulo de evaluación aún no está instalado en Supabase. "
-            "Puedes usar temporalmente la configuración V6 o ejecutar supabase_v6_2_assessment.sql."
-        )
-        profile_form()
+# Desde aquí todo usuario tiene una evaluación completa y válida.
+if not profile:
+    st.title("🏃 RunningCoachPro")
+    st.success("Evaluación inicial completada ✅")
+    show_assessment_result(LATEST_ASSESSMENT)
+    st.divider()
+    st.markdown("### Crear el plan actual")
+    st.caption(
+        "V6.3.1 mantiene temporalmente el generador V6, pero ya no permite crear un plan sin evaluación previa."
+    )
+    profile_form(assessed_level=LATEST_ASSESSMENT.get("runner_level"))
     st.stop()
 
 PLAN = get_plan()
@@ -1570,9 +2192,13 @@ st.sidebar.markdown(f"🎯 **Objetivo:** {profile['goal']}")
 st.sidebar.markdown(f"📅 **Días/sem:** {profile['days_per_week']}")
 st.sidebar.markdown(f"📏 **Base:** {float(profile['weekly_km']):g} km/sem")
 if LATEST_ASSESSMENT:
+    _side_score = int(LATEST_ASSESSMENT.get("runner_score") or 0)
+    _side_level = str(LATEST_ASSESSMENT.get("runner_level") or "—")
+    _side_explanation = LATEST_ASSESSMENT.get("explanation") or {}
+    _side_profile = _side_explanation.get("runner_profile") or {}
+    _side_display = (_side_profile.get("classification") or {}).get("level_display") or runner_level_display(_side_level, _side_score)
     st.sidebar.markdown(
-        f"🧭 **Nivel RCP:** {str(LATEST_ASSESSMENT.get('runner_level') or '—').title()} "
-        f"· {int(LATEST_ASSESSMENT.get('runner_score') or 0)}/100"
+        f"🧭 **Nivel RCP:** {str(_side_display).title()} · {_side_score}/100"
     )
 
 selected_day = st.sidebar.date_input(
@@ -1942,12 +2568,22 @@ with tabs[5]:
                     created_label = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%d/%m/%Y %H:%M")
                 except Exception:
                     created_label = created[:16]
+                a_answers = a.get("answers") or {}
+                a_explanation = a.get("explanation") or {}
+                a_level = str(a.get("runner_level") or "")
+                a_score = int(a.get("runner_score") or 0)
+                a_profile = a_explanation.get("runner_profile") or {}
+                a_display = (a_profile.get("classification") or {}).get("level_display") or runner_level_display(a_level, a_score)
+                a_base = (a_profile.get("readiness") or {}).get("base")
+                if not a_base:
+                    a_base, _ = base_goal_readiness(a_answers, str(a.get("safety_status") or ""))
                 rows.append({
                     "Fecha": created_label,
-                    "Nivel": str(a.get("runner_level") or "").title(),
-                    "Score": int(a.get("runner_score") or 0),
+                    "Versión": a.get("assessment_version"),
+                    "Nivel": str(a_display).title(),
+                    "Score": a_score,
                     "Objetivo": a.get("goal"),
-                    "Preparación": a.get("goal_readiness"),
+                    "Base objetivo": a_base,
                 })
             st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
