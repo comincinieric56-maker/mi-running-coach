@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.2"
+APP_VERSION = "8.1.3"
 
 
 # ============================================================
@@ -486,6 +486,65 @@ CONTINUOUS_OPTIONS = {
     ">90 min": 100,
 }
 TIME_AVAILABLE_OPTIONS = ["30 min", "45 min", "60 min", "75 min", "90+ min"]
+
+# V8.1.3 · RPE con anclajes perceptivos. El número nunca se muestra solo: se
+# acompaña de sensación, respiración y prueba del habla para reducir ambigüedad.
+RPE_GUIDE = {
+    1: {"short": "Mínimo", "feel": "Movimiento casi sin esfuerzo.", "talk": "Respiración normal; conversación completa sin ninguna dificultad."},
+    2: {"short": "Muy fácil", "feel": "Trote regenerativo, claramente contenido.", "talk": "Puedes hablar frases largas cómodamente."},
+    3: {"short": "Fácil", "feel": "Cómodo y sostenible; sientes que podrías continuar bastante tiempo.", "talk": "Conversación fluida en frases completas."},
+    4: {"short": "Cómodo–moderado", "feel": "El trabajo se nota, pero conservas una reserva clara.", "talk": "Puedes hablar en frases completas, con respiración algo más marcada."},
+    5: {"short": "Moderado", "feel": "Esfuerzo sostenido y controlado; ya no es un trote totalmente relajado.", "talk": "Puedes hablar en frases, pero necesitas pequeñas pausas para respirar."},
+    6: {"short": "Moderado–alto", "feel": "Trabajo firme, todavía bajo control y sin sensación de ir al límite.", "talk": "Frases cortas; conversar de forma continua ya cuesta."},
+    7: {"short": "Difícil controlado", "feel": "Exigente pero sostenible por bloques; requiere concentración.", "talk": "Solo pocas palabras o frases muy cortas de una vez."},
+    8: {"short": "Muy difícil", "feel": "Esfuerzo intenso, apropiado para intervalos; margen pequeño.", "talk": "Una a tres palabras; respiración intensa."},
+    9: {"short": "Casi máximo", "feel": "Muy cerca de tu límite; sostenible solo por poco tiempo.", "talk": "Apenas puedes hablar."},
+    10: {"short": "Máximo", "feel": "Esfuerzo máximo voluntario; no podrías aumentarlo.", "talk": "No puedes hablar; solo sostenible brevemente."},
+}
+
+def rpe_option_label(value):
+    try:
+        n = int(round(float(value)))
+    except Exception:
+        n = 5
+    info = RPE_GUIDE.get(max(1, min(10, n)), RPE_GUIDE[5])
+    return f"{n} · {info['short']} — {info['talk']}"
+
+def rpe_reference(value):
+    try:
+        n = int(round(float(value)))
+    except Exception:
+        return ""
+    info = RPE_GUIDE.get(max(1, min(10, n)))
+    if not info:
+        return ""
+    return f"RPE {n}/10 · {info['short']}: {info['feel']} {info['talk']}"
+
+def rpe_target_reference(target):
+    raw = str(target or "")
+    m = re.search(r"RPE\s*(\d+(?:[.,]\d+)?)\s*(?:[–—-]\s*(\d+(?:[.,]\d+)?))?", raw, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    lo = int(round(float(m.group(1).replace(",", "."))))
+    hi = int(round(float((m.group(2) or m.group(1)).replace(",", "."))))
+    lo, hi = max(1, min(10, lo)), max(1, min(10, hi))
+    if lo > hi:
+        lo, hi = hi, lo
+    low = RPE_GUIDE[lo]
+    high = RPE_GUIDE[hi]
+    if lo == hi:
+        return rpe_reference(lo)
+    return (
+        f"RPE {lo}–{hi}/10 · de {low['short'].lower()} a {high['short'].lower()}. "
+        f"Referencia: {low['talk']} En el extremo alto: {high['talk']}"
+    )
+
+def render_rpe_guide(expanded=False, key_suffix=""):
+    with st.expander("🫁 ¿Cómo se siente cada RPE?", expanded=expanded):
+        st.caption("Usa la sensación global, la respiración y la capacidad de hablar. El ritmo o km/h son referencias secundarias.")
+        for n in range(1, 11):
+            info = RPE_GUIDE[n]
+            st.markdown(f"**{n} · {info['short']}** — {info['feel']} {info['talk']}")
 
 PERFORMANCE_DISTANCE_KM = {
     "1K": 1.0,
@@ -926,6 +985,21 @@ def profile_v74_storage_ready():
         (
             client.table("rc_profile_metrics")
             .select("id,metric_date,weight_kg,resting_hr")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def profile_v813_storage_ready():
+    """Comprueba V8.1.3: disponibilidad horaria exacta por día en rc_profiles."""
+    try:
+        (
+            client.table("rc_profiles")
+            .select("user_id,training_time_by_day,availability_updated_at")
             .eq("user_id", USER_ID)
             .limit(1)
             .execute()
@@ -3119,6 +3193,30 @@ def v81_actionable_guidance(session, readiness_row, prediction):
             "tone": "error",
         }
 
+
+    # La disponibilidad horaria es una restricción real: nunca se compensa corriendo más rápido.
+    _time_ctx = session_time_context(sess, parse_date_safe(sess.get("session_date")) or rcp_today(), LATEST_ASSESSMENT, ACTIVE_GOAL, profile)
+    if _time_ctx.get("cap_minutes") and not _time_ctx.get("fits"):
+        _cap = int(_time_ctx["cap_minutes"])
+        _max_km = float(_time_ctx.get("max_km") or 0)
+        if kind in {"Series", "Tempo"}:
+            return {
+                "title": f"Hoy: haz una versión de máximo {_cap} min",
+                "text": f"Tu sesión completa no cabe en el tiempo disponible. Mantén calentamiento y enfriamiento, reduce el bloque de calidad y no superes {_cap} min totales. Como referencia, el volumen total no debería exceder ~{_max_km:g} km. No compenses aumentando el ritmo.",
+                "tone": "warning",
+            }
+        if kind == "Larga":
+            return {
+                "title": f"Hoy: limita la larga a {_cap} min",
+                "text": f"Haz como máximo ~{_max_km:g} km a esfuerzo fácil/conversacional y termina al llegar a {_cap} min aunque falten kilómetros del plan. No aceleres para intentar completar la distancia.",
+                "tone": "warning",
+            }
+        return {
+            "title": f"Hoy: máximo {_cap} min",
+            "text": f"Haz como máximo ~{_max_km:g} km suaves y termina al alcanzar {_cap} min. No corras más rápido para intentar completar la distancia original.",
+            "tone": "warning",
+        }
+
     if decision == "SUSTITUIR_POR_SUAVE":
         target = round(max(3.0, planned * 0.60), 1) if planned else None
         amount = f"~{target:.1f} km" if target else "20–40 min"
@@ -3713,6 +3811,7 @@ def build_runner_profile(answers, safety_status, safety_message, score, level, c
             "no_intensity_days": answers.get("no_intensity_days") or [],
             "weekday_time": answers.get("weekday_time"),
             "weekend_time": answers.get("weekend_time"),
+            "daily_time_minutes": answers.get("daily_time_minutes") or {},
         },
         "goal": {
             "type": answers.get("goal"),
@@ -4271,6 +4370,168 @@ DAY_INDEX = {name: idx for idx, name in enumerate(DAY_NAMES)}
 def _clamp(value, low, high):
     return max(low, min(high, value))
 
+
+def _time_option_minutes(value):
+    """Convierte la disponibilidad legacy. `90+` no es un techo exacto, por eso devuelve None."""
+    raw = str(value or "").strip().lower()
+    if not raw or "+" in raw:
+        return None
+    m = re.search(r"(\d+)", raw)
+    return int(m.group(1)) if m else None
+
+def _assessment_time_map(answers):
+    answers = answers or {}
+    out = {}
+    raw = answers.get("daily_time_minutes") or {}
+    if isinstance(raw, dict):
+        for day, value in raw.items():
+            if day not in DAY_INDEX:
+                continue
+            try:
+                minutes = int(value)
+            except Exception:
+                continue
+            if 15 <= minutes <= 360:
+                out[day] = minutes
+    weekday = _time_option_minutes(answers.get("weekday_time"))
+    weekend = _time_option_minutes(answers.get("weekend_time"))
+    for day in DAY_NAMES:
+        if day in out:
+            continue
+        idx = DAY_INDEX[day]
+        fallback = weekend if idx >= 5 else weekday
+        if fallback:
+            out[day] = fallback
+    return out
+
+def resolved_training_time_map(answers=None, profile_row=None):
+    """Perfil V8.1.3 tiene prioridad; si no existe, usa evaluación y luego formato legacy."""
+    out = _assessment_time_map(answers or {})
+    profile_row = profile_row or {}
+    raw = profile_row.get("training_time_by_day") if isinstance(profile_row, dict) else None
+    if isinstance(raw, dict):
+        for day, value in raw.items():
+            if day not in DAY_INDEX:
+                continue
+            try:
+                minutes = int(value)
+            except Exception:
+                continue
+            if 15 <= minutes <= 360:
+                out[day] = minutes
+    return out
+
+def training_time_limit_minutes(weekday_or_date, answers=None, profile_row=None):
+    if isinstance(weekday_or_date, (date, datetime)):
+        idx = weekday_or_date.weekday()
+    else:
+        try:
+            idx = int(weekday_or_date)
+        except Exception:
+            return None
+    if idx < 0 or idx > 6:
+        return None
+    return resolved_training_time_map(answers or {}, profile_row or {}).get(DAY_NAMES[idx])
+
+def _session_pace_seconds_for_role(role, pace_profile):
+    key = {"LONG": "long", "QUALITY": "steady", "EASY": "easy", "RECOVERY": "recovery"}.get(str(role or "EASY").upper(), "easy")
+    zone = (pace_profile or {}).get(key)
+    if isinstance(zone, (list, tuple)) and len(zone) == 2:
+        try:
+            return (float(zone[0]) + float(zone[1])) / 2.0
+        except Exception:
+            pass
+    return {"LONG": 405.0, "QUALITY": 375.0, "RECOVERY": 420.0}.get(str(role or "EASY").upper(), 400.0)
+
+def estimate_session_minutes_from_distance(distance_km, role="EASY", pace_profile=None):
+    try:
+        km = max(0.0, float(distance_km or 0))
+    except Exception:
+        km = 0.0
+    if km <= 0:
+        return 0
+    sec_per_km = _session_pace_seconds_for_role(role, pace_profile or {})
+    factor = 1.08 if str(role).upper() == "QUALITY" else 1.03
+    return int(math.ceil((km * sec_per_km / 60.0) * factor))
+
+def max_distance_for_time(minutes, role="EASY", pace_profile=None):
+    try:
+        cap = int(minutes)
+    except Exception:
+        return None
+    if cap < 15:
+        return None
+    sec_per_km = _session_pace_seconds_for_role(role, pace_profile or {})
+    factor = 1.08 if str(role).upper() == "QUALITY" else 1.03
+    return max(1.5, round((cap * 60.0) / (sec_per_km * factor), 1))
+
+def fit_distance_to_time(distance_km, minutes, role="EASY", pace_profile=None):
+    try:
+        km = float(distance_km or 0)
+    except Exception:
+        km = 0.0
+    if not minutes or km <= 0:
+        return km, estimate_session_minutes_from_distance(km, role, pace_profile), False
+    max_km = max_distance_for_time(minutes, role, pace_profile)
+    if max_km is None or km <= max_km:
+        return km, estimate_session_minutes_from_distance(km, role, pace_profile), False
+    fitted = max(1.5, round(max_km, 1))
+    return fitted, min(int(minutes), estimate_session_minutes_from_distance(fitted, role, pace_profile)), True
+
+def session_time_context(session, day_value=None, assessment=None, goal_row=None, profile_row=None):
+    """Duración estimada + límite real del día para planes nuevos, adaptados o antiguos."""
+    session = session or {}
+    day_value = day_value or parse_date_safe(session.get("session_date")) or rcp_today()
+    assessment = assessment or globals().get("LATEST_ASSESSMENT") or {}
+    answers = (assessment or {}).get("answers") or {}
+    goal_row = goal_row or globals().get("ACTIVE_GOAL") or {}
+    profile_row = profile_row or globals().get("profile") or {}
+    try:
+        pace_prof = v7_pace_profile(assessment, goal_row)
+    except Exception:
+        pace_prof = {}
+    kind = workout_kind(session)
+    role = "LONG" if kind == "Larga" else ("QUALITY" if kind in ("Series", "Tempo", "Carrera") else ("RECOVERY" if kind == "Recuperación" else "EASY"))
+    km = float(session.get("planned_km") or 0)
+    estimated = estimate_session_minutes_from_distance(km, role, pace_prof)
+    cap = training_time_limit_minutes(day_value, answers, profile_row)
+    max_km = max_distance_for_time(cap, role, pace_prof) if cap else None
+    return {
+        "estimated_minutes": estimated, "cap_minutes": cap, "fits": (cap is None or estimated <= cap),
+        "max_km": max_km, "role": role,
+    }
+
+def _fit_quality_description_to_time(q, cap_minutes):
+    """Conserva el objetivo fisiológico pero hace que el bloque completo quepa en el tiempo disponible."""
+    if not cap_minutes:
+        return q
+    cap = int(cap_minutes)
+    q = dict(q or {})
+    qtype = str(q.get("type") or "").upper()
+    if cap >= 70:
+        return q
+    warm = 10 if cap <= 45 else 12
+    cool = 8 if cap <= 45 else 10
+    work = max(8, cap - warm - cool - 4)
+    if "CUESTA" in qtype:
+        reps = max(4, min(8, int(work / 2.5)))
+        q["description"] = f"{warm} min suave + {reps} × 45–60 s en subida a la intensidad indicada, recuperando al bajar + {cool} min suave. Duración total objetivo ≤{cap} min; no es sprint."
+    elif qtype in {"INTERVALOS", "INTERVAL"}:
+        reps = max(4, min(8, int(work / 4)))
+        q["description"] = f"{warm} min suave + {reps} × 2 min al esfuerzo indicado / 2 min suave + {cool} min suave. Ajusta la última repetición si hace falta para no superar {cap} min."
+    elif qtype in {"UMBRAL", "TEMPO", "TEMPO_AEROBICO"}:
+        block = max(12, min(30, work))
+        if block >= 20:
+            half = max(8, block // 2)
+            q["description"] = f"{warm} min suave + 2 × {half} min al esfuerzo indicado con 2 min suaves entre bloques + {cool} min suave. Duración total objetivo ≤{cap} min."
+        else:
+            q["description"] = f"{warm} min suave + {block} min sostenidos al esfuerzo indicado + {cool} min suave. Duración total objetivo ≤{cap} min."
+    elif qtype == "FARTLEK":
+        reps = max(4, min(8, int(work / 3)))
+        q["description"] = f"{warm} min suave + {reps} × 1 min ágil / 2 min suave + {cool} min suave. No superes {cap} min totales."
+    else:
+        q["description"] = f"Realiza una versión reducida que incluya calentamiento y enfriamiento y no supere {cap} min totales. Mantén el RPE prescrito; no compenses corriendo más rápido."
+    return q
 
 def _day_gap(a, b):
     """Distancia circular mínima entre dos días de la semana (0..6)."""
@@ -4942,13 +5203,27 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         long_km = _v7_long_distance(weekly_km, answers, goal, phase, w, total_weeks, len(selected_days))
         roles, distances = _v7_allocate_distances(weekly_km, selected_days, long_day, quality_days, long_km, phase, goal, development_focus)
 
+        # V8.1.3 · Antes de construir las sesiones, el volumen de cada día se limita
+        # al tiempo real disponible. El volumen que no cabe NO se redistribuye ni se
+        # apila en otros días: la restricción logística tiene prioridad.
+        _uncapped_weekly_km = float(weekly_km)
+        for _wd in selected_days:
+            _role = roles.get(_wd, "EASY")
+            _cap = training_time_limit_minutes(_wd, answers, globals().get("profile") or {})
+            _fit_km, _, _ = fit_distance_to_time(distances.get(_wd) or 0, _cap, _role, pace_profile)
+            distances[_wd] = round(float(_fit_km or 0), 1)
+        _effective_weekly_km = round(sum(float(distances.get(_wd) or 0) for _wd in selected_days), 1)
+        _effective_long_km = round(float(distances.get(long_day) or long_km), 1)
+
         week_meta.append({
             "week": week_no,
             "phase": phase,
-            "target_km": weekly_km,
-            "long_km": long_km,
+            "target_km": _effective_weekly_km,
+            "uncapped_target_km": round(_uncapped_weekly_km, 1),
+            "long_km": _effective_long_km,
             "quality_sessions": len(quality_days),
             "development_focus": development_focus,
+            "time_limited": _effective_weekly_km < round(_uncapped_weekly_km, 1),
         })
 
         quality_slot = 0
@@ -4963,6 +5238,10 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
 
             distance_km = float(distances.get(weekday) or 0)
             role = roles.get(weekday, "EASY")
+            _time_cap = training_time_limit_minutes(weekday, answers, globals().get("profile") or {})
+            distance_km, _estimated_minutes, _time_capped = fit_distance_to_time(
+                distance_km, _time_cap, role, pace_profile
+            )
 
             _rw_this_week = run_walk_mode and (
                 phase == "BASE"
@@ -4972,10 +5251,14 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 run_min, walk_min, reps = _run_walk_recipe(week_no)
                 if role == "LONG":
                     reps += 1
+                if _time_cap:
+                    _max_reps = max(2, int(max(0, int(_time_cap) - 13) / max(1, run_min + walk_min)))
+                    reps = min(reps, _max_reps)
                 description = (
                     f"5–8 min caminando + {reps} × ({run_min} min trote muy suave / {walk_min} min caminata) "
                     "+ 5 min caminando. El objetivo es acumular tiempo cómodo, no velocidad. "
-                    "Si aparece dolor que cambie la zancada, detén la sesión."
+                    + (f"No superes {_time_cap} min totales. " if _time_cap else "")
+                    + "Si aparece dolor que cambie la zancada, detén la sesión."
                 )
                 rows.append({
                     "user_id": USER_ID,
@@ -4994,6 +5277,8 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
             if role == "LONG":
                 long_target = _target_with_pace("", pace_profile.get("long"), "3–4/10")
                 desc = "Empieza muy suave y mantén conversación completa. En subidas manda el esfuerzo, no el ritmo."
+                if _time_cap:
+                    desc += f" Límite logístico de hoy: máximo {_time_cap} min totales; RCP ya ajustó la distancia para que la sesión quepa en ese tiempo."
                 if development_focus == "CAPACIDAD_AEROBICA" and phase == "DESARROLLO" and week_no % 2 == 0:
                     desc += " Si llegas recuperado, los últimos 10–15 min pueden subir a RPE 4–5; sigue siendo trabajo aeróbico, no ritmo de carrera."
                 if phase == "ESPECÍFICA" and goal in ("21K", "42K") and pace_profile.get("race") and level in ("INTERMEDIO", "AVANZADO"):
@@ -5014,6 +5299,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
 
             if role == "QUALITY":
                 q = _v73_quality_session(development_focus, goal, phase, week_no, quality_slot, pace_profile, level)
+                q = _fit_quality_description_to_time(q, _time_cap)
                 quality_slot += 1
                 rows.append({
                     "user_id": USER_ID,
@@ -5034,6 +5320,8 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
             zone = pace_profile.get("recovery" if is_recovery else "easy")
             target = _target_with_pace("", zone, "2–3/10" if is_recovery else "3–4/10")
             desc = "Muy suave; debe dejarte mejor de lo que empezaste." if is_recovery else "Ritmo conversacional. Mantén técnica relajada y reserva clara al terminar."
+            if _time_cap:
+                desc += f" Tiempo total previsto: ≤{_time_cap} min; no añadas kilómetros si alcanzas ese límite."
             if development_focus == "CAPACIDAD_AEROBICA" and not is_recovery:
                 desc += " Este rodaje es parte central del bloque: no lo aceleres para convertirlo en una sesión moderada."
             # Dos recordatorios de fuerza/semana sin crear una segunda sesión en la misma fecha.
@@ -5093,8 +5381,9 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         "development_focus_guardrail": focus_info.get("guardrail"),
         "selected_days": [DAY_NAMES[d] for d in selected_days],
         "long_day": DAY_NAMES[long_day] if long_day is not None else None,
-        "initial_weekly_km": round(initial_km, 1),
-        "peak_weekly_km": round(max(weekly_volumes) if weekly_volumes else initial_km, 1),
+        "time_limits_minutes": {DAY_NAMES[d]: training_time_limit_minutes(d, answers, globals().get("profile") or {}) for d in selected_days},
+        "initial_weekly_km": round(float((week_meta[0] if week_meta else {}).get("target_km") or initial_km), 1),
+        "peak_weekly_km": round(max([float(x.get("target_km") or 0) for x in week_meta] or [initial_km]), 1),
         "pace_basis": pace_profile.get("basis"),
         "pace_profile": {k: v for k, v in pace_profile.items() if k != "source"},
         "physiology_snapshot": physiological_profile_snapshot(globals().get("profile") or {}),
@@ -5105,6 +5394,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
             "taper": "Reducción progresiva de volumen manteniendo estímulos breves de intensidad antes de carrera.",
             "strength": "Fuerza complementaria sugerida 1–2 veces/semana según fase y tolerancia.",
             "development_focus": "El objetivo fisiológico dominante cambia fases, densidad de calidad y distribución de carga sin sustituir el objetivo competitivo.",
+            "time_availability": "Cada sesión se limita por el tiempo total disponible del día; calentamiento, recuperaciones y enfriamiento deben caber dentro de ese límite. La tirada larga usa el límite específico de su día.",
         },
     }
     return rows, metadata, None
@@ -5664,11 +5954,14 @@ def assessment_form(existing_assessment=None, onboarding=False):
             PERFORMANCE_TERRAINS,
             index=_option_index(PERFORMANCE_TERRAINS, existing_answers.get("recent_mark_terrain"), 0),
         )
-        recent_mark_rpe = st.slider(
-            "Esfuerzo percibido de esa carrera o prueba (RPE, 1–10)",
-            1, 10,
-            int(existing_answers.get("recent_mark_rpe") or 8),
+        recent_mark_rpe = st.selectbox(
+            "Esfuerzo percibido de esa carrera o prueba (RPE)",
+            list(range(1, 11)),
+            index=max(0, min(9, int(existing_answers.get("recent_mark_rpe") or 8) - 1)),
+            format_func=rpe_option_label,
+            help="Elige por sensación y respiración, no por el ritmo alcanzado.",
         )
+        st.caption(rpe_reference(recent_mark_rpe))
 
         st.markdown("### 4 · Lesiones y tolerancia actual")
         i1, i2, i3 = st.columns(3)
@@ -5708,17 +6001,30 @@ def assessment_form(existing_assessment=None, onboarding=False):
             DAY_NAMES,
             default=existing_answers.get("no_intensity_days") or [],
         )
-        t1, t2 = st.columns(2)
-        weekday_time = t1.selectbox(
-            "Tiempo máximo entre semana",
-            TIME_AVAILABLE_OPTIONS,
-            index=_option_index(TIME_AVAILABLE_OPTIONS, existing_answers.get("weekday_time"), 2),
+        st.markdown("#### ⏱️ Tiempo máximo disponible por día")
+        st.caption(
+            "Indica el tiempo TOTAL que puedes dedicar a correr ese día, incluyendo calentamiento, recuperaciones y enfriamiento. "
+            "RCP usará solo los días marcados arriba. La tirada larga puede tener un límite mayor."
         )
-        weekend_time = t2.selectbox(
-            "Tiempo máximo fin de semana",
-            TIME_AVAILABLE_OPTIONS,
-            index=_option_index(TIME_AVAILABLE_OPTIONS, existing_answers.get("weekend_time"), 4),
-        )
+        _existing_time_map = _assessment_time_map(existing_answers)
+        _default_weekday = _time_option_minutes(existing_answers.get("weekday_time")) or 60
+        _default_weekend = _time_option_minutes(existing_answers.get("weekend_time")) or 120
+        daily_time_minutes = {}
+        for _i in range(0, 7, 2):
+            _cols = st.columns(2)
+            for _j, _day in enumerate(DAY_NAMES[_i:_i+2]):
+                _idx = DAY_INDEX[_day]
+                _default_min = int(_existing_time_map.get(_day) or (_default_weekend if _idx >= 5 else _default_weekday))
+                daily_time_minutes[_day] = _cols[_j].number_input(
+                    f"{_day} · máximo (min)",
+                    min_value=15, max_value=360, value=max(15, min(360, _default_min)), step=5,
+                    help="Solo se usa si este día está seleccionado como disponible. Para una tirada larga puedes indicar, por ejemplo, 120–180 min.",
+                    key=f"assessment_time_{_day}",
+                )
+        _weekday_values = [int(daily_time_minutes[d]) for d in DAY_NAMES[:5] if d in available_days]
+        _weekend_values = [int(daily_time_minutes[d]) for d in DAY_NAMES[5:] if d in available_days]
+        weekday_time = f"{max(_weekday_values) if _weekday_values else 60} min"
+        weekend_time = f"{max(_weekend_values) if _weekend_values else 90} min"
 
         st.markdown("### 6 · Objetivo a evaluar")
         st.caption("Este objetivo se usa para estimar preparación durante la evaluación. En V6.3.2 el objetivo deportivo oficial se gestiona aparte en 🎯 Objetivo y no se cambia al reevaluarte.")
@@ -5845,6 +6151,7 @@ def assessment_form(existing_assessment=None, onboarding=False):
         "no_intensity_days": no_intensity_days,
         "weekday_time": weekday_time,
         "weekend_time": weekend_time,
+        "daily_time_minutes": {d: int(daily_time_minutes[d]) for d in available_days if d in daily_time_minutes},
         "goal": goal,
         "goal_style": goal_style,
         "has_goal_race": bool(has_goal_race),
@@ -7484,6 +7791,11 @@ def _find_safe_replan_target(missed_session, missed_day, trigger_day, kind):
         if log and str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
             continue
         if existing and workout_kind(existing) in ("Carrera", "Series", "Tempo", "Larga"):
+            continue
+        _time_ctx_move = session_time_context(
+            missed_session, d, LATEST_ASSESSMENT, ACTIVE_GOAL, profile
+        )
+        if _time_ctx_move.get("cap_minutes") and not _time_ctx_move.get("fits"):
             continue
         radius = 2 if kind == "Larga" else 1
         if _adjacent_hard_conflict(d, ignore_session_id=(existing or {}).get("id"), radius=radius):
@@ -9621,6 +9933,18 @@ if current_page == "Hoy":
             )
             st.markdown(f"## {session_display_name(today_session)}")
             st.markdown(f"**🎯 {today_session.get('target') or 'Por esfuerzo'}**")
+            _rpe_today_ref = rpe_target_reference(today_session.get("target"))
+            if _rpe_today_ref:
+                st.caption("🫁 " + _rpe_today_ref)
+            _time_today = session_time_context(today_session, selected_day, LATEST_ASSESSMENT, ACTIVE_GOAL, profile)
+            if _time_today.get("cap_minutes"):
+                if _time_today.get("fits"):
+                    st.caption(f"⏱️ Duración estimada ~{_time_today['estimated_minutes']} min · tienes hasta {_time_today['cap_minutes']} min disponibles hoy.")
+                else:
+                    st.warning(
+                        f"⏱️ Esta sesión requiere aproximadamente {_time_today['estimated_minutes']} min, pero hoy declaraste un máximo de {_time_today['cap_minutes']} min. "
+                        f"No intentes comprimirla corriendo más rápido; haz como máximo ~{float(_time_today.get('max_km') or 0):g} km o usa la recomendación personalizada de abajo."
+                    )
             _surface_today = session_surface_reference(today_session, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
             _surface_parts = []
             if _surface_today.get("show_pace") and _surface_today.get("pace"):
@@ -9647,6 +9971,11 @@ if current_page == "Hoy":
 
             with st.expander("📋 Cómo hacerlo", expanded=False):
                 st.write(today_session.get("description") or "Sin instrucciones adicionales.")
+                _target_ref = rpe_target_reference(today_session.get("target"))
+                if _target_ref:
+                    st.info(_target_ref)
+            if rpe_target_reference(today_session.get("target")):
+                render_rpe_guide(expanded=False, key_suffix="today")
 
             if today_log:
                 status = str(today_log.get("status") or "").upper()
@@ -9905,6 +10234,9 @@ if current_page == "Hoy":
                 c1.caption(d.strftime("%d/%m"))
                 c2.markdown(f"**{session_display_name(p)}**")
                 c2.caption(f"{workout_kind(p)} · {p.get('target') or 'Por esfuerzo'}")
+                _week_rpe_ref = rpe_target_reference(p.get("target"))
+                if _week_rpe_ref:
+                    c2.caption("🫁 " + _week_rpe_ref)
                 c3.markdown(f"**{float(p.get('planned_km') or 0):g} km**")
                 if c3.button("Abrir", key=f"home_open_{p['id']}", use_container_width=True):
                     set_page("Registro", d)
@@ -10529,7 +10861,10 @@ elif current_page == "Progreso":
                     ss = tt3.number_input("Segundos", 0, 59, 0, 1)
                     duration_sec = int(hh)*3600 + int(mm)*60 + int(ss)
                 tr1, tr2 = st.columns(2)
-                test_rpe = tr1.slider("Esfuerzo al terminar la prueba (RPE)", 1, 10, 8)
+                test_rpe = tr1.selectbox(
+                    "Esfuerzo al terminar la prueba (RPE)", list(range(1, 11)), index=7,
+                    format_func=rpe_option_label,
+                )
                 test_hr = tr2.number_input("FC media opcional", 0, 240, 0, 1)
                 test_notes = st.text_area("Notas opcionales")
                 save_test = st.form_submit_button("Guardar prueba y recalibrar ritmos", use_container_width=True)
@@ -10718,6 +11053,9 @@ elif current_page == "Plan":
                 f"{float(p.get('planned_km') or 0):g} km · {p.get('intensity') or '—'}"
             )
             st.markdown(f"**Objetivo:** {p.get('target') or 'Por esfuerzo'}")
+            _plan_rpe_ref = rpe_target_reference(p.get("target"))
+            if _plan_rpe_ref:
+                st.caption("🫁 " + _plan_rpe_ref)
             _surface_plan = session_surface_reference(p, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
             _surface_plan_parts = []
             if _surface_plan.get("show_pace") and _surface_plan.get("pace"):
@@ -10783,6 +11121,11 @@ elif current_page == "Registro":
                 st.caption(" · ".join(_surface_reg_parts) + f" · {_surface_reg.get('source') or 'RPE'}")
             with st.expander("📋 Instrucciones"):
                 st.write(session.get("description") or "Sin instrucciones adicionales.")
+                _register_target_ref = rpe_target_reference(session.get("target"))
+                if _register_target_ref:
+                    st.info(_register_target_ref)
+            if rpe_target_reference(session.get("target")):
+                render_rpe_guide(expanded=False, key_suffix="register")
 
         if existing and str(existing.get("status") or "").upper() == "OMITIDO" and selected_day > rcp_today():
             st.warning(f"📅 Ausencia planificada para {selected_day.strftime('%d/%m/%Y')}. Puedes cancelarla antes de esa fecha.")
@@ -10807,7 +11150,14 @@ elif current_page == "Registro":
                 value=fmt_time(existing.get("actual_duration_sec"))
                 if existing.get("actual_duration_sec") else "",
             )
-            rpe = r3.slider("Esfuerzo percibido (RPE)", 1, 10, int(existing.get("rpe") or 5))
+            rpe = r3.selectbox(
+                "Esfuerzo percibido (RPE)",
+                list(range(1, 11)),
+                index=max(0, min(9, int(existing.get("rpe") or 5) - 1)),
+                format_func=rpe_option_label,
+                help="Elige por sensación, respiración y capacidad de hablar; no por el ritmo que marcó el reloj.",
+            )
+            st.caption(rpe_reference(rpe))
 
             h1, h2 = st.columns(2)
             avg_hr = h1.number_input("FC media (opcional)", 0, 230, int(existing.get("avg_hr") or 0))
@@ -11042,6 +11392,50 @@ elif current_page == "Perfil":
             st.rerun()
 
     st.divider()
+    st.markdown("### ⏱️ Tiempo disponible para entrenar")
+    st.caption(
+        "RCP limita la duración total de cada sesión al tiempo que realmente tienes ese día. "
+        "La tirada larga puede tener un límite mayor que los entrenamientos normales."
+    )
+    _avail_answers = (LATEST_ASSESSMENT or {}).get("answers") or {}
+    _avail_days = [d for d in (_avail_answers.get("available_days") or []) if d in DAY_NAMES]
+    _resolved_times = resolved_training_time_map(_avail_answers, profile)
+    if not profile_v813_storage_ready():
+        st.warning(
+            "Para editar estos límites directamente desde Perfil ejecuta `supabase_v8_1_3_time_availability.sql`. "
+            "Mientras tanto, RCP seguirá usando la disponibilidad registrada en tu Evaluación RCP."
+        )
+        if _avail_days:
+            st.write(" · ".join(f"**{d}:** {_resolved_times.get(d, '—')} min" for d in _avail_days))
+    elif not _avail_days:
+        st.info("Completa o actualiza tu Evaluación RCP para definir los días en que puedes entrenar.")
+    else:
+        with st.form("profile_time_availability_form"):
+            _new_time_map = {}
+            for _i in range(0, len(_avail_days), 2):
+                _cols = st.columns(2)
+                for _j, _day in enumerate(_avail_days[_i:_i+2]):
+                    _default = int(_resolved_times.get(_day) or (120 if DAY_INDEX[_day] >= 5 else 60))
+                    _new_time_map[_day] = _cols[_j].number_input(
+                        f"{_day} · máximo total", 15, 360, max(15, min(360, _default)), 5,
+                        help="Minutos totales disponibles, incluyendo calentamiento, recuperaciones y enfriamiento.",
+                        key=f"profile_time_{_day}",
+                    )
+            _long_name = str(_avail_answers.get("preferred_long_day") or "")
+            if _long_name in _new_time_map:
+                st.info(f"🏃 Tirada larga preferida: **{_long_name}** · límite actual **{int(_new_time_map[_long_name])} min**. Puedes darle más tiempo que al resto de los días.")
+            save_time_availability = st.form_submit_button("💾 Guardar tiempo disponible", use_container_width=True)
+        if save_time_availability:
+            update_profile_fields({
+                "training_time_by_day": {k: int(v) for k, v in _new_time_map.items()},
+                "availability_updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            st.success("Disponibilidad horaria actualizada. Los planes nuevos y las reorganizaciones respetarán estos límites.")
+            if ACTIVE_PLAN:
+                st.info("Tu plan activo no se borra automáticamente. Si alguna sesión existente supera el nuevo límite, RCP lo señalará en Hoy; al regenerar el plan se ajustará desde el origen.")
+            st.rerun()
+
+    st.divider()
     st.markdown("### 🧬 Datos personales y fisiológicos")
     st.caption(
         "Estos datos caracterizan mejor al corredor. En V7.4 se guardan como contexto técnico; "
@@ -11255,6 +11649,10 @@ elif current_page == "Perfil":
                     use_container_width=True,
                     hide_index=True,
                 )
+
+        st.markdown("### 🫁 Referencia de esfuerzo RPE")
+        st.caption("La app usa esta misma escala al prescribir y al registrar sesiones. No interpretes el número sin la sensación y la prueba del habla.")
+        render_rpe_guide(expanded=False, key_suffix="profile")
 
         st.markdown("### 🎚️ Aprendizaje personal de ritmo y esfuerzo")
         st.caption(
