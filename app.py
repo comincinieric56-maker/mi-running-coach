@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.3"
+APP_VERSION = "8.1.4"
 
 
 # ============================================================
@@ -4533,6 +4533,145 @@ def _fit_quality_description_to_time(q, cap_minutes):
         q["description"] = f"Realiza una versión reducida que incluya calentamiento y enfriamiento y no supere {cap} min totales. Mantén el RPE prescrito; no compenses corriendo más rápido."
     return q
 
+
+def _clean_existing_time_limit_text(text):
+    """Elimina notas horarias antiguas para que un nuevo límite no deje mensajes contradictorios."""
+    out = str(text or "").strip()
+    patterns = [
+        r"\s*Límite logístico de hoy: máximo \d+ min totales; RCP ya ajustó la distancia para que la sesión quepa en ese tiempo\.",
+        r"\s*Tiempo total previsto: ≤\d+ min; no añadas kilómetros si alcanzas ese límite\.",
+        r"\s*⏱️ Límite de tiempo: máximo \d+ min totales\. No compenses aumentando el ritmo\.",
+        r"\s*No superes \d+ min totales\.",
+    ]
+    for pat in patterns:
+        out = re.sub(pat, "", out, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def _time_limited_session_fields(session, cap_minutes, assessment=None, goal_row=None):
+    """Hace que una sesión existente respete el techo horario sin aumentar carga."""
+    session = dict(session or {})
+    try:
+        cap = int(cap_minutes)
+    except Exception:
+        return {}
+    if cap < 15:
+        return {}
+
+    kind = workout_kind(session)
+    if kind in {"Carrera", "Fuerza"}:
+        return {}
+    try:
+        km = float(session.get("planned_km") or 0)
+    except Exception:
+        km = 0.0
+    if km <= 0:
+        return {}
+
+    assessment = assessment or globals().get("LATEST_ASSESSMENT") or {}
+    goal_row = goal_row or globals().get("ACTIVE_GOAL") or {}
+    try:
+        pace_prof = v7_pace_profile(assessment, goal_row)
+    except Exception:
+        pace_prof = {}
+
+    role = "LONG" if kind == "Larga" else ("QUALITY" if kind in ("Series", "Tempo") else ("RECOVERY" if "RECUP" in str(session.get("workout_type") or "").upper() else "EASY"))
+    fitted_km, _, was_capped = fit_distance_to_time(km, cap, role, pace_prof)
+    new_km = min(km, float(fitted_km or km))
+    fields = {}
+    if new_km < km - 0.049:
+        fields["planned_km"] = round(new_km, 1)
+
+    base_desc = _clean_existing_time_limit_text(session.get("description"))
+    if kind in ("Series", "Tempo"):
+        q = {
+            "type": session.get("workout_type"),
+            "name": session.get("workout_name"),
+            "target": session.get("target"),
+            "intensity": session.get("intensity"),
+            "description": base_desc,
+        }
+        q2 = _fit_quality_description_to_time(q, cap)
+        new_desc = str(q2.get("description") or base_desc).strip()
+        if was_capped and f"{cap} min" not in new_desc:
+            new_desc = (new_desc + f" ⏱️ Límite de tiempo: máximo {cap} min totales. No compenses aumentando el ritmo.").strip()
+    else:
+        new_desc = base_desc
+        if was_capped:
+            new_desc = (new_desc + f" ⏱️ Límite de tiempo: máximo {cap} min totales. No compenses aumentando el ritmo.").strip()
+
+    if new_desc != str(session.get("description") or "").strip():
+        fields["description"] = new_desc
+
+    if "planned_km" in fields:
+        shown = fields["planned_km"]
+        if kind == "Larga":
+            fields["workout_name"] = f"Tirada larga {shown:g} km"
+        elif kind == "Rodaje":
+            is_rec = "RECUP" in f"{session.get('workout_type') or ''} {session.get('workout_name') or ''}".upper()
+            fields["workout_name"] = f"{'Recuperación' if is_rec else 'Rodaje suave'} {shown:g} km"
+
+    return fields
+
+
+def enforce_time_limits_on_active_plan(time_map=None, from_day=None):
+    """Corrige las sesiones pendientes del plan ACTIVO según el tiempo disponible por día."""
+    active = globals().get("ACTIVE_PLAN") or {}
+    if not active.get("id"):
+        return 0, []
+    from_day = from_day or rcp_today()
+    assessment = globals().get("LATEST_ASSESSMENT") or {}
+    answers = (assessment or {}).get("answers") or {}
+    profile_row = globals().get("profile") or {}
+    if time_map is None:
+        time_map = resolved_training_time_map(answers, profile_row)
+    clean_map = {}
+    for day, value in (time_map or {}).items():
+        if day not in DAY_INDEX:
+            continue
+        try:
+            value = int(value)
+        except Exception:
+            continue
+        if 15 <= value <= 360:
+            clean_map[day] = value
+    if not clean_map:
+        return 0, []
+
+    plan_rows = get_plan(active["id"])
+    log_rows = get_logs(active["id"])
+    log_map = {str(x.get("session_date")): x for x in log_rows}
+    changed_dates = []
+    for sess in plan_rows:
+        d = parse_date_safe(sess.get("session_date"))
+        if not d or d < from_day:
+            continue
+        status = str((log_map.get(str(sess.get("session_date"))) or {}).get("status") or "").upper()
+        if status in {"COMPLETADO", "MODIFICADO", "OMITIDO"}:
+            continue
+        if workout_kind(sess) == "Carrera":
+            continue
+        cap = clean_map.get(DAY_NAMES[d.weekday()])
+        if not cap:
+            continue
+        fields = _time_limited_session_fields(sess, cap, assessment, globals().get("ACTIVE_GOAL") or {})
+        real = {}
+        for key, value in fields.items():
+            old = sess.get(key)
+            if key == "planned_km":
+                try:
+                    if abs(float(old or 0) - float(value or 0)) >= 0.049:
+                        real[key] = value
+                except Exception:
+                    real[key] = value
+            elif str(old or "").strip() != str(value or "").strip():
+                real[key] = value
+        if not real:
+            continue
+        update_plan_session_fields(sess.get("id"), **real)
+        changed_dates.append(d.isoformat())
+    return len(changed_dates), changed_dates
+
 def _day_gap(a, b):
     """Distancia circular mínima entre dos días de la semana (0..6)."""
     d = abs(int(a) - int(b))
@@ -5203,7 +5342,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         long_km = _v7_long_distance(weekly_km, answers, goal, phase, w, total_weeks, len(selected_days))
         roles, distances = _v7_allocate_distances(weekly_km, selected_days, long_day, quality_days, long_km, phase, goal, development_focus)
 
-        # V8.1.3 · Antes de construir las sesiones, el volumen de cada día se limita
+        # V8.1.4 · Antes de construir las sesiones, el volumen de cada día se limita
         # al tiempo real disponible. El volumen que no cabe NO se redistribuye ni se
         # apila en otros días: la restricción logística tiene prioridad.
         _uncapped_weekly_km = float(weekly_km)
@@ -9037,6 +9176,24 @@ rpes = [float(x["rpe"]) for x in completed if x.get("rpe") is not None]
 avg_rpe = sum(rpes) / len(rpes) if rpes else None
 
 render_goal_hero()
+
+# V8.1.4 · Si los límites ya estaban guardados desde V8.1.3, el plan activo
+# se sincroniza automáticamente una vez por sesión/app/actualización de disponibilidad.
+# Solo reduce sesiones pendientes; nunca toca sesiones realizadas ni la carrera objetivo.
+try:
+    if ACTIVE_PLAN:
+        _time_sync_key = f"{ACTIVE_PLAN.get('id')}|{profile.get('availability_updated_at') or ''}|{APP_VERSION}"
+        if st.session_state.get("rcp_time_sync_key") != _time_sync_key:
+            _auto_time_changed, _auto_time_dates = enforce_time_limits_on_active_plan()
+            st.session_state["rcp_time_sync_key"] = _time_sync_key
+            if _auto_time_changed:
+                st.session_state["rcp_time_limit_notice"] = (
+                    f"RCP ajustó {_auto_time_changed} sesión(es) pendiente(s) para respetar tu tiempo disponible por día."
+                )
+                st.rerun()
+except Exception:
+    pass
+
 render_icon_navigation()
 st.divider()
 
@@ -11379,6 +11536,8 @@ elif current_page == "Perfil":
         "El objetivo deportivo se gestiona en 🎯 Objetivo. "
         "Editar tu identidad no regenera ni elimina el plan."
     )
+    if st.session_state.get("rcp_time_limit_notice"):
+        st.success(st.session_state.pop("rcp_time_limit_notice"))
 
     with st.form("profile_identity_form"):
         display_name = st.text_input("Nombre", value=str(profile.get("display_name") or ""))
@@ -11426,13 +11585,16 @@ elif current_page == "Perfil":
                 st.info(f"🏃 Tirada larga preferida: **{_long_name}** · límite actual **{int(_new_time_map[_long_name])} min**. Puedes darle más tiempo que al resto de los días.")
             save_time_availability = st.form_submit_button("💾 Guardar tiempo disponible", use_container_width=True)
         if save_time_availability:
+            _saved_time_map = {k: int(v) for k, v in _new_time_map.items()}
             update_profile_fields({
-                "training_time_by_day": {k: int(v) for k, v in _new_time_map.items()},
+                "training_time_by_day": _saved_time_map,
                 "availability_updated_at": datetime.now(timezone.utc).isoformat(),
             })
-            st.success("Disponibilidad horaria actualizada. Los planes nuevos y las reorganizaciones respetarán estos límites.")
-            if ACTIVE_PLAN:
-                st.info("Tu plan activo no se borra automáticamente. Si alguna sesión existente supera el nuevo límite, RCP lo señalará en Hoy; al regenerar el plan se ajustará desde el origen.")
+            _changed, _changed_dates = enforce_time_limits_on_active_plan(_saved_time_map, rcp_today()) if ACTIVE_PLAN else (0, [])
+            if _changed:
+                st.session_state["rcp_time_limit_notice"] = f"Tiempo disponible guardado. RCP ajustó {_changed} sesión(es) pendiente(s) del plan activo para que respeten tus límites."
+            else:
+                st.session_state["rcp_time_limit_notice"] = "Tiempo disponible guardado. Las sesiones pendientes ya respetan esos límites."
             st.rerun()
 
     st.divider()
