@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.5"
+APP_VERSION = "8.1.6"
 
 
 # ============================================================
@@ -1009,6 +1009,121 @@ def profile_v813_storage_ready():
         return False
 
 
+
+def extra_sessions_storage_ready():
+    """V8.1.5: sesiones adicionales manuales, separadas del plan base."""
+    try:
+        (
+            client.table("rc_extra_sessions")
+            .select("id,user_id,plan_id,session_date,workout_type,planned_minutes,planned_km,target_rpe")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_extra_sessions(plan_id=None, start_date=None, end_date=None):
+    """Obtiene entrenamientos adicionales del plan activo sin convertirlos en sesiones del plan."""
+    if not extra_sessions_storage_ready():
+        return []
+    active = get_active_plan_record() if plan_id is None else {"id": plan_id}
+    if not active or not active.get("id"):
+        return []
+    try:
+        q = (
+            client.table("rc_extra_sessions")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .eq("plan_id", int(active["id"]))
+            .order("session_date")
+        )
+        if start_date:
+            q = q.gte("session_date", str(start_date))
+        if end_date:
+            q = q.lte("session_date", str(end_date))
+        return q.execute().data or []
+    except Exception:
+        return []
+
+
+def save_extra_session(payload):
+    """Crea/edita una sesión adicional. Nunca escribe en rc_plan_sessions."""
+    payload = dict(payload or {})
+    active = get_active_plan_record()
+    if not active or not active.get("id"):
+        raise RuntimeError("No existe un plan activo para asociar el entrenamiento adicional.")
+    session_date = str(payload.get("session_date") or "")
+    if not session_date:
+        raise ValueError("Falta la fecha del entrenamiento adicional.")
+    payload["user_id"] = USER_ID
+    payload["plan_id"] = int(active["id"])
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_extra_sessions").upsert(
+        payload, on_conflict="user_id,plan_id,session_date"
+    ).execute()
+
+
+def delete_extra_session(extra_id, session_date=None, delete_training_log=True):
+    """Elimina solo el adicional. Opcionalmente limpia su registro real del mismo día."""
+    if extra_id is None:
+        return
+    client.table("rc_extra_sessions").delete().eq("user_id", USER_ID).eq("id", int(extra_id)).execute()
+    if delete_training_log and session_date:
+        # Solo se usa en días sin sesión del plan; así no toca un registro planificado.
+        if str(session_date) not in globals().get("PLAN_BY_DATE", {}):
+            try:
+                delete_log(str(session_date))
+            except Exception:
+                pass
+
+
+def extra_session_to_session(extra):
+    """Adaptador para reutilizar RPE, carga y lenguaje de sesión sin alterar el plan."""
+    extra = extra or {}
+    label = str(extra.get("workout_type") or "Rodaje suave")
+    upper = label.upper()
+    if "RECUP" in upper:
+        wtype = "Recuperación"
+        wname = "Recuperación adicional"
+    elif "CAMIN" in upper:
+        wtype = "Rodaje"
+        wname = "Caminata / trote adicional"
+    else:
+        wtype = "Rodaje"
+        wname = "Rodaje suave adicional"
+    km = float(extra.get("planned_km") or 0)
+    minutes = int(extra.get("planned_minutes") or 0)
+    target_rpe = int(extra.get("target_rpe") or 3)
+    return {
+        "id": None,
+        "plan_id": extra.get("plan_id"),
+        "session_date": extra.get("session_date"),
+        "week_no": _week_no_for_date(parse_date_safe(extra.get("session_date")) or rcp_today(), 1)
+            if "_week_no_for_date" in globals() else 1,
+        "workout_type": wtype,
+        "workout_name": wname,
+        "planned_km": km,
+        "target": f"RPE {target_rpe}/10 · {minutes} min",
+        "intensity": f"RPE {target_rpe}/10",
+        "description": str(extra.get("notes") or ""),
+        "is_extra": True,
+        "extra_session_id": extra.get("id"),
+        "planned_minutes": minutes,
+        "target_rpe": target_rpe,
+    }
+
+
+def extra_session_status_label(extra, log=None):
+    log = log or {}
+    status = str(log.get("status") or "").upper()
+    if status in ("COMPLETADO", "MODIFICADO"):
+        return "✅ Realizado"
+    return "🟦 Opcional"
+
+
 def profile_v763_storage_ready():
     """Comprueba que el perfil ya puede guardar la preferencia de superficie."""
     try:
@@ -1113,6 +1228,10 @@ def pace_rpe_calibration_samples(surface="CAMINADORA", days=120):
             continue
 
         session = session_by_id.get(int(log.get("plan_session_id") or 0), {})
+        if not session:
+            _extra = globals().get("EXTRA_BY_DATE", {}).get(str(log.get("session_date"))) or {}
+            if _extra:
+                session = extra_session_to_session(_extra)
         zone = _session_zone_key(session)
         if zone in {"interval", "threshold", "race"}:
             continue
@@ -1732,132 +1851,6 @@ def insert_plan_sessions(plan_id, rows):
         row["plan_id"] = int(plan_id)
         prepared.append(row)
     client.table("rc_plan_sessions").insert(prepared).execute()
-
-
-# ============================================================
-# V8.1.5 · Trote extra opcional en días libres
-# ============================================================
-def session_is_user_extra(session):
-    session = session or {}
-    kind = str(session.get("workout_type") or "").upper()
-    name = str(session.get("workout_name") or "").upper()
-    return kind == "RODAJE_EXTRA" or "TROTE EXTRA" in name
-
-
-def _week_no_for_extra_day(day_value):
-    """Asocia el extra a la semana de calendario del plan sin alterar las sesiones base."""
-    day_value = parse_date_safe(day_value) if not isinstance(day_value, date) else day_value
-    if not day_value:
-        return 1
-    same_week = []
-    monday = day_value - timedelta(days=day_value.weekday())
-    sunday = monday + timedelta(days=6)
-    for row in globals().get("PLAN", []) or []:
-        d = parse_date_safe(row.get("session_date"))
-        if d and monday <= d <= sunday and not session_is_user_extra(row):
-            try:
-                same_week.append(int(row.get("week_no") or 0))
-            except Exception:
-                pass
-    same_week = [x for x in same_week if x > 0]
-    if same_week:
-        return max(set(same_week), key=same_week.count)
-    nearest = []
-    for row in globals().get("PLAN", []) or []:
-        if session_is_user_extra(row):
-            continue
-        d = parse_date_safe(row.get("session_date"))
-        if d:
-            nearest.append((abs((d-day_value).days), int(row.get("week_no") or 1)))
-    return min(nearest)[1] if nearest else 1
-
-
-def _extra_adjacent_constraint(day_value):
-    """Evita convertir un día libre en una segunda sesión exigente pegada a calidad/larga."""
-    day_value = parse_date_safe(day_value) if not isinstance(day_value, date) else day_value
-    if not day_value:
-        return 60, None
-    nearby = []
-    for row in globals().get("PLAN", []) or []:
-        if session_is_user_extra(row):
-            continue
-        d = parse_date_safe(row.get("session_date"))
-        if not d:
-            continue
-        gap = abs((d-day_value).days)
-        if gap != 1:
-            continue
-        kind = workout_kind(row)
-        if kind in {"Series", "Tempo", "Larga", "Carrera"}:
-            nearby.append((kind, d, session_display_name(row)))
-    if nearby:
-        kind, d, name = sorted(nearby, key=lambda x: x[1])[0]
-        return 30, f"Hay una sesión exigente el {d.strftime('%d/%m')} ({name}). Por eso el extra se limita a 30 min muy suaves."
-    return 60, None
-
-
-def create_user_extra_session(day_value, duration_minutes, rpe_target=3):
-    """Añade un rodaje opcional sin mover ni sustituir ninguna sesión del plan base."""
-    if not ACTIVE_PLAN:
-        return False, "No existe un plan activo."
-    day_value = parse_date_safe(day_value) if not isinstance(day_value, date) else day_value
-    if not day_value:
-        return False, "Fecha inválida."
-    if PLAN_BY_DATE.get(day_value.isoformat()):
-        return False, "Ese día ya tiene una sesión programada."
-    if day_value < rcp_today():
-        return False, "El trote extra se puede programar para hoy o una fecha futura."
-
-    adjacent_cap, _ = _extra_adjacent_constraint(day_value)
-    answers = (LATEST_ASSESSMENT or {}).get("answers") or {}
-    declared_cap = training_time_limit_minutes(day_value, answers, profile)
-    effective_cap = min([x for x in [60, adjacent_cap, declared_cap] if x])
-    duration = max(15, min(int(duration_minutes or 30), int(effective_cap)))
-    try:
-        pace_prof = v7_pace_profile(LATEST_ASSESSMENT, ACTIVE_GOAL)
-    except Exception:
-        pace_prof = {}
-    # El extra se prescribe por tiempo; km es una referencia conservadora para que el resto de la app pueda mostrarlo.
-    max_km = max_distance_for_time(duration, "RECOVERY", pace_prof) or 3.0
-    planned_km = max(1.5, round(float(max_km) * 0.92, 1))
-    rpe_target = max(2, min(4, int(rpe_target or 3)))
-    target_hi = min(4, rpe_target + 1)
-    target = f"RPE {rpe_target}–{target_hi}/10 · conversación cómoda"
-    desc = (
-        f"Trote adicional voluntario de máximo {duration} min. Mantén RPE {rpe_target}–{target_hi}/10 y conversación cómoda. "
-        "No es una sesión para recuperar kilómetros perdidos ni para añadir intensidad. Detente antes si las piernas se sienten pesadas, "
-        "si aparece dolor o si el esfuerzo deja de ser fácil. El plan original permanece sin cambios."
-    )
-    row = {
-        "user_id": USER_ID,
-        "plan_id": int(ACTIVE_PLAN["id"]),
-        "session_date": day_value.isoformat(),
-        "week_no": _week_no_for_extra_day(day_value),
-        "workout_type": "RODAJE_EXTRA",
-        "workout_name": f"Trote extra opcional · {duration} min",
-        "planned_km": planned_km,
-        "target": target,
-        "intensity": "OPCIONAL",
-        "description": desc,
-        "is_optional": True,
-    }
-    try:
-        result = client.table("rc_plan_sessions").insert(row).execute().data or []
-        return bool(result), ("Trote extra agregado sin modificar el plan original." if result else "No fue posible crear el trote extra.")
-    except Exception as exc:
-        return False, f"No fue posible crear el trote extra: {exc}"
-
-
-def delete_user_extra_session(session):
-    if not session_is_user_extra(session):
-        return False, "Esta sesión no es un trote extra."
-    if LOG_BY_DATE.get(str(session.get("session_date"))):
-        return False, "Ya existe un registro para este trote. Elimina primero el registro si realmente deseas quitarlo."
-    try:
-        delete_plan_session_by_id(session.get("id"))
-        return True, "Trote extra eliminado. El plan original no cambió."
-    except Exception as exc:
-        return False, f"No fue posible eliminar el trote extra: {exc}"
 
 
 def get_assessments(limit=20):
@@ -3069,6 +3062,10 @@ def _v81_history(days=210):
     for d,l in parsed_logs:
         sid=int(l.get("plan_session_id") or 0)
         sess=sess_by_id.get(sid) or sess_by_plan_date.get((int(l.get("plan_id") or 0),str(l.get("session_date")))) or {}
+        if not sess:
+            _extra = globals().get("EXTRA_BY_DATE", {}).get(str(l.get("session_date"))) or {}
+            if _extra:
+                sess = extra_session_to_session(_extra)
         candidates=ready_by_date.get(d.isoformat(),[])
         rr=next((x for x in candidates if int(x.get("plan_id") or 0)==int(l.get("plan_id") or 0)), candidates[0] if candidates else {})
         # Carga previa 7d relativa a los 28d anteriores, usando solo información anterior a la sesión.
@@ -7210,14 +7207,21 @@ PLAN = get_plan(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 LOGS = get_logs(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 PLAN_BY_DATE = {str(x["session_date"]): x for x in PLAN}
 
-# Solo los registros asociados al plan ACTIVE alimentan KPI y gráficos.
+# V8.1.5 · Los entrenamientos adicionales viven fuera del plan base.
+EXTRA_READY = extra_sessions_storage_ready()
+EXTRA_SESSIONS = get_extra_sessions(ACTIVE_PLAN["id"]) if EXTRA_READY and ACTIVE_PLAN else []
+EXTRA_BY_DATE = {str(x.get("session_date")): x for x in EXTRA_SESSIONS}
+_VALID_TRAINING_DATES = set(PLAN_BY_DATE) | set(EXTRA_BY_DATE)
+
+# Los registros reales del plan activo y de adicionales válidos alimentan carga/KPI.
+# Un adicional nunca mejora el cumplimiento del plan: solo suma carga/volumen real.
 CURRENT_LOGS = [
     x for x in LOGS
-    if str(x.get("session_date")) in PLAN_BY_DATE
+    if str(x.get("session_date")) in _VALID_TRAINING_DATES
 ]
 ORPHAN_LOGS = get_unassigned_logs() + [
     x for x in LOGS
-    if str(x.get("session_date")) not in PLAN_BY_DATE
+    if str(x.get("session_date")) not in _VALID_TRAINING_DATES
 ]
 LOG_BY_DATE = {str(x["session_date"]): x for x in CURRENT_LOGS}
 
@@ -7388,6 +7392,7 @@ def readiness_session_guidance(readiness_row, session):
     illness = bool(rr.get("illness"))
     gait = bool(rr.get("pain_changes_gait"))
     planned = float((session or {}).get("planned_km") or 0)
+    is_extra = bool((session or {}).get("is_extra"))
 
     if not session:
         if illness or gait or pain >= 7:
@@ -7402,6 +7407,10 @@ def readiness_session_guidance(readiness_row, session):
     if status == "GREEN":
         rlo, rhi = expected_rpe_range(session)
         km_txt = f" {planned:.1f} km" if planned > 0 else ""
+        if is_extra:
+            minutes = int((session or {}).get("planned_minutes") or 0)
+            time_txt = f" durante {minutes} min" if minutes else ""
+            return f"Si decides hacer el entrenamiento adicional, mantenlo fácil{time_txt}{km_txt and f' (aprox.{km_txt})'} a RPE {rlo}–{rhi}/10. No lo conviertas en una sesión de calidad."
         return f"Haz la sesión prevista:{km_txt} de {kind.lower()}, manteniendo el esfuerzo alrededor de RPE {rlo}–{rhi}/10 y sin añadir volumen extra."
 
     if status == "YELLOW":
@@ -8052,6 +8061,9 @@ def _find_safe_replan_target(missed_session, missed_day, trigger_day, kind):
         if d.weekday() not in available:
             continue
         existing = _session_on_date(d)
+        if globals().get("EXTRA_BY_DATE", {}).get(d.isoformat()):
+            # Un adicional manual ocupa ese hueco sin formar parte del plan base.
+            continue
         log = _logged_on_date(d)
         if log and str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO", "OMITIDO"):
             continue
@@ -8717,6 +8729,18 @@ def weekly_review_snapshot(day_value):
         if log.get("post_fatigue") is not None:
             post_fatigues.append(int(log.get("post_fatigue")))
 
+    # Los adicionales no mejoran adherencia ni km del plan, pero sus señales de
+    # recuperación sí deben contar para seguridad semanal.
+    for _dstr, _elog in local_logs.items():
+        if _dstr not in globals().get("EXTRA_BY_DATE", {}):
+            continue
+        if str(_elog.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
+            continue
+        if _elog.get("post_pain") is not None:
+            post_pains.append(int(_elog.get("post_pain")))
+        if _elog.get("post_fatigue") is not None:
+            post_fatigues.append(int(_elog.get("post_fatigue")))
+
     readiness = [
         r for r in READINESS_ROWS
         if (d := parse_date_safe(r.get("checkin_date"))) and monday <= d <= sunday
@@ -9141,10 +9165,14 @@ def all_weekly_stats():
     for log in CURRENT_LOGS:
         if str(log.get("status") or "").upper() not in ("COMPLETADO", "MODIFICADO"):
             continue
+        _log_date = parse_date_safe(log.get("session_date"))
         p = PLAN_BY_DATE.get(str(log.get("session_date")))
-        if not p:
+        if p:
+            week = int(p.get("week_no") or 0)
+        elif _log_date and str(log.get("session_date")) in EXTRA_BY_DATE:
+            week = _week_no_for_date(_log_date, 0)
+        else:
             continue
-        week = int(p.get("week_no") or 0)
         item = weekly.get(week)
         if not item:
             continue
@@ -10089,6 +10117,8 @@ if current_page == "Hoy":
         render_timezone_plan_repair("home")
 
     today_session = PLAN_BY_DATE.get(selected_day.isoformat())
+    today_extra = EXTRA_BY_DATE.get(selected_day.isoformat()) if EXTRA_READY else None
+    today_context_session = today_session or (extra_session_to_session(today_extra) if today_extra else None)
     today_log = LOG_BY_DATE.get(selected_day.isoformat())
 
     # V7.1.1 · Estado para entrenar compacto. El formulario permanece cerrado por defecto.
@@ -10098,7 +10128,7 @@ if current_page == "Hoy":
         st.markdown("### 🧠 Estado de hoy")
         if existing_ready:
             st.markdown(
-                readiness_summary_html(existing_ready, today_session),
+                readiness_summary_html(existing_ready, today_context_session),
                 unsafe_allow_html=True,
             )
             checkin_label = "✏️ Actualizar registro diario"
@@ -10186,61 +10216,143 @@ if current_page == "Hoy":
 
     with st.container(border=True):
         if not today_session:
-            st.markdown("### 😴 Recuperación")
-            st.write("No hay una sesión programada para esta fecha.")
-            future = [
-                p for p in PLAN
-                if (d := parse_date_safe(p.get("session_date"))) and d > selected_day and not session_is_user_extra(p)
-            ]
-            if future:
-                nxt = future[0]
-                nxt_day = parse_date_safe(nxt["session_date"])
-                st.info(
-                    f"Próxima sesión: **{nxt_day.strftime('%d/%m')} · {session_display_name(nxt)} · "
-                    f"{float(nxt.get('planned_km') or 0):g} km**"
-                )
-
-            if selected_day >= rcp_today():
-                st.divider()
-                st.markdown("#### ➕ ¿Quieres trotar este día libre?")
-                st.caption(
-                    "Puedes añadir un trote extra opcional. No mueve ni sustituye ninguna sesión del plan y no se usa para 'pagar' un entrenamiento perdido."
-                )
-                _extra_cap, _extra_warning = _extra_adjacent_constraint(selected_day)
-                _declared_extra_cap = training_time_limit_minutes(
-                    selected_day, (LATEST_ASSESSMENT or {}).get("answers") or {}, profile
-                )
-                _extra_max = min([x for x in [60, _extra_cap, _declared_extra_cap] if x])
-                if _extra_warning:
-                    st.warning(_extra_warning)
-                with st.form(f"extra_run_form_{selected_day.isoformat()}"):
-                    _extra_minutes = st.slider(
-                        "¿Cuánto tiempo quieres trotar?", 15, int(max(15, _extra_max)),
-                        min(30, int(max(15, _extra_max))), 5,
-                        help="El extra se prescribe por tiempo para evitar que un día libre se convierta en una sesión larga improvisada.",
+            if today_extra:
+                _extra_view = extra_session_to_session(today_extra)
+                _extra_log = LOG_BY_DATE.get(selected_day.isoformat()) or {}
+                st.markdown("### 🏃 Entrenamiento adicional")
+                st.caption("Opcional · no modifica, mueve ni reemplaza ninguna sesión del plan base.")
+                st.markdown(f"## {str(today_extra.get('workout_type') or 'Rodaje suave')}")
+                _ex1, _ex2, _ex3 = st.columns(3)
+                _ex1.metric("Tiempo", f"{int(today_extra.get('planned_minutes') or 0)} min")
+                _ex2.metric("Distancia", "Por tiempo" if not float(today_extra.get('planned_km') or 0) else f"{float(today_extra.get('planned_km') or 0):g} km")
+                _ex3.metric("Esfuerzo", f"RPE {int(today_extra.get('target_rpe') or 3)}/10")
+                st.caption(rpe_reference(int(today_extra.get("target_rpe") or 3)))
+                if today_extra.get("notes"):
+                    st.write(str(today_extra.get("notes")))
+                st.info("Este entrenamiento suma a tu carga y kilómetros reales, pero no cuenta como cumplimiento de una sesión que hayas omitido otro día.")
+                e1, e2 = st.columns(2)
+                if e1.button("✅ Registrar entrenamiento adicional", type="primary", use_container_width=True, key=f"extra_register_home_{today_extra.get('id')}"):
+                    set_page("Registro", selected_day)
+                    st.rerun()
+                if e2.button("🗑️ Quitar adicional", use_container_width=True, key=f"extra_delete_home_{today_extra.get('id')}"):
+                    delete_extra_session(today_extra.get("id"), selected_day.isoformat(), delete_training_log=True)
+                    st.session_state["rcp_saved_notice"] = "Entrenamiento adicional eliminado. El plan base no cambió."
+                    st.rerun()
+            else:
+                st.markdown("### 😴 Recuperación")
+                st.write("No hay una sesión programada para esta fecha.")
+                future = [
+                    p for p in PLAN
+                    if (d := parse_date_safe(p.get("session_date"))) and d > selected_day
+                ]
+                if future:
+                    nxt = future[0]
+                    nxt_day = parse_date_safe(nxt["session_date"])
+                    st.info(
+                        f"Próxima sesión: **{nxt_day.strftime('%d/%m')} · {session_display_name(nxt)} · "
+                        f"{float(nxt.get('planned_km') or 0):g} km**"
                     )
-                    _extra_rpe = st.select_slider(
-                        "Esfuerzo objetivo", options=[2, 3, 4], value=3,
-                        format_func=lambda x: f"RPE {x}/10 · {rpe_reference(x)}",
-                    )
-                    _add_extra = st.form_submit_button("➕ Añadir trote extra", use_container_width=True)
-                if _add_extra:
-                    _ok, _msg = create_user_extra_session(selected_day, _extra_minutes, _extra_rpe)
-                    (st.success if _ok else st.error)(_msg)
-                    if _ok:
+                    c1, c2 = st.columns(2)
+                    if c1.button("📅 Ver semana", use_container_width=True):
+                        set_page("Semana", nxt_day)
+                        st.rerun()
+                    if c2.button("🗓️ Ver plan", use_container_width=True):
+                        set_page("Plan")
                         st.rerun()
 
-            c1, c2 = st.columns(2)
-            if c1.button("📅 Ver semana", use_container_width=True):
-                set_page("Semana", selected_day)
-                st.rerun()
-            if c2.button("🗓️ Ver plan", use_container_width=True):
-                set_page("Plan")
-                st.rerun()
+                if EXTRA_READY:
+                    with st.expander("➕ Añadir entrenamiento adicional", expanded=False):
+                        st.caption(
+                            "Úsalo cuando excepcionalmente tengas tiempo en un día libre. "
+                            "No mueve ni borra el plan; si omitiste otra sesión, esa omisión seguirá registrada."
+                        )
+                        _extra_ready_row = READINESS_BY_DATE.get(selected_day.isoformat()) or {}
+                        _extra_blocked = (
+                            selected_day == rcp_today()
+                            and (
+                                bool(_extra_ready_row.get("illness"))
+                                or bool(_extra_ready_row.get("pain_changes_gait"))
+                                or int(_extra_ready_row.get("pain") or 0) >= 7
+                                or str(_extra_ready_row.get("readiness_status") or "").upper() == "RED"
+                            )
+                        )
+                        if _extra_blocked:
+                            st.error("Con el estado registrado hoy RCP no recomienda añadir trote. Mantén la recuperación y vuelve a valorar tu estado después.")
+                        _extra_cap = training_time_limit_minutes(
+                            selected_day,
+                            (LATEST_ASSESSMENT or {}).get("answers") or {},
+                            profile,
+                        )
+                        # V8.1.6 · Los entrenamientos adicionales son libres: la disponibilidad habitual
+                        # y las sesiones cercanas pueden contextualizar la decisión, pero no imponen un
+                        # techo automático al tiempo que el usuario decide registrar.
+                        if _extra_cap:
+                            st.caption(
+                                f"Disponibilidad habitual guardada para {DAY_NAMES[selected_day.weekday()]}: {_extra_cap} min. "
+                                "Es solo una referencia; este entrenamiento adicional no tiene un límite automático."
+                            )
+                        else:
+                            st.caption("Elige libremente cuánto tiempo quieres dedicar a este entrenamiento adicional.")
+                        with st.form(f"extra_create_home_{selected_day.isoformat()}"):
+                            _et1, _et2 = st.columns(2)
+                            _extra_type = _et1.selectbox(
+                                "Tipo",
+                                ["Rodaje suave", "Recuperación", "Caminata / trote"],
+                                index=0,
+                            )
+                            _extra_minutes = _et2.number_input(
+                                "Tiempo objetivo (min)",
+                                min_value=10,
+                                value=40,
+                                step=5,
+                                help="Tú eliges la duración. RCP no la reduce automáticamente por otra sesión del plan.",
+                            )
+                            _ek1, _ek2 = st.columns(2)
+                            _extra_km = _ek1.number_input(
+                                "Distancia objetivo (km, opcional)",
+                                min_value=0.0,
+                                value=0.0,
+                                step=0.5,
+                                help="Déjalo en 0 si prefieres correr solo por tiempo. No hay un máximo fijo para el entrenamiento adicional.",
+                            )
+                            _extra_rpe = _ek2.selectbox(
+                                "RPE objetivo",
+                                [2, 3, 4],
+                                index=1,
+                                format_func=rpe_option_label,
+                            )
+                            st.caption(rpe_reference(_extra_rpe))
+                            _extra_notes = st.text_area("Nota opcional", placeholder="Ej.: trote muy suave porque hoy tuve tiempo.")
+                            _extra_submit = st.form_submit_button(
+                                "💾 Guardar entrenamiento adicional",
+                                use_container_width=True,
+                                disabled=_extra_blocked,
+                            )
+                        if _extra_submit:
+                            _pace_prof_extra = v7_pace_profile(LATEST_ASSESSMENT, ACTIVE_GOAL)
+                            _extra_max_km_for_time = max_distance_for_time(_extra_minutes, "EASY", _pace_prof_extra)
+                            if _extra_km and _extra_max_km_for_time and float(_extra_km) > float(_extra_max_km_for_time) + 0.3:
+                                st.error(
+                                    f"Esa distancia probablemente no cabe en {_extra_minutes} min manteniendo esfuerzo fácil. "
+                                    f"Usa como referencia hasta ~{float(_extra_max_km_for_time):.1f} km o deja la distancia en 0 y corre por tiempo."
+                                )
+                            else:
+                                save_extra_session({
+                                    "session_date": selected_day.isoformat(),
+                                    "workout_type": _extra_type,
+                                    "planned_minutes": int(_extra_minutes),
+                                    "planned_km": float(_extra_km) if _extra_km else None,
+                                    "target_rpe": int(_extra_rpe),
+                                    "notes": _extra_notes.strip() or None,
+                                })
+                                st.session_state["rcp_saved_notice"] = (
+                                    "Entrenamiento adicional guardado. El plan base quedó exactamente igual."
+                                )
+                                st.rerun()
+                else:
+                    st.caption("Para añadir entrenamientos opcionales activa la actualización V8.1.5 en Supabase.")
         else:
             status_label = status_label_for_date(selected_day)
-            if session_is_user_extra(today_session):
-                st.info("➕ **Trote extra opcional** · añadido por ti. No reemplaza ni modifica ninguna sesión del plan original.")
             _week_info = active_plan_week_info(today_session.get("week_no"))
             _phase = _week_info.get("phase")
             st.caption(
@@ -10292,12 +10404,6 @@ if current_page == "Hoy":
                     st.info(_target_ref)
             if rpe_target_reference(today_session.get("target")):
                 render_rpe_guide(expanded=False, key_suffix="today")
-            if session_is_user_extra(today_session) and not today_log:
-                if st.button("🗑️ Quitar este trote extra", use_container_width=True, key=f"delete_extra_{today_session.get('id')}"):
-                    _ok, _msg = delete_user_extra_session(today_session)
-                    (st.success if _ok else st.error)(_msg)
-                    if _ok:
-                        st.rerun()
 
             if today_log:
                 status = str(today_log.get("status") or "").upper()
@@ -10691,9 +10797,26 @@ elif current_page == "Semana":
                     set_page("Registro", d)
                     st.rerun()
             else:
-                c2.markdown("**😴 Descanso / recuperación**")
-                c2.caption("Sin sesión planificada")
-                c3.caption("—")
+                _extra_week = EXTRA_BY_DATE.get(d.isoformat()) if EXTRA_READY else None
+                if _extra_week:
+                    _extra_week_log = LOG_BY_DATE.get(d.isoformat()) or {}
+                    c2.markdown(f"**🏃 {str(_extra_week.get('workout_type') or 'Entrenamiento adicional')}**")
+                    c2.caption(
+                        f"Adicional opcional · {int(_extra_week.get('planned_minutes') or 0)} min · "
+                        f"RPE {int(_extra_week.get('target_rpe') or 3)}/10"
+                    )
+                    if float(_extra_week.get("planned_km") or 0):
+                        c3.markdown(f"**{float(_extra_week.get('planned_km') or 0):g} km**")
+                    else:
+                        c3.markdown("**Por tiempo**")
+                    c3.caption(extra_session_status_label(_extra_week, _extra_week_log))
+                    if c4.button("Abrir", key=f"week_open_extra_{_extra_week['id']}", use_container_width=True):
+                        set_page("Registro", d)
+                        st.rerun()
+                else:
+                    c2.markdown("**😴 Descanso / recuperación**")
+                    c2.caption("Sin sesión planificada")
+                    c3.caption("—")
 
 
 # ============================================================
@@ -11405,8 +11528,11 @@ elif current_page == "Registro":
     st.caption(f"Fecha seleccionada: {selected_day.strftime('%d/%m/%Y')}")
 
     session = PLAN_BY_DATE.get(selected_day.isoformat())
-    if not session:
-        st.info("Selecciona en la barra lateral una fecha que tenga entrenamiento programado.")
+    extra_session = EXTRA_BY_DATE.get(selected_day.isoformat()) if EXTRA_READY else None
+    if not session and not extra_session:
+        st.info("Esta fecha no tiene entrenamiento programado ni adicional.")
+        if EXTRA_READY:
+            st.caption("Puedes añadir un trote opcional desde la pantalla Hoy seleccionando esta misma fecha.")
         nearby = [
             p for p in PLAN
             if (d := parse_date_safe(p.get("session_date"))) and d >= rcp_today()
@@ -11422,11 +11548,134 @@ elif current_page == "Registro":
                 ):
                     set_page("Registro", d)
                     st.rerun()
+    elif extra_session and not session:
+        existing = LOG_BY_DATE.get(selected_day.isoformat(), {})
+        with st.container(border=True):
+            st.caption("ENTRENAMIENTO ADICIONAL · FUERA DEL PLAN BASE")
+            st.markdown(f"## 🏃 {str(extra_session.get('workout_type') or 'Rodaje suave')}")
+            x1, x2, x3 = st.columns(3)
+            x1.metric("Tiempo objetivo", f"{int(extra_session.get('planned_minutes') or 0)} min")
+            x2.metric(
+                "Distancia objetivo",
+                "Por tiempo" if not float(extra_session.get("planned_km") or 0) else f"{float(extra_session.get('planned_km') or 0):g} km",
+            )
+            x3.metric("RPE objetivo", f"{int(extra_session.get('target_rpe') or 3)}/10")
+            st.caption(rpe_reference(int(extra_session.get("target_rpe") or 3)))
+            if extra_session.get("notes"):
+                st.write(str(extra_session.get("notes")))
+            st.info(
+                "Este entrenamiento es opcional. No reemplaza ni completa automáticamente una sesión omitida de otro día. "
+                "Sí cuenta como carga, kilómetros y respuesta real del corredor."
+            )
+            render_rpe_guide(expanded=False, key_suffix=f"extra_register_{selected_day.isoformat()}")
+
+        with st.form(f"extra_log_form_{selected_day.isoformat()}"):
+            st.markdown("### ¿Cómo salió?")
+            _planned_extra_km = float(extra_session.get("planned_km") or 0)
+            _er1, _er2, _er3 = st.columns(3)
+            _extra_actual_km = _er1.number_input(
+                "KM reales",
+                0.0, 100.0,
+                float(existing.get("actual_km") if existing.get("actual_km") is not None else _planned_extra_km),
+                .1,
+            )
+            _extra_duration_default = (
+                fmt_time(existing.get("actual_duration_sec"))
+                if existing.get("actual_duration_sec")
+                else fmt_time(int(extra_session.get("planned_minutes") or 0) * 60)
+            )
+            _extra_duration_text = _er2.text_input("Duración HH:MM:SS", value=_extra_duration_default)
+            _extra_actual_rpe = _er3.selectbox(
+                "Esfuerzo percibido (RPE)",
+                list(range(1, 11)),
+                index=max(0, min(9, int(existing.get("rpe") or extra_session.get("target_rpe") or 3) - 1)),
+                format_func=rpe_option_label,
+            )
+            st.caption(rpe_reference(_extra_actual_rpe))
+
+            _ehr1, _ehr2 = st.columns(2)
+            _extra_avg_hr = _ehr1.number_input("FC media (opcional)", 0, 230, int(existing.get("avg_hr") or 0))
+            _extra_max_hr = _ehr2.number_input("FC máxima (opcional)", 0, 240, int(existing.get("max_hr") or 0))
+
+            _surface_log_options = ["No informada", "Exterior", "Caminadora"]
+            _saved_surface = _surface_code(existing.get("training_surface_used"))
+            _pref_surface = training_surface_preference(profile)
+            if _saved_surface == "EXTERIOR":
+                _surface_log_default = "Exterior"
+            elif _saved_surface == "CAMINADORA":
+                _surface_log_default = "Caminadora"
+            elif _pref_surface == "EXTERIOR":
+                _surface_log_default = "Exterior"
+            elif _pref_surface == "CAMINADORA":
+                _surface_log_default = "Caminadora"
+            else:
+                _surface_log_default = "No informada"
+            _extra_surface_ui = st.selectbox(
+                "Superficie realizada",
+                _surface_log_options,
+                index=_surface_log_options.index(_surface_log_default),
+                disabled=not pace_rpe_calibration_storage_ready(),
+            )
+
+            if ADAPTIVE_READY:
+                _ep1, _ep2 = st.columns(2)
+                _extra_post_pain = _ep1.slider("Dolor después de entrenar", 0, 10, int(existing.get("post_pain") or 0))
+                _extra_post_fatigue = _ep2.slider("Fatiga después de entrenar", 1, 5, int(existing.get("post_fatigue") or 2))
+                _difficulty_options = ["Mucho más fácil", "Más fácil", "Como esperaba", "Más difícil", "Mucho más difícil"]
+                _current_diff = str(existing.get("perceived_difficulty") or "Como esperaba")
+                _extra_difficulty = st.selectbox(
+                    "La sesión se sintió…",
+                    _difficulty_options,
+                    index=_difficulty_options.index(_current_diff) if _current_diff in _difficulty_options else 2,
+                )
+            else:
+                _extra_post_pain = None
+                _extra_post_fatigue = None
+                _extra_difficulty = None
+
+            _extra_notes_actual = st.text_area("Observaciones", value=str(existing.get("notes") or ""))
+            _extra_log_submit = st.form_submit_button("💾 Guardar entrenamiento adicional", use_container_width=True)
+
+        if _extra_log_submit:
+            _extra_seconds = parse_hms(_extra_duration_text) if _extra_duration_text else 0
+            if _extra_duration_text and _extra_seconds is None:
+                st.error("Duración inválida. Usa HH:MM:SS.")
+            else:
+                save_log({
+                    "session_date": selected_day.isoformat(),
+                    "plan_session_id": None,
+                    "actual_km": float(_extra_actual_km),
+                    "actual_duration_sec": int(_extra_seconds or 0),
+                    "rpe": int(_extra_actual_rpe),
+                    "avg_hr": int(_extra_avg_hr) if _extra_avg_hr else None,
+                    "max_hr": int(_extra_max_hr) if _extra_max_hr else None,
+                    "status": "COMPLETADO",
+                    "training_surface_used": (
+                        {"Exterior": "EXTERIOR", "Caminadora": "CAMINADORA"}.get(_extra_surface_ui)
+                        if pace_rpe_calibration_storage_ready()
+                        else None
+                    ),
+                    "post_pain": int(_extra_post_pain) if ADAPTIVE_READY else None,
+                    "post_fatigue": int(_extra_post_fatigue) if ADAPTIVE_READY else None,
+                    "perceived_difficulty": _extra_difficulty if ADAPTIVE_READY else None,
+                    "notes": _extra_notes_actual.strip(),
+                })
+                st.session_state["rcp_saved_notice"] = (
+                    "Entrenamiento adicional guardado ✅. Se suma a tu carga real sin modificar el plan base."
+                )
+                set_page("Hoy", selected_day)
+                st.rerun()
+
+        st.divider()
+        _del_extra_label = "🗑️ Eliminar adicional y su registro" if existing else "🗑️ Quitar entrenamiento adicional"
+        if st.button(_del_extra_label, key=f"delete_extra_register_{extra_session.get('id')}", use_container_width=True):
+            delete_extra_session(extra_session.get("id"), selected_day.isoformat(), delete_training_log=True)
+            st.session_state["rcp_saved_notice"] = "Entrenamiento adicional eliminado. El plan base no cambió."
+            set_page("Hoy", selected_day)
+            st.rerun()
     else:
         existing = LOG_BY_DATE.get(selected_day.isoformat(), {})
         with st.container(border=True):
-            if session_is_user_extra(session):
-                st.info("➕ Entrenamiento extra opcional · no altera el plan original ni cuenta como sesión obligatoria.")
             st.caption(f"{workout_kind(session).upper()} · SEMANA {session.get('week_no')}")
             st.markdown(f"## {session_display_name(session)}")
             r1, r2, r3 = st.columns(3)
