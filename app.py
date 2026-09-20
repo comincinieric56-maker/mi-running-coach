@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.2.0"
+APP_VERSION = "8.2.1"
 
 
 # ============================================================
@@ -4998,7 +4998,12 @@ def _pace_range(fast_sec, slow_sec):
 
 
 def v7_pace_profile(assessment, goal_row):
-    """Ritmos orientativos. Si no hay marca reciente fiable, usa solo RPE (esfuerzo percibido) y prueba del habla."""
+    """Ritmos orientativos desde capacidad ACTUAL; RPE/prueba del habla mandan.
+
+    V8.2.1 evita usar una meta futura más rápida como si ya fuera capacidad fisiológica
+    actual. El ritmo específico de entrenamiento progresa desde la equivalencia vigente
+    hacia la meta solo si el esfuerzo prescrito sigue siendo compatible.
+    """
     answers = dict((assessment or {}).get("answers") or {})
     perf = performance_summary(answers)
     out = {
@@ -5012,6 +5017,9 @@ def v7_pace_profile(assessment, goal_row):
         "threshold": None,
         "interval": None,
         "race": None,
+        "race_current": None,
+        "race_target": None,
+        "race_gap_pct": None,
     }
     if not perf.get("usable"):
         return out
@@ -5022,47 +5030,80 @@ def v7_pace_profile(assessment, goal_row):
     equivalents = perf.get("equivalents_sec") or {}
     p5 = (float(equivalents.get("5K")) / 5.0) if equivalents.get("5K") else None
     p10 = (float(equivalents.get("10K")) / 10.0) if equivalents.get("10K") else None
+    source_km = float(perf.get("source_distance_km") or 0)
+    source_sec = float(perf.get("source_time_sec") or 0)
     if not p10:
-        source_km = float(perf.get("source_distance_km") or 0)
-        source_sec = float(perf.get("source_time_sec") or 0)
         p10 = source_sec / source_km if source_km > 0 else None
     if not p10:
         return out
     if not p5:
         p5 = max(1.0, p10 - 18)
 
+    # Aproximación de ritmo de ~60 min desde la marca actual (Riegel 1.06).
+    # Se usa como ancla práctica del trabajo de umbral; no como medición de LT2.
+    p60 = None
+    if source_km > 0 and source_sec > 0:
+        try:
+            d60 = source_km * (3600.0 / source_sec) ** (1.0 / 1.06)
+            if d60 > 0:
+                p60 = 3600.0 / d60
+        except Exception:
+            p60 = None
+    if not p60:
+        p60 = p10 + 8.0
+
     out.update({
-        "basis": "marca reciente + RPE",
+        "basis": "marca reciente + RPE · prescripción desde capacidad actual",
         "usable": True,
-        "recovery": [round(p10 + 75), round(p10 + 110)],
-        "easy": [round(p10 + 55), round(p10 + 90)],
-        "long": [round(p10 + 50), round(p10 + 85)],
-        "steady": [round(p10 + 30), round(p10 + 50)],
-        "threshold": [round(p10 + 10), round(p10 + 25)],
-        "interval": [round(max(1, p5 - 5)), round(p5 + 10)],
+        "recovery": [round(p60 + 55), round(p60 + 95)],
+        "easy": [round(p60 + 35), round(p60 + 75)],
+        "long": [round(p60 + 30), round(p60 + 70)],
+        "steady": [round(p60 + 15), round(p60 + 35)],
+        "threshold": [round(max(p5 + 4, p60 - 4)), round(p60 + 7)],
+        "interval": [round(max(1, p5 - 5)), round(p5 + 8)],
     })
 
     goal_km = GOAL_KM.get(str(goal_row.get("goal_type") or ""))
     target_seconds = goal_row.get("target_time_sec")
-    source_seconds = perf.get("source_time_sec")
-    source_km = perf.get("source_distance_km")
-    estimated = estimate_equivalent_time(source_seconds, source_km, goal_km) if goal_km else None
+    estimated = estimate_equivalent_time(source_sec, source_km, goal_km) if goal_km else None
     if goal_km:
-        race_sec = None
-        # Una meta >5% por delante de la equivalencia actual no se usa como ritmo de
-        # prescripción; V7 entrena desde la capacidad actual y conserva la meta como objetivo.
+        current_race = (float(estimated) / float(goal_km)) if estimated else None
+        target_race = (float(target_seconds) / float(goal_km)) if target_seconds else None
         gap = None
-        if estimated and target_seconds:
-            gap = (float(estimated) - float(target_seconds)) / float(estimated) * 100
-        if target_seconds and (gap is None or gap <= 5):
-            race_sec = float(target_seconds) / float(goal_km)
-        elif estimated:
-            race_sec = float(estimated) / float(goal_km)
-        elif target_seconds:
-            race_sec = float(target_seconds) / float(goal_km)
-        if race_sec:
-            out["race"] = round(race_sec)
+        if current_race and target_race:
+            gap = (float(current_race) - float(target_race)) / float(current_race) * 100.0
+        out["race_current"] = round(current_race) if current_race else None
+        out["race_target"] = round(target_race) if target_race else None
+        out["race_gap_pct"] = round(gap, 1) if gap is not None else None
+
+        # Para entrenar no asumimos de entrada que una meta futura ya sea sostenible.
+        # Si la meta es >2% más rápida que la equivalencia actual, el ritmo específico
+        # parte de la capacidad actual y se aproxima progresivamente a la meta.
+        if current_race and target_race and target_race < current_race * 0.98:
+            out["race"] = round(current_race)
+        elif target_race:
+            out["race"] = round(target_race)
+        elif current_race:
+            out["race"] = round(current_race)
     return out
+
+
+def _specific_race_training_pace(pace_profile, cycle_progress=0.5):
+    """Puente conservador capacidad actual -> ritmo meta; RPE siempre tiene prioridad."""
+    pp = pace_profile or {}
+    current = pp.get("race_current") or pp.get("race")
+    target = pp.get("race_target")
+    try:
+        progress = float(cycle_progress)
+    except Exception:
+        progress = 0.5
+    progress = float(_clamp(progress, 0.0, 1.0))
+    if current and target and float(target) < float(current):
+        # Solo cierra parte de la brecha antes de la carrera; no fuerza la meta si el
+        # rendimiento actual/RPE todavía no la sostienen.
+        bridge = float(_clamp((progress - 0.35) / 0.55, 0.0, 0.80))
+        return round(float(current) - (float(current) - float(target)) * bridge)
+    return round(float(target or current)) if (target or current) else None
 
 
 def _target_with_pace(label, zone, rpe):
@@ -5242,19 +5283,32 @@ def _v7_long_distance(weekly_km, answers, goal, phase, week_idx, total_weeks, da
 
 
 def _v7_quality_count(level, days_count, phase, answers, focus="AUTO"):
+    """Número de estímulos principales de calidad.
+
+    V8.2.1: la base no significa cero velocidad. En corredores intermedios/avanzados
+    se conserva un estímulo breve/controlado, mientras la gran mayoría de la carga
+    permanece fácil. Una carrera preparatoria cuenta después como estímulo de calidad
+    y el módulo de carreras descarga lo cercano.
+    """
     level = str(level or "INICIACIÓN").upper()
     focus = str(focus or "CAPACIDAD_AEROBICA")
     experience = str(answers.get("experience") or "Nunca")
     prior_quality = len(set(answers.get("quality_types") or []))
-    if phase == "BASE" or level == "INICIACIÓN" or days_count <= 2:
+    if level == "INICIACIÓN" or days_count <= 2:
         return 0
     if focus == "RETORNO_RECONSTRUCCION":
-        return 0 if phase != "TAPER" else (1 if days_count >= 4 and level not in ("INICIACIÓN", "PRINCIPIANTE") else 0)
+        return 1 if phase == "TAPER" and days_count >= 4 and level not in ("INICIACIÓN", "PRINCIPIANTE") else 0
+    if phase == "BASE":
+        if level in ("INTERMEDIO", "AVANZADO") and days_count >= 3:
+            return 1
+        if level == "PRINCIPIANTE" and days_count >= 4 and prior_quality >= 1 and _experience_rank(experience) >= 3:
+            return 1
+        return 0
     if phase == "TAPER":
         return 1 if days_count >= 3 else 0
     if focus == "CAPACIDAD_AEROBICA":
-        # La intensidad es complementaria: 1 estímulo principal incluso con 4 días.
-        # Solo perfiles muy consolidados con >=5 días pueden llevar 2 en específica.
+        # Con 3–4 días: 1 sesión principal; el segundo estímulo, cuando corresponde,
+        # puede vivir dentro de la larga (progresivo/específico) o ser una carrera.
         if phase == "ESPECÍFICA" and days_count >= 5 and level == "AVANZADO" and prior_quality >= 2 and _experience_rank(experience) >= 5:
             return 2
         return 1 if days_count >= 3 else 0
@@ -5281,7 +5335,7 @@ def _run_walk_recipe(week_no):
     return run_min, walk_min, reps
 
 
-def _v7_quality_session(goal, phase, week_no, slot, pace_profile, level):
+def _v7_quality_session(goal, phase, week_no, slot, pace_profile, level, cycle_progress=0.5):
     goal = str(goal)
     slot = int(slot)
     if phase == "TAPER":
@@ -5336,13 +5390,13 @@ def _v7_quality_session(goal, phase, week_no, slot, pace_profile, level):
                 "intensity": "UMBRAL",
                 "description": "15 min suave + 2–3 bloques de 10–12 min a umbral con 2–3 min suaves + 10 min suave.",
             }
-        race_pace = pace_profile.get("race")
+        race_pace = _specific_race_training_pace(pace_profile, cycle_progress)
         return {
-            "type": "RITMO_CARRERA",
-            "name": "Bloques a ritmo MM",
+            "type": "ESPECIFICO_21K",
+            "name": "Bloques específicos de media maratón",
             "target": _target_with_pace("", race_pace, "5–6/10"),
             "intensity": "ESPECÍFICA",
-            "description": "15 min suave + 3–5 bloques de 1–2 km al esfuerzo específico de media maratón, 2–3 min suaves entre bloques + enfriamiento.",
+            "description": "15 min suave + 3–5 bloques de 1–2 km al esfuerzo específico de media maratón, 2–3 min suaves entre bloques + enfriamiento. El ritmo se deriva de tu capacidad actual y se acerca gradualmente a la meta; si el RPE supera 6/10, manda el esfuerzo y no la cifra.",
         }
 
     if goal == "42K":
@@ -5372,28 +5426,60 @@ def _v7_quality_session(goal, phase, week_no, slot, pace_profile, level):
     }
 
 
-def _v73_quality_session(focus, goal, phase, week_no, slot, pace_profile, level):
+def _v73_quality_session(focus, goal, phase, week_no, slot, pace_profile, level, cycle_progress=0.5):
+    """Selecciona el estímulo principal manteniendo predominio de baja intensidad."""
     focus = str(focus or "CAPACIDAD_AEROBICA")
+    phase = str(phase or "DESARROLLO").upper()
     if phase == "TAPER":
-        return _v7_quality_session(goal, phase, week_no, slot, pace_profile, level)
+        return _v7_quality_session(goal, phase, week_no, slot, pace_profile, level, cycle_progress)
     if focus == "CAPACIDAD_AEROBICA":
-        if phase == "ESPECÍFICA":
-            # Transferencia progresiva: alterna umbral y ritmo de carrera, sin perder el predominio fácil.
-            return _v7_quality_session(goal, phase, week_no, (week_no + slot) % 2, pace_profile, level)
-        if week_no % 2 == 0:
+        if phase == "BASE":
+            # Microdosis neuromuscular / economía: conserva velocidad sin convertir
+            # la base en una semana dura.
+            if week_no % 2:
+                return {
+                    "type": "RECTAS",
+                    "name": "Rodaje + rectas de economía",
+                    "target": "Rodaje RPE 3–4/10 · rectas RPE 7/10, rápidas pero relajadas",
+                    "intensity": "BASE + ECONOMÍA",
+                    "description": "Rodaje fácil. Tras 15–20 min suaves, realiza 6–8 × 20 s rápidos y relajados con 80–120 s de trote/caminata completa entre repeticiones; termina suave. No es sprint ni debe dejar fatiga residual.",
+                }
             return {
-                "type": "CUESTAS",
-                "name": "Cuestas aeróbicas",
-                "target": "RPE 6/10 en subida · recuperación completa al bajar",
-                "intensity": "MODERADA CONTROLADA",
-                "description": "15–20 min suave + 6–8 × 60–75 s en subida con técnica estable; baja trotando/caminando hasta recuperar + 10–15 min suave. No es sprint.",
+                "type": "CUESTAS_CORTAS",
+                "name": "Rodaje + cuestas cortas",
+                "target": "Rodaje RPE 3–4/10 · cuestas RPE 7/10 con recuperación completa",
+                "intensity": "BASE + ECONOMÍA",
+                "description": "15–20 min suave + 6–8 × 25–35 s en cuesta con técnica estable y recuperación completa al bajar + rodaje suave. Mantén potencia y coordinación; nunca sprint máximo.",
+            }
+        if phase == "ESPECÍFICA":
+            # Alterna umbral y especificidad; no prescribe automáticamente el ritmo
+            # meta si la capacidad actual aún no lo sostiene.
+            return _v7_quality_session(goal, phase, week_no, (week_no + slot) % 2, pace_profile, level, cycle_progress)
+
+        # Desarrollo: rota estímulos para no convertir toda la calidad en "tempo".
+        rotation = week_no % 3
+        if rotation == 0:
+            return {
+                "type": "UMBRAL",
+                "name": "Umbral fraccionado controlado",
+                "target": _target_with_pace("", pace_profile.get("threshold"), "6–7/10"),
+                "intensity": "UMBRAL",
+                "description": "15 min suave + 3 × 8–10 min a umbral controlado con 2–3 min suaves + enfriamiento. Debes terminar con técnica estable y sin sensación de vaciarte.",
+            }
+        if rotation == 1:
+            return {
+                "type": "INTERVALOS",
+                "name": "Intervalos aeróbicos",
+                "target": _target_with_pace("", pace_profile.get("interval"), "7–8/10"),
+                "intensity": "ALTA CONTROLADA",
+                "description": "15 min suave + 4–6 × 3 min rápidos/controlados con 2 min suaves + 10 min suave. Prioriza regularidad; la última repetición no debe ser un sprint.",
             }
         return {
-            "type": "TEMPO_AEROBICO",
-            "name": "Tempo aeróbico controlado",
-            "target": "RPE 5–6/10 · respiración firme pero controlada",
-            "intensity": "MODERADA",
-            "description": "15 min suave + 3 × 8–10 min a esfuerzo sostenido subumbral con 2–3 min suaves + 10 min suave. Debe quedar margen; no persigas un ritmo si el RPE sube.",
+            "type": "CUESTAS",
+            "name": "Cuestas de fuerza y economía",
+            "target": "RPE 7/10 en subida · recuperación completa al bajar",
+            "intensity": "ALTA CONTROLADA",
+            "description": "15–20 min suave + 8 × 40–60 s en subida con técnica firme, recuperando completamente al bajar + 10 min suave. Estímulo de economía/fuerza; no es sprint.",
         }
     if focus == "UMBRAL":
         return {
@@ -5420,7 +5506,7 @@ def _v73_quality_session(focus, goal, phase, week_no, slot, pace_profile, level)
             "description": "15 min suave + 6–10 repeticiones de 1–3 min rápidas con recuperación suficiente + 10 min suave. Termina con reserva.",
         }
     if focus == "ESPECIFICO_CARRERA":
-        return _v7_quality_session(goal, "ESPECÍFICA", week_no, slot, pace_profile, level)
+        return _v7_quality_session(goal, "ESPECÍFICA", week_no, slot, pace_profile, level, cycle_progress)
     if focus == "RETORNO_RECONSTRUCCION":
         return {
             "type": "FARTLEK",
@@ -5437,7 +5523,7 @@ def _v73_quality_session(focus, goal, phase, week_no, slot, pace_profile, level)
             "intensity": "MODERADA",
             "description": "15 min suave + 8 × 1 min ágil / 2 min suave + enfriamiento. Mantiene estímulo sin aumentar densidad de carga.",
         }
-    return _v7_quality_session(goal, phase, week_no, slot, pace_profile, level)
+    return _v7_quality_session(goal, phase, week_no, slot, pace_profile, level, cycle_progress)
 
 
 def _v7_allocate_distances(weekly_km, days, long_day, quality_days, long_km, phase, goal, focus="AUTO"):
@@ -5519,12 +5605,13 @@ def can_generate_v7_plan(goal_row, assessment):
 
 
 def _race_plan_row_kind(row):
-    txt = f"{(row or {}).get('workout_type') or ''} {(row or {}).get('workout_name') or ''} {(row or {}).get('intensity') or ''}".upper()
-    if "CARRERA" in txt or "COMPET" in txt:
+    wtype = str((row or {}).get("workout_type") or "").upper()
+    txt = f"{wtype} {(row or {}).get('workout_name') or ''} {(row or {}).get('intensity') or ''}".upper()
+    if wtype in {"CARRERA", "CARRERA_PREPARATORIA"} or "COMPETENCIA PREPARATORIA" in txt:
         return "RACE"
     if "LARGA" in txt or "TIRADA" in txt:
         return "LONG"
-    if "SERIE" in txt or "INTERVAL" in txt or "TEMPO" in txt or "UMBRAL" in txt or "FARTLEK" in txt:
+    if "SERIE" in txt or "INTERVAL" in txt or "TEMPO" in txt or "UMBRAL" in txt or "FARTLEK" in txt or "ESPECIF" in txt or "CUESTA" in txt:
         return "QUALITY"
     if "RECUP" in txt:
         return "RECOVERY"
@@ -5855,10 +5942,18 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 desc = "Empieza muy suave y mantén conversación completa. En subidas manda el esfuerzo, no el ritmo."
                 if _time_cap:
                     desc += f" Límite logístico de hoy: máximo {_time_cap} min totales; RCP ya ajustó la distancia para que la sesión quepa en ese tiempo."
-                if development_focus == "CAPACIDAD_AEROBICA" and phase == "DESARROLLO" and week_no % 2 == 0:
-                    desc += " Si llegas recuperado, los últimos 10–15 min pueden subir a RPE 4–5; sigue siendo trabajo aeróbico, no ritmo de carrera."
-                if phase == "ESPECÍFICA" and goal in ("21K", "42K") and pace_profile.get("race") and level in ("INTERMEDIO", "AVANZADO"):
-                    desc += " En el tercio final, si estás recuperado, añade 15–25 min al esfuerzo específico de carrera; omítelo si el readiness o la fatiga no acompañan."
+                if development_focus == "CAPACIDAD_AEROBICA":
+                    if phase == "BASE" and level in ("INTERMEDIO", "AVANZADO") and week_no % 2 == 0:
+                        desc += " Si llegas fresco, termina los últimos 8–10 min en RPE 4/10; no debe sentirse como tempo."
+                    elif phase == "DESARROLLO" and week_no % 2 == 0:
+                        desc += " Si llegas recuperado, los últimos 15–20 min pueden progresar a RPE 4–5; sigue siendo trabajo aeróbico, no una segunda sesión dura."
+                    elif phase == "ESPECÍFICA" and goal in ("21K", "42K") and level in ("INTERMEDIO", "AVANZADO"):
+                        _specific_long_pace = _specific_race_training_pace(pace_profile, (w + 1) / max(1, total_weeks))
+                        _specific_long_txt = pace_string(_specific_long_pace) if _specific_long_pace else "el esfuerzo específico de carrera"
+                        if week_no % 2 == 0:
+                            desc += f" Si el estado de recuperación es normal, incluye 2 × 10–15 min cerca de {_specific_long_txt} a RPE 5–6/10, con 5 min suaves entre bloques. Si el RPE se dispara, vuelve al ritmo fácil."
+                        else:
+                            desc += " Mantén esta larga completamente fácil: alternar largas específicas con largas fáciles protege la recuperación."
                 rows.append({
                     "user_id": USER_ID,
                     "session_date": d.isoformat(),
@@ -5874,7 +5969,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 continue
 
             if role == "QUALITY":
-                q = _v73_quality_session(development_focus, goal, phase, week_no, quality_slot, pace_profile, level)
+                q = _v73_quality_session(development_focus, goal, phase, week_no, quality_slot, pace_profile, level, (w + 1) / max(1, total_weeks))
                 q = _fit_quality_description_to_time(q, _time_cap)
                 quality_slot += 1
                 rows.append({
@@ -5917,7 +6012,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 "is_optional": False,
             })
 
-    # V8.2 · Las carreras preparatorias se integran al ciclo antes de la carrera objetivo.
+    # V8.2.1 · Carreras + distribución dinámica basada en evidencia.
     rows, _applied_prep_races = _apply_preparatory_races_to_rows(
         rows, prep_races, goal_row.get("race_date"), monday0, total_weeks
     )
@@ -5925,7 +6020,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     # Carrera objetivo: se agrega siempre aunque no coincida con un día habitual.
     if race_date and goal in GOAL_KM and GOAL_KM.get(goal):
         race_distance = float(GOAL_KM[goal])
-        race_pace = pace_profile.get("race")
+        race_pace = pace_profile.get("race_target") or pace_profile.get("race")
         rows = [r for r in rows if r["session_date"] != race_date.isoformat()]
         rows.append({
             "user_id": USER_ID,
@@ -5945,8 +6040,12 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     if not rows:
         return [], {}, "El motor V7 no produjo sesiones en el intervalo disponible."
 
+    _time_limited_weeks = [int(x.get("week") or 0) for x in week_meta if bool(x.get("time_limited"))]
+    _uncapped_peak = max([float(x.get("uncapped_target_km") or 0) for x in week_meta] or [float(initial_km)])
+    _declared_weekly_km = float(answers.get("weekly_km") or 0)
+
     metadata = {
-        "engine": "RCP-V8.2",
+        "engine": "RCP-V8.2.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -5964,6 +6063,10 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         "selected_days": [DAY_NAMES[d] for d in selected_days],
         "long_day": DAY_NAMES[long_day] if long_day is not None else None,
         "time_limits_minutes": {DAY_NAMES[d]: training_time_limit_minutes(d, answers, globals().get("profile") or {}) for d in selected_days},
+        "declared_weekly_km": round(_declared_weekly_km, 1),
+        "time_constraint_active": bool(_time_limited_weeks),
+        "time_limited_weeks": _time_limited_weeks,
+        "uncapped_peak_weekly_km": round(_uncapped_peak, 1),
         "initial_weekly_km": round(float((week_meta[0] if week_meta else {}).get("target_km") or initial_km), 1),
         "peak_weekly_km": round(max([float(x.get("target_km") or 0) for x in week_meta] or [initial_km]), 1),
         "pace_basis": pace_profile.get("basis"),
@@ -5979,6 +6082,8 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
             "development_focus": "El objetivo fisiológico dominante cambia fases, densidad de calidad y distribución de carga sin sustituir el objetivo competitivo.",
             "time_availability": "Cada sesión se limita por el tiempo total disponible del día; calentamiento, recuperaciones y enfriamiento deben caber dentro de ese límite. La tirada larga usa el límite específico de su día.",
             "preparatory_races": "Las carreras previas al objetivo cuentan como carga de calidad. RCP reduce o sustituye intensidad y tirada larga cercanas según distancia y relevancia, sin recuperar después el volumen retirado.",
+            "evidence_distribution": "Predominio de baja intensidad con una dosis menor de trabajo moderado/alto; la fase base conserva economía/velocidad con microdosis controladas, desarrollo rota umbral/intervalos/cuestas y la fase específica añade trabajo de carrera sin convertir toda la semana en intensidad.",
+            "pace_guardrail": "Los ritmos de entrenamiento salen de la capacidad actual y del RPE. Una meta futura más rápida no se usa automáticamente como ritmo fisiológicamente sostenible; el trabajo específico aproxima la meta de forma progresiva.",
         },
     }
     return rows, metadata, None
@@ -5994,7 +6099,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V8.2",
+        "engine_version": "RCP-V8.2.1",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -6080,7 +6185,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V8.2",
+        "engine_version": "RCP-V8.2.1",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -7378,12 +7483,23 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                 f"Días elegidos por V7: {', '.join(selected)} · Tirada larga: {meta.get('long_day') or '—'} · "
                 f"Progresión: {meta.get('progression_mode') or '—'} · Ritmos: {meta.get('pace_basis') or 'RPE'}"
             )
+        if meta.get("time_constraint_active"):
+            _declared_km = float(meta.get("declared_weekly_km") or 0)
+            _uncapped_peak_ui = float(meta.get("uncapped_peak_weekly_km") or 0)
+            _limits_ui = meta.get("time_limits_minutes") or {}
+            _limits_txt = " · ".join(f"{k} {int(v)} min" for k, v in _limits_ui.items() if v)
+            st.info(
+                f"⏱️ Volumen ajustado por tiempo: tu base declarada es {_declared_km:g} km/sem, pero los límites horarios de tus días de entrenamiento reducen el volumen que cabe de forma realista. "
+                f"RCP no te hace correr más rápido ni sobrecarga la tirada larga para 'recuperar' kilómetros. "
+                + (f"Disponibilidad usada: {_limits_txt}. " if _limits_txt else "")
+                + (f"Sin esos límites, el ciclo podría alcanzar aproximadamente {_uncapped_peak_ui:g} km/sem." if _uncapped_peak_ui else "")
+            )
         _plan_focus = str(meta.get("development_focus") or "")
         _goal_focus = resolve_development_focus(active_goal, assessment).get("resolved")
         if _plan_focus:
             st.caption(f"🫁 Foco del plan: {development_focus_label(_plan_focus)}")
-        if development_focus_storage_ready() and (_plan_focus != _goal_focus or not (engine_name.startswith("RCP-V7.3") or engine_name.startswith("RCP-V8.2"))):
-            with st.expander("🫁 Recalibrar el plan con enfoque de entrenamiento", expanded=True):
+        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.1"):
+            with st.expander("🧠 Recalibrar plan con motor dinámico actual", expanded=True):
                 _focus_start = expected_next_training_date(rcp_today()) or (rcp_today() + timedelta(days=1))
                 _preview_goal = dict(active_goal)
                 preview_rows, preview_meta, preview_reason = build_v7_plan(_preview_goal, assessment, start_date_value=_focus_start)
@@ -7415,7 +7531,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     if st.button("🫁 Crear plan con este enfoque", type="primary", use_container_width=True, disabled=not _confirm_focus, key="apply_focus_rebuild"):
                         new_plan, err = replace_active_plan_with_v7(active_goal, profile, assessment, start_date_value=_focus_start)
                         if new_plan:
-                            st.session_state["rcp_saved_notice"] = f"Plan V7.3 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
+                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.1 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
                             st.rerun()
                         else:
                             st.error(err or "No fue posible crear el nuevo plan.")
@@ -7821,13 +7937,16 @@ def parse_date_safe(value):
 
 
 def workout_kind(session):
+    wtype = str(session.get("workout_type") or "").upper()
     text = (
-        f"{session.get('workout_type') or ''} "
+        f"{wtype} "
         f"{session.get('workout_name') or ''} "
         f"{session.get('intensity') or ''}"
     ).upper()
-    if "CARRERA" in text or "COMPET" in text:
+    if wtype in {"CARRERA", "CARRERA_PREPARATORIA"} or "COMPETENCIA PREPARATORIA" in text:
         return "Carrera"
+    if "ESPECIF" in text:
+        return "Específico"
     if "LARGA" in text or "TIRADA" in text:
         return "Larga"
     if "SERIE" in text or "INTERVAL" in text:
@@ -10022,6 +10141,7 @@ def build_plan_pdf_bytes(
         "Recuperación": cyan,
         "Series": red,
         "Tempo": colors.HexColor("#EA580C"),
+        "Específico": teal,
         "Larga": violet,
         "Fuerza": teal,
         "Carrera": ink,
@@ -10031,6 +10151,7 @@ def build_plan_pdf_bytes(
         "Recuperación": colors.HexColor("#ECFEFF"),
         "Series": red_soft,
         "Tempo": orange_soft,
+        "Específico": colors.HexColor("#F0FDFA"),
         "Larga": violet_soft,
         "Fuerza": colors.HexColor("#F0FDFA"),
         "Carrera": surface_2,
@@ -10227,6 +10348,8 @@ def build_plan_pdf_bytes(
         facts.append("Días: " + ", ".join(_pdf_clean(x) for x in meta.get("selected_days") or []))
     if meta.get("long_day"):
         facts.append("Larga: " + _pdf_clean(meta.get("long_day")))
+    if meta.get("time_constraint_active"):
+        facts.append("Volumen ajustado por disponibilidad horaria")
     if facts:
         facts_box = Table([[Paragraph("  |  ".join(_pdf_esc(x) for x in facts), styles["RCPSubtitle"]) ]], colWidths=[170*mm])
         facts_box.setStyle(TableStyle([
