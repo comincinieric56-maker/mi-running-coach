@@ -5631,7 +5631,7 @@ def _v7_long_cap(goal):
 
 
 def _v7_long_distance(weekly_km, answers, goal, phase, week_idx, total_weeks, days_count):
-    """V8.2.6 · Tirada larga guiada por historial, objetivo y fase.
+    """V8.2.7 · Tirada larga guiada por historial, objetivo y fase.
 
     El porcentaje del kilometraje semanal deja de ser un techo rígido. Si el corredor
     ya ha demostrado tolerancia a una tirada larga mayor, ese historial tiene prioridad
@@ -6440,7 +6440,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 "is_optional": False,
             })
 
-    # V8.2.6 · Carreras + distribución dinámica basada en evidencia.
+    # V8.2.7 · Carreras + distribución dinámica basada en evidencia.
     rows, _applied_prep_races = _apply_preparatory_races_to_rows(
         rows, prep_races, goal_row.get("race_date"), monday0, total_weeks
     )
@@ -6473,7 +6473,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     _declared_weekly_km = float(answers.get("weekly_km") or 0)
 
     metadata = {
-        "engine": "RCP-V8.2.6",
+        "engine": "RCP-V8.2.7",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -6528,7 +6528,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V8.2.6",
+        "engine_version": "RCP-V8.2.7",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -6614,7 +6614,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V8.2.6",
+        "engine_version": "RCP-V8.2.7",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -7927,7 +7927,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         _goal_focus = resolve_development_focus(active_goal, assessment).get("resolved")
         if _plan_focus:
             st.caption(f"🫁 Foco del plan: {development_focus_label(_plan_focus)}")
-        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.6"):
+        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.7"):
             with st.expander("🧠 Recalibrar plan con motor dinámico actual", expanded=True):
                 _focus_start = expected_next_training_date(rcp_today()) or (rcp_today() + timedelta(days=1))
                 _preview_goal = dict(active_goal)
@@ -7960,7 +7960,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     if st.button("🫁 Crear plan con este enfoque", type="primary", use_container_width=True, disabled=not _confirm_focus, key="apply_focus_rebuild"):
                         new_plan, err = replace_active_plan_with_v7(active_goal, profile, assessment, start_date_value=_focus_start)
                         if new_plan:
-                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.6 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
+                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.7 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
                             st.rerun()
                         else:
                             st.error(err or "No fue posible crear el nuevo plan.")
@@ -8275,7 +8275,7 @@ PLAN = get_plan(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 LOGS = get_logs(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 PLAN_BY_DATE = {str(x["session_date"]): x for x in PLAN}
 
-# V8.2.6 · Historial longitudinal: NO depende del plan activo.
+# V8.2.7 · Historial longitudinal: NO depende del plan activo.
 # Recalibrar el plan cambia el plan_id, pero no debe ocultar actividades ya registradas.
 ALL_LOGS_RAW = get_all_logs(limit=2000)
 HISTORY_LOGS = _dedupe_longitudinal_logs(ALL_LOGS_RAW)
@@ -10275,7 +10275,7 @@ def all_weekly_stats():
 def longitudinal_calendar_weekly_stats():
     """Semanas calendario con historia real transversal a todos los planes.
 
-    V8.2.6: los registros reales se agrupan por fecha, no por el week_no del plan
+    V8.2.7: los registros reales se agrupan por fecha, no por el week_no del plan
     actualmente activo. Así, recalibrar/archivar un plan no hace desaparecer septiembre
     (ni cualquier bloque previo) de Progreso. El cumplimiento sí pertenece al plan activo.
     """
@@ -11784,17 +11784,20 @@ if current_page == "Hoy":
                         set_page("Semana", _review_candidate.get("week_start"))
                         st.rerun()
 
-    # Vista rápida de 4 semanas
-    weekly_all = all_weekly_stats()
+    # Vista rápida de 4 semanas · V8.2.7
+    # Usa semanas calendario longitudinales para que los entrenamientos históricos
+    # sigan visibles aunque el plan se haya recalibrado/archivado.
+    weekly_all = longitudinal_calendar_weekly_stats()
     if weekly_all:
         today_monday, _ = week_bounds(rcp_today())
-        eligible = [w for w in weekly_all if w["start"] <= today_monday]
-        preview = (eligible[-4:] if eligible else weekly_all[:4])
+        eligible = [w for w in weekly_all if w.get("start") and w["start"] <= today_monday]
+        preview = (eligible[-4:] if eligible else weekly_all[-4:])
         quick_values = []
         for w in preview:
+            _week_label = w.get("label") or (f"S{w.get('week')}" if w.get("week") is not None else "Semana")
             quick_values.extend([
-                {"Semana": w["label"], "Serie": "Plan", "KM": round(w["plan"], 1)},
-                {"Semana": w["label"], "Serie": "Real", "KM": round(w["real"], 1)},
+                {"Semana": _week_label, "Serie": "Plan activo", "KM": round(float(w.get("plan") or 0), 1)},
+                {"Semana": _week_label, "Serie": "Real", "KM": round(float(w.get("real") or 0), 1)},
             ])
         st.markdown("### 📊 Últimas semanas")
         st.vega_lite_chart(
@@ -11997,7 +12000,7 @@ elif current_page == "Progreso":
     st.subheader("📈 Progreso")
     st.caption("Explora carga, volumen, cumplimiento, ritmo, frecuencia cardiaca y evolución de las sesiones.")
 
-    # V8.2.6 · Historial real transversal a todas las versiones del plan.
+    # V8.2.7 · Historial real transversal a todas las versiones del plan.
     # El plan activo se usa para cumplimiento; la historia del corredor nunca se oculta al recalibrar.
     with st.container(border=True):
         st.markdown("### 🗂️ Historial real de entrenamientos")
