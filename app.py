@@ -3718,7 +3718,7 @@ def session_execution_steps(session, goal_row=None, assessment=None, profile_row
     if easy_pace:
         easy_ref += f" · exterior {easy_pace}"
     if easy_speed:
-        easy_ref += f" · caminadora {easy_speed} km/h aprox."
+        easy_ref += f" · caminadora {easy_speed} aprox."
     work_ref = str(session.get("target") or "al esfuerzo indicado")
     if surface.get("pace"):
         work_ref += f" · exterior {surface['pace']}"
@@ -3750,11 +3750,23 @@ def session_execution_steps(session, goal_row=None, assessment=None, profile_row
 
     # Larga con bloques específicos: explica exactamente dónde van los bloques.
     if kind == "Larga" and re.search(r"2\s*[×x]\s*10[-–]15\s*min", desc, flags=re.IGNORECASE):
+        # La referencia de los bloques específicos NO es el ritmo fácil de la larga.
+        # La descripción persistida ya contiene el ritmo específico calculado por RCP;
+        # lo extraemos y convertimos a km/h para explicar exactamente qué hacer.
+        _specific_paces = _target_pace_seconds(desc)
+        _specific_pace_txt = _pace_text_from_seconds(_specific_paces) if _specific_paces else None
+        _specific_speed_txt = _speed_text_from_paces(_specific_paces) if _specific_paces else None
+        _incline_txt = treadmill_incline_reference({"workout_type": "ESPECIFICO_21K", "workout_name": "Bloque específico llano"}).get("label")
+        _specific_ref = "RPE 5–6/10"
+        if _specific_pace_txt:
+            _specific_ref += f" · exterior {_specific_pace_txt}"
+        if _specific_speed_txt:
+            _specific_ref += f" · caminadora {_specific_speed_txt} · pendiente {_incline_txt}"
         return [
-            f"1. Primera parte: corre fácil a RPE 3–4/10. Mantén este ritmo hasta que falten aproximadamente 35–40 min para terminar la sesión.",
-            f"2. Primer bloque específico: corre 10–15 min a RPE 5–6/10, cerca del esfuerzo de media maratón. {('Referencia: ' + surface['pace'] + ' exterior. ') if surface.get('pace') else ''}{('En caminadora: ' + surface['speed'] + '. ') if surface.get('speed') else ''}",
+            "1. Primera parte: corre fácil a RPE 3–4/10. Mantén este ritmo hasta que falten aproximadamente 35–40 min para terminar la sesión.",
+            f"2. Primer bloque específico: corre 10–15 min a {_specific_ref}. Debe sentirse firme pero controlado, no como una carrera máxima.",
             "3. Recuperación: trota 5 min muy suave; no te detengas salvo necesidad de hidratación o logística.",
-            "4. Segundo bloque específico: vuelve a correr 10–15 min a RPE 5–6/10. Debe ser parecido al primer bloque, no más rápido por obligación.",
+            f"4. Segundo bloque específico: vuelve a correr 10–15 min a {_specific_ref}. Debe ser parecido al primer bloque, no más rápido por obligación. Si el RPE supera 6/10, baja el ritmo.",
             "5. Final: completa los minutos o kilómetros restantes muy suave. Las pausas breves para beber están permitidas.",
         ]
 
@@ -5529,29 +5541,89 @@ def _v7_long_cap(goal):
 
 
 def _v7_long_distance(weekly_km, answers, goal, phase, week_idx, total_weeks, days_count):
-    current_long = float(answers.get("long_run_km") or 0)
-    cap = _v7_long_cap(goal)
-    frac = 0.32 if days_count <= 3 else 0.28
-    upper_frac = 0.42 if days_count <= 3 else 0.38
-    baseline_long = max(4.0, weekly_km * frac)
-    if current_long > 0:
-        preserve = current_long * (0.82 if week_idx == 0 else 0.88)
-        baseline_long = max(baseline_long, preserve)
-    long_km = min(cap, baseline_long, weekly_km * upper_frac)
+    """V8.2.4 · Tirada larga guiada por historial, objetivo y fase.
 
+    El porcentaje del kilometraje semanal deja de ser un techo rígido. Si el corredor
+    ya ha demostrado tolerancia a una tirada larga mayor, ese historial tiene prioridad
+    sobre una semana que haya quedado artificialmente reducida por disponibilidad horaria.
+    El porcentaje semanal se conserva solo como referencia/guardarraíl blando.
+    """
+    current_long = float(answers.get("long_run_km") or 0)
+    cap = float(_v7_long_cap(goal))
+    goal = str(goal or "")
+    phase = str(phase or "DESARROLLO").upper()
+    weekly_km = max(0.0, float(weekly_km or 0))
+    progress = (week_idx + 1) / max(1, int(total_weeks or 1))
+
+    # Ancla por volumen semanal: útil cuando no existe historial suficiente, pero ya
+    # no limita por sí sola a un corredor que ha demostrado tolerar más distancia.
+    frac = 0.32 if days_count <= 3 else 0.28
+    weekly_anchor = max(4.0, weekly_km * frac)
+
+    # Ancla por historial. Para 21K se conserva y recupera progresivamente una tirada
+    # larga ya tolerada; en fase específica puede superarla de forma pequeña y controlada.
+    history_anchor = 0.0
+    history_cap = cap
+    if current_long > 0:
+        if goal == "21K":
+            if phase == "BASE":
+                history_factor = 0.84 + 0.08 * progress
+            elif phase == "DESARROLLO":
+                history_factor = 0.88 + 0.10 * progress
+            elif phase == "ESPECÍFICA":
+                history_factor = 0.94 + 0.10 * progress
+            else:
+                history_factor = 0.88
+            history_anchor = current_long * history_factor
+            # En media maratón no se necesita forzar >21 km, pero si el historial lo
+            # permite RCP puede llegar aproximadamente a 21–22 km antes del taper.
+            history_cap = min(cap, max(current_long, min(22.0, current_long * 1.05)))
+        elif goal == "42K":
+            if phase == "BASE":
+                history_factor = 0.88 + 0.06 * progress
+            elif phase == "DESARROLLO":
+                history_factor = 0.92 + 0.10 * progress
+            elif phase == "ESPECÍFICA":
+                history_factor = 0.98 + 0.10 * progress
+            else:
+                history_factor = 0.90
+            history_anchor = current_long * history_factor
+            history_cap = min(cap, max(current_long, current_long * 1.08))
+        else:
+            history_factor = 0.84 + (0.08 if phase in {"DESARROLLO", "ESPECÍFICA"} else 0.03)
+            history_anchor = current_long * history_factor
+            history_cap = min(cap, max(current_long, current_long * 1.05))
+
+    long_km = max(weekly_anchor, history_anchor)
+
+    # Guardarraíl blando: sin historial no dejamos que una sola sesión absorba una
+    # fracción desproporcionada de la semana. Con historial suficiente se permite
+    # superar ese porcentaje, porque el recorte semanal puede deberse solo al tiempo
+    # disponible entre semana.
+    soft_share = 0.46 if days_count >= 4 else 0.50
+    soft_cap = weekly_km * soft_share if weekly_km > 0 else cap
+    if current_long <= 0 or current_long < long_km * 0.90:
+        long_km = min(long_km, max(4.0, soft_cap))
+
+    long_km = min(cap, history_cap, long_km)
+
+    # Taper: aquí sí reducimos deliberadamente la tirada larga respecto al historial.
     if phase == "TAPER":
         taper_weeks_left = max(1, total_weeks - week_idx)
         factor = 0.65 if taper_weeks_left >= 2 else 0.48
-        long_km = min(long_km, max(4.0, current_long * factor if current_long else weekly_km * 0.24))
-    if str(goal) in ("Empezar a correr", "Correr 30 min continuos"):
+        taper_reference = current_long * factor if current_long else weekly_km * 0.24
+        long_km = min(long_km, max(4.0, taper_reference))
+
+    if goal in ("Empezar a correr", "Correr 30 min continuos"):
         long_km = min(long_km, 6.0)
+
     return round(max(3.0, long_km), 1)
 
 
 def _v7_quality_count(level, days_count, phase, answers, focus="AUTO"):
     """Número de estímulos principales de calidad.
 
-    V8.2.3: la base no significa cero velocidad. En corredores intermedios/avanzados
+    V8.2.4: la base no significa cero velocidad. En corredores intermedios/avanzados
     se conserva un estímulo breve/controlado, mientras la gran mayoría de la carga
     permanece fácil. Una carrera preparatoria cuenta después como estímulo de calidad
     y el módulo de carreras descarga lo cercano.
@@ -6278,7 +6350,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 "is_optional": False,
             })
 
-    # V8.2.3 · Carreras + distribución dinámica basada en evidencia.
+    # V8.2.4 · Carreras + distribución dinámica basada en evidencia.
     rows, _applied_prep_races = _apply_preparatory_races_to_rows(
         rows, prep_races, goal_row.get("race_date"), monday0, total_weeks
     )
@@ -6311,7 +6383,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     _declared_weekly_km = float(answers.get("weekly_km") or 0)
 
     metadata = {
-        "engine": "RCP-V8.2.3",
+        "engine": "RCP-V8.2.4",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -6366,7 +6438,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V8.2.3",
+        "engine_version": "RCP-V8.2.4",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -6452,7 +6524,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V8.2.3",
+        "engine_version": "RCP-V8.2.4",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -7765,7 +7837,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         _goal_focus = resolve_development_focus(active_goal, assessment).get("resolved")
         if _plan_focus:
             st.caption(f"🫁 Foco del plan: {development_focus_label(_plan_focus)}")
-        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.3"):
+        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.4"):
             with st.expander("🧠 Recalibrar plan con motor dinámico actual", expanded=True):
                 _focus_start = expected_next_training_date(rcp_today()) or (rcp_today() + timedelta(days=1))
                 _preview_goal = dict(active_goal)
@@ -7798,7 +7870,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     if st.button("🫁 Crear plan con este enfoque", type="primary", use_container_width=True, disabled=not _confirm_focus, key="apply_focus_rebuild"):
                         new_plan, err = replace_active_plan_with_v7(active_goal, profile, assessment, start_date_value=_focus_start)
                         if new_plan:
-                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.3 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
+                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.4 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
                             st.rerun()
                         else:
                             st.error(err or "No fue posible crear el nuevo plan.")
