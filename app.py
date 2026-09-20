@@ -364,7 +364,7 @@ def secret(name, default=""):
 SUPABASE_URL = secret("SUPABASE_URL").rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = secret("SUPABASE_PUBLISHABLE_KEY")
 APP_URL = secret("APP_URL", "https://runningcoachpro.streamlit.app")
-APP_VERSION = "8.1.6"
+APP_VERSION = "8.2.0"
 
 
 # ============================================================
@@ -1495,6 +1495,127 @@ def get_active_goal():
     )
     return rows[0] if rows else None
 
+
+
+# ============================================================
+# V8.2 · MÓDULO DE CARRERAS PREPARATORIAS
+# ============================================================
+def races_storage_ready():
+    """Comprueba que existe la tabla de carreras preparatorias V8.2."""
+    try:
+        (
+            client.table("rc_races")
+            .select("id,user_id,goal_id,race_date,name,distance_km,priority,effort,status")
+            .eq("user_id", USER_ID)
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def get_goal_races(goal_id=None, include_cancelled=False):
+    """Carreras asociadas al objetivo. El objetivo principal sigue viviendo en rc_goals."""
+    if not races_storage_ready():
+        return []
+    gid = goal_id
+    if gid is None:
+        active = get_active_goal()
+        gid = (active or {}).get("id")
+    if not gid:
+        return []
+    try:
+        q = (
+            client.table("rc_races")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .eq("goal_id", int(gid))
+            .order("race_date")
+        )
+        if not include_cancelled:
+            q = q.neq("status", "CANCELLED")
+        return q.execute().data or []
+    except Exception:
+        return []
+
+
+def save_goal_race(payload):
+    """Crea o actualiza una carrera preparatoria sin tocar el plan hasta confirmación del usuario."""
+    values = dict(payload or {})
+    active_goal = get_active_goal()
+    goal_id = values.get("goal_id") or (active_goal or {}).get("id")
+    if not goal_id:
+        raise RuntimeError("No existe un objetivo activo al cual asociar la carrera.")
+    values["user_id"] = USER_ID
+    values["goal_id"] = int(goal_id)
+    values["updated_at"] = datetime.now(timezone.utc).isoformat()
+    client.table("rc_races").upsert(
+        values,
+        on_conflict="user_id,goal_id,race_date",
+    ).execute()
+
+
+def update_goal_race(race_id, **changes):
+    if not race_id:
+        return
+    values = dict(changes)
+    values["updated_at"] = datetime.now(timezone.utc).isoformat()
+    (
+        client.table("rc_races")
+        .update(values)
+        .eq("user_id", USER_ID)
+        .eq("id", int(race_id))
+        .execute()
+    )
+
+
+def delete_goal_race(race_id):
+    if not race_id:
+        return
+    (
+        client.table("rc_races")
+        .delete()
+        .eq("user_id", USER_ID)
+        .eq("id", int(race_id))
+        .execute()
+    )
+
+
+def _parse_race_time_text(value):
+    """Acepta MM:SS, H:MM:SS o segundos vacíos. Devuelve segundos o None."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = [int(x) for x in raw.split(":")]
+    except Exception:
+        return None
+    if len(parts) == 2:
+        mm, ss = parts
+        if mm < 0 or not (0 <= ss < 60):
+            return None
+        return mm * 60 + ss
+    if len(parts) == 3:
+        hh, mm, ss = parts
+        if hh < 0 or not (0 <= mm < 60) or not (0 <= ss < 60):
+            return None
+        return hh * 3600 + mm * 60 + ss
+    return None
+
+
+def race_priority_label(value):
+    return {
+        "B": "Importante · competir con intención",
+        "C": "Control · parte del entrenamiento",
+    }.get(str(value or "C").upper(), "Control · parte del entrenamiento")
+
+
+def race_effort_label(value):
+    return {
+        "COMPETE": "Competir fuerte",
+        "CONTROLLED": "Correr controlado",
+    }.get(str(value or "CONTROLLED").upper(), "Correr controlado")
 
 def get_plans(limit=50):
     return (
@@ -5396,6 +5517,198 @@ def can_generate_v7_plan(goal_row, assessment):
     return True, None
 
 
+
+def _race_plan_row_kind(row):
+    txt = f"{(row or {}).get('workout_type') or ''} {(row or {}).get('workout_name') or ''} {(row or {}).get('intensity') or ''}".upper()
+    if "CARRERA" in txt or "COMPET" in txt:
+        return "RACE"
+    if "LARGA" in txt or "TIRADA" in txt:
+        return "LONG"
+    if "SERIE" in txt or "INTERVAL" in txt or "TEMPO" in txt or "UMBRAL" in txt or "FARTLEK" in txt:
+        return "QUALITY"
+    if "RECUP" in txt:
+        return "RECOVERY"
+    return "EASY"
+
+
+def _race_easy_version(row, factor=0.65, activation=False, optional=False, note=""):
+    """Convierte una sesión alrededor de una carrera en trabajo fácil sin trasladar carga a otro día."""
+    out = dict(row or {})
+    original = float(out.get("planned_km") or 0)
+    if activation:
+        km = min(5.0, max(2.5, round(original * factor, 1) if original else 3.0))
+        out.update({
+            "workout_type": "ACTIVACION",
+            "workout_name": f"Activación pre-carrera {km:g} km",
+            "planned_km": km,
+            "target": "RPE 2–3/10 · muy fácil",
+            "intensity": "ACTIVACIÓN",
+            "description": "Rodaje muy suave. Si te sientes bien, añade 3–4 progresiones breves de 15–20 s con recuperación completa. No conviertas la activación en una sesión exigente.",
+            "is_optional": bool(optional),
+        })
+    else:
+        km = max(2.5, round(original * factor, 1) if original else 3.0)
+        out.update({
+            "workout_type": "RECUPERACION",
+            "workout_name": f"Rodaje de recuperación {km:g} km",
+            "planned_km": km,
+            "target": "RPE 2–3/10 · conversación completa",
+            "intensity": "RECUPERACIÓN",
+            "description": "Muy suave. Esta sesión fue reducida porque una carrera preparatoria ya aporta carga de calidad esa semana. No recuperes los kilómetros retirados.",
+            "is_optional": bool(optional),
+        })
+    if note:
+        out["description"] = f"{out.get('description') or ''} {note}".strip()
+    return out
+
+
+def _prep_race_target(race):
+    effort = str((race or {}).get("effort") or "CONTROLLED").upper()
+    target_sec = (race or {}).get("target_time_sec")
+    target_txt = f" · meta {fmt_time(target_sec)}" if target_sec else ""
+    if effort == "COMPETE":
+        return f"RPE 8–9/10 · competir fuerte{target_txt}"
+    return f"RPE 6–7/10 · controlado, sin vaciarte{target_txt}"
+
+
+def _apply_preparatory_races_to_rows(rows, races, goal_race_date, monday0, total_weeks):
+    """Integra carreras previas al objetivo como carga real y protege los días alrededor."""
+    out = [dict(x) for x in (rows or [])]
+    applied = []
+    goal_day = None
+    try:
+        goal_day = date.fromisoformat(str(goal_race_date)) if goal_race_date else None
+    except Exception:
+        goal_day = None
+
+    valid_races = []
+    for race in races or []:
+        if str(race.get("status") or "PLANNED").upper() == "CANCELLED":
+            continue
+        try:
+            rd = date.fromisoformat(str(race.get("race_date")))
+            dist = float(race.get("distance_km") or 0)
+        except Exception:
+            continue
+        if dist <= 0 or (goal_day and rd >= goal_day):
+            continue
+        valid_races.append((rd, race))
+    valid_races.sort(key=lambda x: x[0])
+
+    for rd, race in valid_races:
+        priority = str(race.get("priority") or "C").upper()
+        dist = float(race.get("distance_km") or 0)
+        race_monday = rd - timedelta(days=rd.weekday())
+        same_week_start = race_monday
+        same_week_end = race_monday + timedelta(days=6)
+
+        adjusted = []
+        for row in out:
+            try:
+                d = date.fromisoformat(str(row.get("session_date")))
+            except Exception:
+                adjusted.append(row)
+                continue
+            if d == rd:
+                # La carrera sustituye la sesión de ese día.
+                continue
+            kind = _race_plan_row_kind(row)
+            if kind == "RACE":
+                adjusted.append(row)
+                continue
+            delta = (d - rd).days
+            same_week = same_week_start <= d <= same_week_end
+            new_row = row
+
+            if priority == "B":
+                if delta == -1:
+                    new_row = _race_easy_version(row, 0.45, activation=True, optional=True,
+                        note="La carrera de mañana es el estímulo principal.")
+                elif delta == -2 and kind in {"QUALITY", "LONG"}:
+                    new_row = _race_easy_version(row, 0.60, optional=False,
+                        note="Se retira la intensidad para llegar con frescura a la carrera.")
+                elif delta == -3 and dist >= 15 and kind in {"QUALITY", "LONG"}:
+                    new_row = _race_easy_version(row, 0.70, optional=False)
+                elif delta == 1:
+                    new_row = _race_easy_version(row, 0.40 if dist >= 15 else 0.55, optional=True,
+                        note="El descanso completo también es válido si quedan molestias o fatiga de la carrera.")
+                elif delta == 2 and dist >= 15 and kind == "QUALITY":
+                    new_row = _race_easy_version(row, 0.65, optional=False)
+                elif same_week and dist >= 12 and kind == "LONG":
+                    new_row = _race_easy_version(row, 0.55, optional=(d > rd),
+                        note="La carrera cumple el papel de la carga larga principal de esta semana.")
+                elif same_week and kind == "QUALITY" and abs(delta) <= 3:
+                    new_row = _race_easy_version(row, 0.65, optional=False,
+                        note="La carrera reemplaza la sesión de calidad cercana.")
+            else:  # C · control
+                if delta == -1 and kind in {"QUALITY", "LONG"}:
+                    new_row = _race_easy_version(row, 0.65, activation=True, optional=True)
+                elif delta == 1 and kind in {"QUALITY", "LONG"}:
+                    new_row = _race_easy_version(row, 0.65, optional=True)
+                elif same_week and kind == "QUALITY" and abs(delta) <= 1:
+                    new_row = _race_easy_version(row, 0.70, optional=False)
+
+            adjusted.append(new_row)
+        out = adjusted
+
+        # Calcula semana dentro del ciclo actual aunque la carrera caiga en un día no habitual.
+        week_no = max(1, min(int(total_weeks), ((rd - monday0).days // 7) + 1))
+        race_name = str(race.get("name") or f"Carrera {dist:g} km")
+        priority_txt = "carrera preparatoria importante" if priority == "B" else "carrera de control"
+        effort_txt = "competir fuerte" if str(race.get("effort") or "CONTROLLED").upper() == "COMPETE" else "correr controlado"
+        out.append({
+            "user_id": USER_ID,
+            "session_date": rd.isoformat(),
+            "week_no": week_no,
+            "workout_type": "CARRERA_PREPARATORIA",
+            "workout_name": f"{race_name} · {dist:g} km",
+            "planned_km": round(dist, 2),
+            "target": _prep_race_target(race),
+            "intensity": "COMPETENCIA PREPARATORIA",
+            "description": (
+                f"{priority_txt.capitalize()}: {effort_txt}. Esta carrera forma parte del camino hacia el objetivo principal. "
+                "Cuenta como carga de calidad y, si la distancia es suficiente, puede sustituir la tirada larga de la semana. "
+                "No compenses después los kilómetros que RCP retire alrededor de la carrera."
+            ),
+            "is_optional": False,
+        })
+        applied.append({
+            "id": race.get("id"),
+            "name": race_name,
+            "date": rd.isoformat(),
+            "distance_km": round(dist, 2),
+            "priority": priority,
+            "effort": str(race.get("effort") or "CONTROLLED").upper(),
+        })
+
+    return out, applied
+
+
+def _refresh_week_meta_from_rows(week_meta, rows):
+    """Sincroniza los resúmenes semanales después de insertar carreras y descargar sesiones."""
+    refreshed = []
+    for item in week_meta or []:
+        w = int(item.get("week") or 0)
+        wr = [r for r in rows or [] if int(r.get("week_no") or 0) == w]
+        new_item = dict(item)
+        if wr:
+            new_item["target_km"] = round(sum(float(r.get("planned_km") or 0) for r in wr if not r.get("is_optional")), 1)
+            long_candidates = [
+                float(r.get("planned_km") or 0)
+                for r in wr
+                if _race_plan_row_kind(r) in {"LONG", "RACE"}
+            ]
+            if long_candidates:
+                new_item["long_km"] = round(max(long_candidates), 1)
+            new_item["quality_sessions"] = sum(1 for r in wr if _race_plan_row_kind(r) in {"QUALITY", "RACE"})
+            new_item["preparatory_races"] = [
+                str(r.get("workout_name") or "Carrera")
+                for r in wr
+                if str(r.get("workout_type") or "").upper() == "CARRERA_PREPARATORIA"
+            ]
+        refreshed.append(new_item)
+    return refreshed
+
 def build_v7_plan(goal_row, assessment, start_date_value=None):
     """Genera filas de rc_plan_sessions + metadata de plan. Función pura salvo USER_ID/rcp_today()."""
     can_generate, reason = can_generate_v7_plan(goal_row, assessment)
@@ -5448,6 +5761,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     initial_km = _v7_initial_volume(answers, level, base_status, goal)
     weekly_volumes = _v7_weekly_volumes(initial_km, total_weeks, phases, progression_mode, goal, development_focus)
     pace_profile = v7_pace_profile(assessment, goal_row)
+    prep_races = get_goal_races(goal_row.get("id")) if races_storage_ready() and goal_row.get("id") else []
 
     monday0 = start_date_value - timedelta(days=start_date_value.weekday())
     rows = []
@@ -5603,6 +5917,11 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 "is_optional": False,
             })
 
+    # V8.2 · Las carreras preparatorias se integran al ciclo antes de la carrera objetivo.
+    rows, _applied_prep_races = _apply_preparatory_races_to_rows(
+        rows, prep_races, goal_row.get("race_date"), monday0, total_weeks
+    )
+
     # Carrera objetivo: se agrega siempre aunque no coincida con un día habitual.
     if race_date and goal in GOAL_KM and GOAL_KM.get(goal):
         race_distance = float(GOAL_KM[goal])
@@ -5622,11 +5941,12 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         })
 
     rows.sort(key=lambda x: x["session_date"])
+    week_meta = _refresh_week_meta_from_rows(week_meta, rows)
     if not rows:
         return [], {}, "El motor V7 no produjo sesiones en el intervalo disponible."
 
     metadata = {
-        "engine": "RCP-V7.3",
+        "engine": "RCP-V8.2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -5650,6 +5970,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
         "pace_profile": {k: v for k, v in pace_profile.items() if k != "source"},
         "physiology_snapshot": physiological_profile_snapshot(globals().get("profile") or {}),
         "weeks": week_meta,
+        "preparatory_races": _applied_prep_races,
         "methodology": {
             "load": "Progresión RCP individualizada por historial, nivel, base y modo de progresión; incluye descargas y límites de pico.",
             "intensity": "RPE (esfuerzo percibido) y prueba del habla siempre; ritmos solo cuando existe una marca reciente utilizable.",
@@ -5657,6 +5978,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
             "strength": "Fuerza complementaria sugerida 1–2 veces/semana según fase y tolerancia.",
             "development_focus": "El objetivo fisiológico dominante cambia fases, densidad de calidad y distribución de carga sin sustituir el objetivo competitivo.",
             "time_availability": "Cada sesión se limita por el tiempo total disponible del día; calentamiento, recuperaciones y enfriamiento deben caber dentro de ese límite. La tirada larga usa el límite específico de su día.",
+            "preparatory_races": "Las carreras previas al objetivo cuentan como carga de calidad. RCP reduce o sustituye intensidad y tirada larga cercanas según distancia y relevancia, sin recuperar después el volumen retirado.",
         },
     }
     return rows, metadata, None
@@ -5672,7 +5994,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V7.3",
+        "engine_version": "RCP-V8.2",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -5758,7 +6080,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V7.3",
+        "engine_version": "RCP-V8.2",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -6781,6 +7103,203 @@ def official_goal_setup(profile, assessment):
     return True
 
 
+
+def races_management_ui(active_goal, active_plan, profile, assessment):
+    st.subheader("🏁 Carreras antes del objetivo")
+    st.caption(
+        "Registra las carreras que harás antes de tu objetivo principal. RCP puede convertirlas en parte del plan, "
+        "retirar calidad cercana y ajustar la tirada larga para que la carrera sume al proceso en vez de quedar encima del entrenamiento."
+    )
+
+    if not RACES_READY:
+        st.warning("Falta activar el módulo de carreras en Supabase. Ejecuta `supabase_v8_2_races.sql` y recarga la app.")
+        return
+    if not active_goal:
+        st.info("Primero necesitas un objetivo activo.")
+        return
+
+    goal_day = None
+    try:
+        goal_day = date.fromisoformat(str(active_goal.get("race_date"))) if active_goal.get("race_date") else None
+    except Exception:
+        goal_day = None
+
+    if goal_day:
+        st.info(f"🎯 Objetivo principal: **{active_goal.get('goal_type') or '—'} · {goal_day.strftime('%d/%m/%Y')}**")
+    else:
+        st.info(f"🎯 Objetivo principal: **{active_goal.get('goal_type') or '—'}** · sin fecha definida")
+
+    races = get_goal_races(active_goal.get("id"))
+    upcoming = []
+    past = []
+    for race in races:
+        try:
+            rd = date.fromisoformat(str(race.get("race_date")))
+        except Exception:
+            continue
+        (upcoming if rd >= rcp_today() else past).append((rd, race))
+
+    st.markdown("### Próximas carreras")
+    if not upcoming:
+        st.caption("No tienes carreras preparatorias registradas.")
+    for rd, race in upcoming:
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1.5, 1.2])
+            c1.markdown(f"**🏁 {race.get('name') or 'Carrera'}**")
+            c1.caption(rd.strftime("%d/%m/%Y"))
+            c2.metric("Distancia", f"{float(race.get('distance_km') or 0):g} km")
+            c3.write(race_priority_label(race.get("priority")))
+            c4.write(race_effort_label(race.get("effort")))
+            if race.get("target_time_sec"):
+                st.caption(f"Meta orientativa: {fmt_time(race.get('target_time_sec'))}")
+            if race.get("notes"):
+                st.write(str(race.get("notes")))
+            _dist = float(race.get("distance_km") or 0)
+            _priority = str(race.get("priority") or "C").upper()
+            if _priority == "B":
+                st.caption("RCP la tratará como un estímulo importante: descargará 2–3 días alrededor y evitará duplicar calidad o tirada larga cercana.")
+            elif _dist >= 12:
+                st.caption("Por la distancia, esta carrera puede reemplazar parte de la tirada larga de esa semana.")
+            else:
+                st.caption("RCP la contará como sesión de calidad/control y evitará poner otra sesión exigente pegada a ella.")
+            d1, d2 = st.columns(2)
+            if d1.button("✅ Ir al día de la carrera", key=f"race_open_{race.get('id')}", use_container_width=True):
+                set_page("Semana", rd)
+                st.rerun()
+            if d2.button("🗑️ Eliminar carrera", key=f"race_delete_{race.get('id')}", use_container_width=True):
+                delete_goal_race(race.get("id"))
+                st.session_state["rcp_saved_notice"] = "Carrera eliminada. El plan vigente no se cambia hasta que confirmes una nueva recalibración."
+                st.rerun()
+
+    with st.expander("➕ Añadir carrera", expanded=not bool(upcoming)):
+        with st.form("add_preparatory_race_form"):
+            r1, r2 = st.columns(2)
+            race_name = r1.text_input("Nombre", placeholder="Ej.: 10K de Santiago")
+            default_race_date = rcp_today() + timedelta(weeks=4)
+            if goal_day:
+                default_race_date = min(default_race_date, goal_day - timedelta(days=7))
+                default_race_date = max(default_race_date, rcp_today())
+            race_date_value = r2.date_input(
+                "Fecha",
+                value=default_race_date,
+                min_value=rcp_today(),
+                max_value=(goal_day - timedelta(days=1)) if goal_day else (rcp_today() + timedelta(days=1095)),
+            )
+            r3, r4 = st.columns(2)
+            distance_choice = r3.selectbox("Distancia", ["5K", "10K", "15K", "21K", "42K", "Otra"])
+            if distance_choice == "Otra":
+                distance_km = r3.number_input("Distancia exacta (km)", 1.0, 100.0, 8.0, 0.1)
+            else:
+                distance_km = {"5K":5.0, "10K":10.0, "15K":15.0, "21K":21.0975, "42K":42.195}[distance_choice]
+            priority_ui = r4.selectbox(
+                "Importancia para el plan",
+                ["Control · parte del entrenamiento", "Importante · competir con intención"],
+                help="Una carrera importante recibe más descarga antes y recuperación después. Una carrera de control sustituye principalmente una sesión de calidad."
+            )
+            effort_ui = st.radio(
+                "Cómo quieres correrla",
+                ["Correr controlado", "Competir fuerte"],
+                horizontal=True,
+            )
+            target_time_text = st.text_input("Tiempo objetivo opcional", placeholder="Ej.: 45:00 o 1:35:00")
+            race_notes = st.text_area("Nota opcional", placeholder="Ej.: carrera de preparación para probar ritmo y nutrición.")
+            race_submit = st.form_submit_button("💾 Guardar carrera", use_container_width=True)
+
+        if race_submit:
+            if goal_day and race_date_value >= goal_day:
+                st.error("La carrera preparatoria debe ser anterior al objetivo principal.")
+            elif not str(race_name or "").strip():
+                st.error("Escribe un nombre para la carrera.")
+            else:
+                target_sec = _parse_race_time_text(target_time_text)
+                if target_time_text.strip() and target_sec is None:
+                    st.error("El tiempo debe escribirse como MM:SS o H:MM:SS.")
+                else:
+                    save_goal_race({
+                        "race_date": race_date_value.isoformat(),
+                        "name": race_name.strip(),
+                        "distance_km": float(distance_km),
+                        "priority": "B" if priority_ui.startswith("Importante") else "C",
+                        "effort": "COMPETE" if effort_ui == "Competir fuerte" else "CONTROLLED",
+                        "target_time_sec": target_sec,
+                        "status": "PLANNED",
+                        "notes": race_notes.strip() or None,
+                    })
+                    st.session_state["rcp_saved_notice"] = "Carrera guardada. Confirma abajo si quieres que RCP reconstruya las sesiones futuras alrededor de ella."
+                    st.rerun()
+
+    races = get_goal_races(active_goal.get("id"))
+    future_races = []
+    for race in races:
+        try:
+            rd = date.fromisoformat(str(race.get("race_date")))
+        except Exception:
+            continue
+        if rd >= rcp_today() and (not goal_day or rd < goal_day):
+            future_races.append(race)
+
+    if future_races and active_plan:
+        st.markdown("### 🔄 Ajustar el plan a estas carreras")
+        st.write(
+            "Al confirmar, RCP crea una nueva versión de las sesiones futuras teniendo en cuenta las carreras. "
+            "La carrera reemplaza carga de calidad y, cuando corresponde, parte de la tirada larga. El plan anterior y los entrenamientos ya registrados permanecen en el historial."
+        )
+        preview_start = rcp_today() + timedelta(days=1)
+        preview_rows, preview_meta, preview_reason = build_v7_plan(active_goal, assessment, start_date_value=preview_start)
+        if preview_reason:
+            st.warning(preview_reason)
+        else:
+            prep = preview_meta.get("preparatory_races") or []
+            if prep:
+                st.dataframe([
+                    {
+                        "Fecha": x.get("date"),
+                        "Carrera": x.get("name"),
+                        "Distancia": f"{float(x.get('distance_km') or 0):g} km",
+                        "Tratamiento": race_priority_label(x.get("priority")),
+                    }
+                    for x in prep
+                ], use_container_width=True, hide_index=True)
+            confirm_races = st.checkbox(
+                "Confirmo que quiero recalibrar las sesiones futuras alrededor de estas carreras.",
+                key="confirm_race_plan_rebuild",
+            )
+            if st.button(
+                "🏁 Ajustar mi plan a las carreras",
+                type="primary",
+                use_container_width=True,
+                disabled=not confirm_races,
+                key="apply_race_plan_rebuild",
+            ):
+                new_plan, err = replace_active_plan_with_v7(
+                    active_goal, profile, assessment, start_date_value=preview_start
+                )
+                if new_plan:
+                    st.session_state["rcp_saved_notice"] = "Plan recalibrado con tus carreras preparatorias. El historial anterior se conserva."
+                    st.rerun()
+                else:
+                    st.error(err or "No fue posible ajustar el plan.")
+
+    if past:
+        with st.expander("Historial de carreras registradas", expanded=False):
+            for rd, race in reversed(past):
+                log = LOG_BY_DATE.get(rd.isoformat()) if 'LOG_BY_DATE' in globals() else None
+                status = str((log or {}).get("status") or "").upper()
+                done = status in {"COMPLETADO", "MODIFICADO"}
+                st.write(
+                    f"{'✅' if done else '🏁'} **{rd.strftime('%d/%m/%Y')} · {race.get('name') or 'Carrera'} · "
+                    f"{float(race.get('distance_km') or 0):g} km**"
+                )
+                if done:
+                    bits = []
+                    if (log or {}).get("actual_duration_sec"):
+                        bits.append(fmt_time((log or {}).get("actual_duration_sec")))
+                    if (log or {}).get("rpe") is not None:
+                        bits.append(f"RPE {float((log or {}).get('rpe')):g}/10")
+                    if bits:
+                        st.caption(" · ".join(bits))
+
+
 def goal_management_ui(active_goal, active_plan, profile, assessment):
     st.subheader("🎯 Objetivo actual")
     if not active_goal:
@@ -6845,7 +7364,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         )
 
     engine_name = str((active_plan or {}).get("engine_version") or "")
-    if active_plan and engine_name.startswith("RCP-V7"):
+    if active_plan and (engine_name.startswith("RCP-V7") or engine_name.startswith("RCP-V8")):
         meta = active_plan.get("metadata") or {}
         st.markdown("### 🧠 Motor de planificación RCP")
         e1, e2, e3, e4 = st.columns(4)
@@ -6863,7 +7382,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         _goal_focus = resolve_development_focus(active_goal, assessment).get("resolved")
         if _plan_focus:
             st.caption(f"🫁 Foco del plan: {development_focus_label(_plan_focus)}")
-        if development_focus_storage_ready() and (_plan_focus != _goal_focus or not engine_name.startswith("RCP-V7.3")):
+        if development_focus_storage_ready() and (_plan_focus != _goal_focus or not (engine_name.startswith("RCP-V7.3") or engine_name.startswith("RCP-V8.2"))):
             with st.expander("🫁 Recalibrar el plan con enfoque de entrenamiento", expanded=True):
                 _focus_start = expected_next_training_date(rcp_today()) or (rcp_today() + timedelta(days=1))
                 _preview_goal = dict(active_goal)
@@ -7202,6 +7721,10 @@ if not (ACTIVE_GOAL.get("readiness_snapshot") or {}):
     ACTIVE_GOAL["readiness_snapshot"] = _migrated_snapshot
     ACTIVE_GOAL["source_assessment_id"] = LATEST_ASSESSMENT.get("id")
 
+# V8.2 · Carreras preparatorias asociadas al objetivo activo.
+RACES_READY = races_storage_ready()
+GOAL_RACES = get_goal_races(ACTIVE_GOAL["id"]) if RACES_READY and ACTIVE_GOAL else []
+
 ACTIVE_PLAN = get_active_plan_record()
 PLAN = get_plan(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
 LOGS = get_logs(ACTIVE_PLAN["id"]) if ACTIVE_PLAN else []
@@ -7255,6 +7778,7 @@ PAGE_META = {
     "Progreso": ("📈", "Gráficos y tendencias"),
     "Plan": ("🗓️", "Plan completo"),
     "Registro": ("✅", "Registrar entrenamiento"),
+    "Carreras": ("🏁", "Carreras antes del objetivo"),
     "Objetivo": ("🎯", "Objetivo activo"),
     "Evaluación": ("🧭", "Evaluación RCP"),
     "Perfil": ("⚙️", "Cuenta y perfil"),
@@ -10329,26 +10853,22 @@ if current_page == "Hoy":
                                 disabled=_extra_blocked,
                             )
                         if _extra_submit:
-                            _pace_prof_extra = v7_pace_profile(LATEST_ASSESSMENT, ACTIVE_GOAL)
-                            _extra_max_km_for_time = max_distance_for_time(_extra_minutes, "EASY", _pace_prof_extra)
-                            if _extra_km and _extra_max_km_for_time and float(_extra_km) > float(_extra_max_km_for_time) + 0.3:
-                                st.error(
-                                    f"Esa distancia probablemente no cabe en {_extra_minutes} min manteniendo esfuerzo fácil. "
-                                    f"Usa como referencia hasta ~{float(_extra_max_km_for_time):.1f} km o deja la distancia en 0 y corre por tiempo."
-                                )
-                            else:
-                                save_extra_session({
-                                    "session_date": selected_day.isoformat(),
-                                    "workout_type": _extra_type,
-                                    "planned_minutes": int(_extra_minutes),
-                                    "planned_km": float(_extra_km) if _extra_km else None,
-                                    "target_rpe": int(_extra_rpe),
-                                    "notes": _extra_notes.strip() or None,
-                                })
-                                st.session_state["rcp_saved_notice"] = (
-                                    "Entrenamiento adicional guardado. El plan base quedó exactamente igual."
-                                )
-                                st.rerun()
+                            # V8.1.7 · El entrenamiento adicional es una decisión manual del usuario.
+                            # No se bloquea por una relación estimada distancia↔tiempo ni por el límite
+                            # habitual del día. Si se informan tiempo y distancia, solo se muestra
+                            # posteriormente como dato real/objetivo; RCP no los corrige ni recorta.
+                            save_extra_session({
+                                "session_date": selected_day.isoformat(),
+                                "workout_type": _extra_type,
+                                "planned_minutes": int(_extra_minutes),
+                                "planned_km": float(_extra_km) if _extra_km else None,
+                                "target_rpe": int(_extra_rpe),
+                                "notes": _extra_notes.strip() or None,
+                            })
+                            st.session_state["rcp_saved_notice"] = (
+                                "Entrenamiento adicional guardado tal como lo definiste. El plan base quedó exactamente igual."
+                            )
+                            st.rerun()
                 else:
                     st.caption("Para añadir entrenamientos opcionales activa la actualización V8.1.5 en Supabase.")
         else:
@@ -11877,6 +12397,13 @@ elif current_page == "Registro":
                 delete_log(selected_day.isoformat())
                 st.success("Registro eliminado.")
                 st.rerun()
+
+
+# ============================================================
+# 🏁 CARRERAS PREPARATORIAS
+# ============================================================
+elif current_page == "Carreras":
+    races_management_ui(ACTIVE_GOAL, ACTIVE_PLAN, profile, LATEST_ASSESSMENT)
 
 
 # ============================================================
