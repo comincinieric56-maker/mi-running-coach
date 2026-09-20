@@ -2352,7 +2352,7 @@ def _session_zone_key(session):
     blob = f"{wt} {name}"
     if "CARRERA" in blob or "RACE" in blob:
         return "race"
-    # V8.2.2: una sesión específica no puede caer por defecto en la zona fácil.
+    # V8.2.3: una sesión específica no puede caer por defecto en la zona fácil.
     if "ESPECIF" in blob or "RITMO_CARRERA" in blob:
         return "specific"
     if "LARGA" in blob or "LONG" in blob:
@@ -2457,7 +2457,7 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
             "note": "Equivalencia directa del pace prescrito; la inclinación se ajusta por separado.",
         }
 
-    # V8.2.2 · Trabajo específico: referencia propia, progresiva desde la capacidad
+    # V8.2.3 · Trabajo específico: referencia propia, progresiva desde la capacidad
     # actual hacia la meta. Nunca reutiliza la zona de rodaje fácil.
     _zone_key = _session_zone_key(session)
     if _zone_key == "specific":
@@ -2467,7 +2467,7 @@ def treadmill_guidance(session, goal_row=None, assessment=None):
                 "speed": _speed_text_from_paces(specific_paces),
                 "pace": _pace_text_from_seconds(specific_paces),
                 "repeats": treadmill_repeat_text(session),
-                "source": "capacidad actual → objetivo · RCP V8.2.2",
+                "source": "capacidad actual → objetivo · RCP V8.2.3",
                 "note": "Referencia para los bloques específicos, no para el promedio de toda la sesión. El RPE 5–6/10 tiene prioridad sobre la cifra.",
             }
 
@@ -3629,20 +3629,188 @@ def v8_self_checks():
     return checks
 
 
+def treadmill_incline_reference(session):
+    """Pendiente orientativa para caminadora.
+
+    V8.2.3: evita la regla rígida de 1%. Para simular un recorrido llano se usa
+    0.5–1% como referencia práctica y el RPE manda. En recuperación puede usarse
+    0–0.5%; en cuestas se prescribe una pendiente real y se ajusta la velocidad.
+    """
+    session = session or {}
+    text = f"{session.get('workout_type') or ''} {session.get('workout_name') or ''} {session.get('intensity') or ''}".upper()
+    if "CUESTA" in text:
+        short = "CORT" in text or "25–35" in str(session.get("description") or "")
+        return {
+            "label": "5–7% en las repeticiones · 0–1% en los tramos suaves" if short else "4–6% en las repeticiones · 0–1% en los tramos suaves",
+            "note": "En cuestas la pendiente crea el estímulo: baja la velocidad lo necesario para mantener el RPE indicado. No intentes conservar la velocidad de intervalos planos.",
+        }
+    if "RECUP" in text:
+        return {
+            "label": "0–0.5%",
+            "note": "Recuperación: no hace falta añadir pendiente para endurecer la sesión. Mantén el RPE prescrito.",
+        }
+    if "RECTA" in text or "ACTIVACION" in text:
+        return {
+            "label": "0.5–1% si buscas simular llano; 0% también es válido si el RPE coincide",
+            "note": "La pendiente no es una regla fija. En los tramos rápidos conserva técnica y RPE; no subas pendiente y velocidad a la vez para 'compensar'.",
+        }
+    return {
+        "label": "0.5–1% como referencia para recorrido llano",
+        "note": "RCP asume terreno llano salvo que la sesión indique cuestas. El 1% no es obligatorio: ajusta entre 0 y 1% para que el RPE y la mecánica se parezcan a tu carrera exterior.",
+    }
+
+
 def session_surface_reference(session, goal_row=None, assessment=None, profile_row=None):
     """Referencia de entrenamiento respetando la preferencia guardada en Perfil."""
     pref = training_surface_preference(profile_row or globals().get("profile") or {})
     guide = treadmill_guidance(session, goal_row, assessment) or {}
+    incline = treadmill_incline_reference(session)
+    text = f"{(session or {}).get('workout_type') or ''} {(session or {}).get('workout_name') or ''}".upper()
+    speed = guide.get("speed")
+    # En cuestas la velocidad plana es engañosa: la pendiente y el RPE tienen prioridad.
+    if "CUESTA" in text:
+        speed = "ajusta la velocidad para mantener el RPE indicado"
+    if speed:
+        speed = f"{speed} · pendiente {incline['label']}"
+    note_bits = [x for x in [guide.get("note"), incline.get("note")] if x]
     return {
         "preference": pref,
         "show_pace": pref in {"EXTERIOR", "AMBOS"},
         "show_speed": pref in {"CAMINADORA", "AMBOS"},
         "pace": guide.get("pace"),
-        "speed": guide.get("speed"),
+        "speed": speed,
+        "incline": incline.get("label"),
         "repeats": guide.get("repeats") or [],
         "source": guide.get("source"),
-        "note": guide.get("note"),
+        "note": " ".join(note_bits),
     }
+
+
+def _easy_execution_reference(goal_row=None, assessment=None):
+    """Ritmo/velocidad suave para explicar calentamientos y recuperaciones."""
+    try:
+        zones = (v8_dynamic_zones(assessment or globals().get("LATEST_ASSESSMENT") or {}, goal_row or globals().get("ACTIVE_GOAL") or {}) or {}).get("zones") or {}
+        easy = zones.get("recovery") or zones.get("easy")
+        if easy:
+            vals = list(easy) if isinstance(easy, (list, tuple)) else [easy]
+            return _pace_text_from_seconds(vals), _speed_text_from_paces(vals)
+    except Exception:
+        pass
+    return None, None
+
+
+def _extract_cap_from_description(description):
+    m = re.search(r"(?:≤|máximo|no supere)\s*(\d+)\s*min", str(description or ""), flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def session_execution_steps(session, goal_row=None, assessment=None, profile_row=None):
+    """Convierte la prescripción en instrucciones humanas, secuenciales y ejecutables."""
+    session = dict(session or {})
+    if not session:
+        return []
+    desc = str(session.get("description") or "").strip()
+    qtype = str(session.get("workout_type") or "").upper()
+    kind = workout_kind(session)
+    surface = session_surface_reference(session, goal_row, assessment, profile_row)
+    easy_pace, easy_speed = _easy_execution_reference(goal_row, assessment)
+    easy_ref = "RPE 2–3/10"
+    if easy_pace:
+        easy_ref += f" · exterior {easy_pace}"
+    if easy_speed:
+        easy_ref += f" · caminadora {easy_speed} km/h aprox."
+    work_ref = str(session.get("target") or "al esfuerzo indicado")
+    if surface.get("pace"):
+        work_ref += f" · exterior {surface['pace']}"
+    if surface.get("speed"):
+        work_ref += f" · caminadora {surface['speed']}"
+
+    # Específico 21K: nunca dejar una instrucción genérica como 'haz una versión reducida'.
+    if "ESPECIFICO_21K" in qtype or (kind == "Específico" and "21" in f"{session.get('workout_name') or ''} {desc}"):
+        cap = _extract_cap_from_description(desc)
+        if not cap:
+            try:
+                day = parse_date_safe(session.get("session_date"))
+                ctx = session_time_context(session, day, assessment or {}, goal_row or {}, profile_row or globals().get("profile") or {}) if day else {}
+                cap = ctx.get("cap_minutes")
+            except Exception:
+                cap = None
+        cap = int(cap or 55)
+        warm = 10 if cap <= 45 else 12
+        cool = 8 if cap <= 45 else 10
+        recovery = 3
+        block = max(6, int((cap - warm - cool - recovery) / 2))
+        return [
+            f"1. Calentamiento: corre {warm} min muy suaves ({easy_ref}).",
+            f"2. Primer bloque: corre {block} min al esfuerzo específico de media maratón ({work_ref}). Debe sentirse firme pero controlado, no como una carrera máxima.",
+            f"3. Recuperación: trota {recovery} min muy suave. No necesitas detenerte; baja el ritmo hasta recuperar la respiración.",
+            f"4. Segundo bloque: repite {block} min al mismo esfuerzo específico ({work_ref}). Si el RPE supera 6/10, baja el ritmo aunque no alcances la cifra prevista.",
+            f"5. Enfriamiento: termina con {cool} min muy suaves ({easy_ref}).",
+        ]
+
+    # Larga con bloques específicos: explica exactamente dónde van los bloques.
+    if kind == "Larga" and re.search(r"2\s*[×x]\s*10[-–]15\s*min", desc, flags=re.IGNORECASE):
+        return [
+            f"1. Primera parte: corre fácil a RPE 3–4/10. Mantén este ritmo hasta que falten aproximadamente 35–40 min para terminar la sesión.",
+            f"2. Primer bloque específico: corre 10–15 min a RPE 5–6/10, cerca del esfuerzo de media maratón. {('Referencia: ' + surface['pace'] + ' exterior. ') if surface.get('pace') else ''}{('En caminadora: ' + surface['speed'] + '. ') if surface.get('speed') else ''}",
+            "3. Recuperación: trota 5 min muy suave; no te detengas salvo necesidad de hidratación o logística.",
+            "4. Segundo bloque específico: vuelve a correr 10–15 min a RPE 5–6/10. Debe ser parecido al primer bloque, no más rápido por obligación.",
+            "5. Final: completa los minutos o kilómetros restantes muy suave. Las pausas breves para beber están permitidas.",
+        ]
+
+    # Descripciones estructuradas con + se convierten en pasos legibles.
+    first_sentence = desc.split(". ")[0].strip()
+    parts = [x.strip() for x in re.split(r"\s+\+\s+", first_sentence) if x.strip()]
+    if len(parts) >= 2:
+        steps = []
+        for i, part in enumerate(parts, start=1):
+            low = part.lower()
+            if i == 1 and "suave" in low:
+                label = "Calentamiento"
+                extra = f" ({easy_ref})"
+            elif i == len(parts) and "suave" in low:
+                label = "Enfriamiento"
+                extra = f" ({easy_ref})"
+            elif "recuper" in low or ("suave" in low and i not in (1, len(parts))):
+                label = "Recuperación"
+                extra = " · trota/camina muy suave hasta recuperar el control respiratorio"
+            else:
+                label = "Trabajo principal"
+                extra = f" · {work_ref}"
+            steps.append(f"{i}. {label}: {part}{extra}.")
+        return steps
+
+    if "CUESTA" in qtype or "CUESTA" in f"{session.get('workout_name') or ''}".upper():
+        return [
+            f"1. Calienta 15–20 min muy suave ({easy_ref}).",
+            f"2. Haz las repeticiones en subida a RPE 7/10. En caminadora usa {surface.get('incline') or 'la pendiente indicada'} y reduce la velocidad hasta mantener técnica firme.",
+            "3. Entre repeticiones recupera completamente con trote/caminata muy suave; no empieces la siguiente hasta sentir control respiratorio.",
+            "4. Termina con 8–10 min suaves. No conviertas la última repetición en sprint.",
+        ]
+
+    if kind == "Larga":
+        return [
+            f"1. Inicia muy suave durante 10–15 min, RPE 2–3/10.",
+            f"2. Continúa la mayor parte de la tirada a RPE 3–4/10, ritmo conversacional. {('Exterior ' + surface['pace'] + '. ') if surface.get('pace') else ''}{('Caminadora ' + surface['speed'] + '. ') if surface.get('speed') else ''}",
+            "3. Puedes hacer pausas breves para hidratarte, ir al baño o por logística; no necesitas reiniciar el entrenamiento.",
+            "4. Termina suave. Si la sesión prescribe un final progresivo, aumenta solo hasta el RPE indicado y vuelve a fácil si pierdes control.",
+        ]
+
+    if kind == "Rodaje":
+        return [
+            "1. Empieza los primeros 5–10 min más lento de lo que crees necesario.",
+            f"2. Estabiliza el resto del rodaje en {work_ref}. Debes poder conversar y terminar con reserva.",
+            "3. Los últimos 3–5 min pueden ser muy suaves. No aceleres para 'completar' kilómetros si ya alcanzaste tu tiempo disponible.",
+        ]
+
+    if kind == "Carrera":
+        return [
+            "1. Haz tu calentamiento habitual y llega a la salida sin fatiga.",
+            f"2. Comienza controlado y estabiliza el esfuerzo en {work_ref}; no persigas la cifra si el RPE se dispara.",
+            "3. Mantén la estrategia prevista hasta el tramo final. Solo aumenta el esfuerzo si sigues técnicamente estable y con reserva.",
+        ]
+
+    return [f"1. Realiza la sesión según esta indicación: {desc or work_ref}"]
 
 
 def next_monday(day):
@@ -4858,8 +5026,21 @@ def _fit_quality_description_to_time(q, cap_minutes):
     elif qtype == "FARTLEK":
         reps = max(4, min(8, int(work / 3)))
         q["description"] = f"{warm} min suave + {reps} × 1 min ágil / 2 min suave + {cool} min suave. No superes {cap} min totales."
+    elif qtype in {"ESPECIFICO_21K", "RITMO_CARRERA"}:
+        recovery = 3
+        block = max(6, int((cap - warm - cool - recovery) / 2))
+        q["description"] = f"{warm} min suave + 2 × {block} min al esfuerzo específico indicado con {recovery} min de trote muy suave entre bloques + {cool} min suave. Duración total objetivo ≤{cap} min."
+    elif qtype == "ACTIVACION":
+        reps = 4 if cap <= 45 else 5
+        q["description"] = f"{warm} min suave + {reps} × 60–75 s alegres a RPE 6–7/10 con 90 s muy suaves entre repeticiones + {cool} min suave. Termina con reserva; duración total ≤{cap} min."
+    elif qtype == "RECTAS":
+        reps = 6 if cap <= 45 else 8
+        q["description"] = f"{warm} min suave + {reps} × 20 s rápidos pero relajados con 80–100 s muy suaves entre repeticiones + {cool} min suave. No es sprint; duración total ≤{cap} min."
     else:
-        q["description"] = f"Realiza una versión reducida que incluya calentamiento y enfriamiento y no supere {cap} min totales. Mantén el RPE prescrito; no compenses corriendo más rápido."
+        # No borres una receta útil solo porque haya límite horario. Conserva la
+        # explicación original y añade el techo total.
+        base = str(q.get("description") or "").strip()
+        q["description"] = (base + f" Duración total: no superes {cap} min; recorta primero repeticiones o minutos de trabajo, nunca el calentamiento/enfriamiento ni aumentando la velocidad.").strip()
     return q
 
 
@@ -5085,7 +5266,7 @@ def _pace_range(fast_sec, slow_sec):
 def v7_pace_profile(assessment, goal_row):
     """Ritmos orientativos desde capacidad ACTUAL; RPE/prueba del habla mandan.
 
-    V8.2.2 evita usar una meta futura más rápida como si ya fuera capacidad fisiológica
+    V8.2.3 evita usar una meta futura más rápida como si ya fuera capacidad fisiológica
     actual. El ritmo específico de entrenamiento progresa desde la equivalencia vigente
     hacia la meta solo si el esfuerzo prescrito sigue siendo compatible.
     """
@@ -5370,7 +5551,7 @@ def _v7_long_distance(weekly_km, answers, goal, phase, week_idx, total_weeks, da
 def _v7_quality_count(level, days_count, phase, answers, focus="AUTO"):
     """Número de estímulos principales de calidad.
 
-    V8.2.2: la base no significa cero velocidad. En corredores intermedios/avanzados
+    V8.2.3: la base no significa cero velocidad. En corredores intermedios/avanzados
     se conserva un estímulo breve/controlado, mientras la gran mayoría de la carga
     permanece fácil. Una carrera preparatoria cuenta después como estímulo de calidad
     y el módulo de carreras descarga lo cercano.
@@ -6097,7 +6278,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
                 "is_optional": False,
             })
 
-    # V8.2.2 · Carreras + distribución dinámica basada en evidencia.
+    # V8.2.3 · Carreras + distribución dinámica basada en evidencia.
     rows, _applied_prep_races = _apply_preparatory_races_to_rows(
         rows, prep_races, goal_row.get("race_date"), monday0, total_weeks
     )
@@ -6130,7 +6311,7 @@ def build_v7_plan(goal_row, assessment, start_date_value=None):
     _declared_weekly_km = float(answers.get("weekly_km") or 0)
 
     metadata = {
-        "engine": "RCP-V8.2.2",
+        "engine": "RCP-V8.2.3",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assessment_id": assessment.get("id"),
         "assessment_version": assessment.get("assessment_version"),
@@ -6185,7 +6366,7 @@ def replace_active_plan_with_v7(goal_row, profile, assessment, start_date_value=
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": "FUTURE",
-        "engine_version": "RCP-V8.2.2",
+        "engine_version": "RCP-V8.2.3",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -6271,7 +6452,7 @@ def create_plan_record_for_goal(goal_row, base_profile, assessment, status="ACTI
         "user_id": USER_ID,
         "goal_id": int(goal_row["id"]),
         "status": status,
-        "engine_version": "RCP-V8.2.2",
+        "engine_version": "RCP-V8.2.3",
         "start_date": rows[0]["session_date"],
         "end_date": rows[-1]["session_date"],
         "initial_weekly_km": float(metadata.get("initial_weekly_km") or 0),
@@ -7584,7 +7765,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
         _goal_focus = resolve_development_focus(active_goal, assessment).get("resolved")
         if _plan_focus:
             st.caption(f"🫁 Foco del plan: {development_focus_label(_plan_focus)}")
-        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.2"):
+        if development_focus_storage_ready() and (_plan_focus != _goal_focus or engine_name != "RCP-V8.2.3"):
             with st.expander("🧠 Recalibrar plan con motor dinámico actual", expanded=True):
                 _focus_start = expected_next_training_date(rcp_today()) or (rcp_today() + timedelta(days=1))
                 _preview_goal = dict(active_goal)
@@ -7617,7 +7798,7 @@ def goal_management_ui(active_goal, active_plan, profile, assessment):
                     if st.button("🫁 Crear plan con este enfoque", type="primary", use_container_width=True, disabled=not _confirm_focus, key="apply_focus_rebuild"):
                         new_plan, err = replace_active_plan_with_v7(active_goal, profile, assessment, start_date_value=_focus_start)
                         if new_plan:
-                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.2 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
+                            st.session_state["rcp_saved_notice"] = f"Plan RCP-V8.2.3 creado con foco {development_focus_label(preview_meta.get('development_focus'))}."
                             st.rerun()
                         else:
                             st.error(err or "No fue posible crear el nuevo plan.")
@@ -10771,7 +10952,9 @@ def build_plan_pdf_bytes(
                 right_story = [title_row, Spacer(1, 2), target_box]
                 if include_instructions:
                     right_story.append(Spacer(1, 2))
-                    right_story.append(Paragraph(f"<b>Cómo hacerlo:</b> {_pdf_esc(p.get('description') or 'Sin instrucciones adicionales.')}", styles["RCPBody"]))
+                    _pdf_steps = session_execution_steps(p, active_goal, assessment, profile_row)
+                    _pdf_step_html = "<br/>".join(_pdf_esc(x) for x in _pdf_steps) if _pdf_steps else _pdf_esc(p.get("description") or "Sin instrucciones adicionales.")
+                    right_story.append(Paragraph(f"<b>Cómo hacerlo · paso a paso:</b><br/>{_pdf_step_html}", styles["RCPBody"]))
                 if include_progress and log:
                     actual_parts = []
                     if str(log.get("status") or "").upper() in ("COMPLETADO", "MODIFICADO"):
@@ -11137,8 +11320,10 @@ if current_page == "Hoy":
                     f"🧠 Sesión adaptada · {_adapt_source} · plan original {base_km:g} km → actual {float(today_session.get('planned_km') or 0):g} km."
                 )
 
-            with st.expander("📋 Cómo hacerlo", expanded=False):
-                st.write(today_session.get("description") or "Sin instrucciones adicionales.")
+            with st.expander("📋 Cómo hacerlo · paso a paso", expanded=False):
+                _today_steps = session_execution_steps(today_session, ACTIVE_GOAL, LATEST_ASSESSMENT, profile)
+                for _step in _today_steps:
+                    st.write(_step)
                 _target_ref = rpe_target_reference(today_session.get("target"))
                 if _target_ref:
                     st.info(_target_ref)
@@ -12253,7 +12438,9 @@ elif current_page == "Plan":
                 st.info(" · ".join(_surface_plan_parts) + f"\n\n{_surface_plan.get('note') or ''}")
             if REPLAN_READY and str(p.get("replan_status") or "BASELINE").upper() != "BASELINE":
                 st.info(f"🔄 Plan reorganizado · {ui_status_label(p.get('replan_status'))}")
-            st.write(p.get("description") or "Sin instrucciones adicionales.")
+            st.markdown("**📋 Paso a paso**")
+            for _step in session_execution_steps(p, ACTIVE_GOAL, LATEST_ASSESSMENT, profile):
+                st.write(_step)
             d = parse_date_safe(p.get("session_date"))
             if st.button("✅ Ir a registrar esta sesión", use_container_width=True, type="primary"):
                 set_page("Registro", d)
@@ -12432,8 +12619,9 @@ elif current_page == "Registro":
                 _surface_reg_parts.append(" · ".join(_surface_reg["repeats"]))
             if _surface_reg_parts:
                 st.caption(" · ".join(_surface_reg_parts) + f" · {_surface_reg.get('source') or 'RPE'}")
-            with st.expander("📋 Instrucciones"):
-                st.write(session.get("description") or "Sin instrucciones adicionales.")
+            with st.expander("📋 Instrucciones · paso a paso"):
+                for _step in session_execution_steps(session, ACTIVE_GOAL, LATEST_ASSESSMENT, profile):
+                    st.write(_step)
                 _register_target_ref = rpe_target_reference(session.get("target"))
                 if _register_target_ref:
                     st.info(_register_target_ref)
